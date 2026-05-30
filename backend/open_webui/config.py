@@ -915,27 +915,32 @@ load_oauth_providers()
 
 STATIC_DIR = Path(os.getenv('STATIC_DIR', OPEN_WEBUI_DIR / 'static')).resolve()
 
-try:
-    if STATIC_DIR.exists():
-        for item in STATIC_DIR.iterdir():
-            if item.is_file() or item.is_symlink():
-                try:
-                    item.unlink()
-                except Exception as e:
-                    pass
-except Exception as e:
-    pass
+frontend_static_dir = FRONTEND_BUILD_DIR / 'static'
+repo_static_dir = OPEN_WEBUI_DIR.parent.parent / 'static' / 'static'
+source_static_dir = frontend_static_dir if frontend_static_dir.exists() else repo_static_dir
 
-for file_path in (FRONTEND_BUILD_DIR / 'static').glob('**/*'):
-    if file_path.is_file():
-        target_path = STATIC_DIR / file_path.relative_to((FRONTEND_BUILD_DIR / 'static'))
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.copyfile(file_path, target_path)
-        except Exception as e:
-            logging.error(f'An error occurred: {e}')
+if source_static_dir.exists():
+    try:
+        if STATIC_DIR.exists():
+            for item in STATIC_DIR.iterdir():
+                if item.is_file() or item.is_symlink():
+                    try:
+                        item.unlink()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
-frontend_favicon = FRONTEND_BUILD_DIR / 'static' / 'favicon.png'
+    for file_path in source_static_dir.glob('**/*'):
+        if file_path.is_file():
+            target_path = STATIC_DIR / file_path.relative_to(source_static_dir)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copyfile(file_path, target_path)
+            except Exception as e:
+                logging.error(f'An error occurred: {e}')
+
+frontend_favicon = source_static_dir / 'favicon.png'
 
 if frontend_favicon.exists():
     try:
@@ -943,7 +948,7 @@ if frontend_favicon.exists():
     except Exception as e:
         logging.error(f'An error occurred: {e}')
 
-frontend_splash = FRONTEND_BUILD_DIR / 'static' / 'splash.png'
+frontend_splash = source_static_dir / 'splash.png'
 
 if frontend_splash.exists():
     try:
@@ -951,7 +956,7 @@ if frontend_splash.exists():
     except Exception as e:
         logging.error(f'An error occurred: {e}')
 
-frontend_loader = FRONTEND_BUILD_DIR / 'static' / 'loader.js'
+frontend_loader = source_static_dir / 'loader.js'
 
 if frontend_loader.exists():
     try:
@@ -1074,7 +1079,7 @@ if OLLAMA_BASE_URL == '' and OLLAMA_API_BASE_URL != '':
 if ENV == 'prod':
     if OLLAMA_BASE_URL == '/ollama' and not K8S_FLAG:
         if USE_OLLAMA_DOCKER.lower() == 'true':
-            # if you use all-in-one docker container (Open WebUI + Ollama)
+            # if you use all-in-one docker container (Interact Ai + Ollama)
             # with the docker build arg USE_OLLAMA=true (--build-arg="USE_OLLAMA=true") this only works with http://localhost:11434
             OLLAMA_BASE_URL = 'http://localhost:11434'
         else:
