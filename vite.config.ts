@@ -23,6 +23,9 @@ export default defineConfig({
 	build: {
 		sourcemap: true
 	},
+	server: {
+		allowedHosts: ['ai.interact-vision.com.tw']
+	},
 	worker: {
 		format: 'es'
 	},
