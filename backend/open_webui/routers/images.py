@@ -30,6 +30,7 @@ from open_webui.routers.files import upload_file_handler, get_file_content_by_id
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission
 from open_webui.utils.headers import include_user_info_headers
+from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
 from open_webui.internal.db import get_async_session
 from sqlalchemy.ext.asyncio import AsyncSession
 from open_webui.utils.images.comfyui import (
@@ -547,6 +548,37 @@ async def image_generations(
     metadata = metadata or {}
 
     model = await get_image_model(request)
+    original_prompt = form_data.prompt
+    original_count = form_data.n
+    billing_client = InteractBillingClient() if is_billing_enabled() and user else None
+    billing_authorization = None
+    billing_usage = None
+
+    if billing_client:
+        billing_authorization, billing_usage = await billing_client.authorize_image(
+            user,
+            original_prompt,
+            model,
+            width,
+            height,
+            original_count,
+            {
+                "operation": "image-generation",
+                "engine": request.app.state.config.IMAGE_GENERATION_ENGINE or "automatic1111",
+            },
+        )
+
+    async def commit_image_usage(images):
+        if billing_client and billing_authorization and billing_usage:
+            await billing_client.commit_image(
+                user,
+                billing_authorization,
+                original_prompt,
+                model,
+                billing_usage,
+                len(images) or original_count or 1,
+            )
+        return images
 
     try:
         if request.app.state.config.IMAGE_GENERATION_ENGINE == 'openai':
@@ -609,7 +641,7 @@ async def image_generations(
 
                 _, url = await upload_image(request, image_data, content_type, {**data, **metadata}, user)
                 images.append({'url': url})
-            return images
+            return await commit_image_usage(images)
 
         elif request.app.state.config.IMAGE_GENERATION_ENGINE == 'gemini':
             headers = {
@@ -667,7 +699,7 @@ async def image_generations(
                             )
                             images.append({'url': url})
 
-            return images
+            return await commit_image_usage(images)
 
         elif request.app.state.config.IMAGE_GENERATION_ENGINE == 'comfyui':
             data = {
@@ -719,7 +751,7 @@ async def image_generations(
                     user,
                 )
                 images.append({'url': url})
-            return images
+            return await commit_image_usage(images)
         elif (
             request.app.state.config.IMAGE_GENERATION_ENGINE == 'automatic1111'
             or request.app.state.config.IMAGE_GENERATION_ENGINE == ''
@@ -765,8 +797,10 @@ async def image_generations(
                     user,
                 )
                 images.append({'url': url})
-            return images
+            return await commit_image_usage(images)
     except Exception as e:
+        if billing_client and billing_authorization:
+            await billing_client.cancel(billing_authorization, 'image-generation-error')
         error = e
         if isinstance(e, aiohttp.ClientResponseError):
             error = e.message
@@ -851,6 +885,38 @@ async def image_edits(
             form_data.image = list(await asyncio.gather(*[load_url_image(img) for img in form_data.image]))
     except Exception as e:
         raise HTTPException(status_code=400, detail=ERROR_MESSAGES.DEFAULT(e))
+
+    original_prompt = form_data.prompt
+    original_count = form_data.n
+    billing_client = InteractBillingClient() if is_billing_enabled() and user else None
+    billing_authorization = None
+    billing_usage = None
+
+    if billing_client:
+        billing_authorization, billing_usage = await billing_client.authorize_image(
+            user,
+            original_prompt,
+            model,
+            width,
+            height,
+            original_count,
+            {
+                "operation": "image-edit",
+                "engine": request.app.state.config.IMAGE_EDIT_ENGINE,
+            },
+        )
+
+    async def commit_image_usage(images):
+        if billing_client and billing_authorization and billing_usage:
+            await billing_client.commit_image(
+                user,
+                billing_authorization,
+                original_prompt,
+                model,
+                billing_usage,
+                len(images) or original_count or 1,
+            )
+        return images
 
     def get_image_file_item(base64_string, param_name='image'):
         data = base64_string
@@ -939,7 +1005,7 @@ async def image_edits(
 
                 _, url = await upload_image(request, image_data, content_type, {**data, **metadata}, user)
                 images.append({'url': url})
-            return images
+            return await commit_image_usage(images)
 
         elif request.app.state.config.IMAGE_EDIT_ENGINE == 'gemini':
             headers = {
@@ -996,7 +1062,7 @@ async def image_edits(
                         )
                         images.append({'url': url})
 
-            return images
+            return await commit_image_usage(images)
 
         elif request.app.state.config.IMAGE_EDIT_ENGINE == 'comfyui':
             try:
@@ -1076,8 +1142,10 @@ async def image_edits(
                 )
                 images.append({'url': url})
 
-            return images
+            return await commit_image_usage(images)
     except Exception as e:
+        if billing_client and billing_authorization:
+            await billing_client.cancel(billing_authorization, 'image-edit-error')
         error = e
         if isinstance(e, aiohttp.ClientResponseError):
             error = e.message

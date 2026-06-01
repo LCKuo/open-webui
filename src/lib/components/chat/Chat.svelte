@@ -48,7 +48,8 @@
 		showFileNavPath,
 		showFileNavDir,
 		chatRequestQueues,
-		desktopEvent
+		desktopEvent,
+		companyWallet
 	} from '$lib/stores';
 
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
@@ -482,6 +483,14 @@
 					}
 				} else if (type === 'chat:completion') {
 					chatCompletionEventHandler(data, message, event.chat_id);
+				} else if (type === 'billing:wallet') {
+					companyWallet.update((current) => ({
+						enabled: true,
+						wallet: {
+							...(current?.wallet ?? {}),
+							...(data?.wallet ?? {})
+						}
+					}));
 				} else if (type === 'chat:tasks:cancel') {
 					if (event.message_id === history.currentId) {
 						taskIds = null;

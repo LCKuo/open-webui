@@ -105,6 +105,7 @@ from open_webui.routers import (
     scim,
     terminals,
     automations,
+    billing,
     calendar,
 )
 
@@ -557,6 +558,7 @@ from open_webui.utils.middleware import (
     process_chat_payload,
     process_chat_response,
 )
+from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
 from open_webui.utils.tools import set_tool_servers, set_terminal_servers
 
 from open_webui.utils.auth import (
@@ -1455,6 +1457,7 @@ if ENABLE_ADMIN_ANALYTICS:
 app.include_router(utils.router, prefix='/api/v1/utils', tags=['utils'])
 app.include_router(terminals.router, prefix='/api/v1/terminals', tags=['terminals'])
 app.include_router(automations.router, prefix='/api/v1/automations', tags=['automations'])
+app.include_router(billing.router, prefix='/api/v1/billing', tags=['billing'])
 app.include_router(calendar.router, prefix='/api/v1/calendars', tags=['calendars'])
 
 # SCIM 2.0 API for identity management
@@ -1972,7 +1975,12 @@ async def chat_completion(
         )
 
     async def process_chat(request, form_data, user, metadata, model, tasks=None):
+        billing_client = InteractBillingClient() if is_billing_enabled() else None
+        billing_authorization = None
         try:
+            if billing_client:
+                billing_authorization = await billing_client.authorize(user, form_data, metadata)
+
             form_data, metadata, events = await process_chat_payload(request, form_data, user, metadata, model)
 
             response = await chat_completion_handler(request, form_data, user)
@@ -1994,9 +2002,30 @@ async def chat_completion(
 
             ctx = await build_chat_response_context(request, form_data, user, model, metadata, tasks, events)
 
-            return await process_chat_response(response, ctx)
+            processed_response = await process_chat_response(response, ctx)
+
+            if billing_client and billing_authorization:
+                usage = (ctx.get('assistant_message') or {}).get('usage')
+                billing_result = await billing_client.commit(user, billing_authorization, form_data, metadata, usage)
+                event_emitter = await get_event_emitter(metadata, update_db=False)
+                if event_emitter:
+                    await event_emitter(
+                        {
+                            'type': 'billing:wallet',
+                            'data': {
+                                'wallet': {
+                                    'remainingTokens': billing_result.get('remaining_tokens'),
+                                },
+                                'chargedTokens': billing_result.get('charged_tokens'),
+                            },
+                        }
+                    )
+
+            return processed_response
         except asyncio.CancelledError:
             log.info('Chat processing was cancelled')
+            if billing_client and billing_authorization:
+                await billing_client.cancel(billing_authorization, 'chat-cancelled')
             try:
 
                 async def emit_cancel_event():
@@ -2009,6 +2038,8 @@ async def chat_completion(
                 pass
             raise  # re-raise to ensure proper task cancellation handling
         except Exception as e:
+            if billing_client and billing_authorization:
+                await billing_client.cancel(billing_authorization, 'chat-error')
             error_detail = e.detail if isinstance(e, HTTPException) else str(e)
             log.error('Error processing chat payload: %s', error_detail)
             if metadata.get('chat_id') and metadata.get('message_id'):

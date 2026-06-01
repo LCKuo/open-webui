@@ -17,6 +17,17 @@ export const WEBUI_DEPLOYMENT_ID = writable(null);
 
 export const config: Writable<Config | undefined> = writable(undefined);
 export const user: Writable<SessionUser | undefined> = writable(undefined);
+export const companyWallet: Writable<{
+	enabled: boolean;
+	wallet: null | {
+		id?: string;
+		email?: string;
+		companyName?: string;
+		status?: string;
+		remainingTokens: number;
+		updatedAt?: string;
+	};
+} | null> = writable(null);
 
 // Electron App
 export const isApp = writable(false);

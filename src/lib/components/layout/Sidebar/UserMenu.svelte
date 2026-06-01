@@ -5,9 +5,11 @@
 	import { fade, slide } from 'svelte/transition';
 
 	import { getUsage } from '$lib/apis';
+	import { getBillingWallet } from '$lib/apis/billing';
 	import { getSessionUser, userSignOut } from '$lib/apis/auths';
 
 	import {
+		companyWallet,
 		showSettings,
 		mobile,
 		showSidebar,
@@ -90,12 +92,30 @@
 		}
 	};
 
+	const getBillingWalletInfo = async () => {
+		const res = await getBillingWallet(localStorage.token).catch((error) => {
+			console.error('Error fetching billing wallet:', error);
+			return null;
+		});
+
+		if (res) {
+			companyWallet.set({
+				enabled: res.enabled,
+				wallet: res.wallet
+			});
+		}
+	};
+
 	const handleDropdownChange = (state) => {
 		dispatch('change', state);
 
 		// Fetch usage info when dropdown opens, if user has permission
 		if (state && ($config?.features?.enable_public_active_users_count || role === 'admin')) {
 			getUsageInfo();
+		}
+
+		if (state) {
+			getBillingWalletInfo();
 		}
 	};
 </script>
@@ -228,6 +248,25 @@
 							</div>
 							<div class=" self-center truncate">{$i18n.t('Update your status')}</div>
 						</button>
+					</div>
+				{/if}
+
+				{#if $companyWallet?.enabled && $companyWallet?.wallet}
+					<div class="mx-1">
+						<a
+							href="https://interact-vision.com.tw/company-portal/profile"
+							target="_blank"
+							rel="noreferrer"
+							class="mb-1 w-full px-3 py-2 rounded-xl bg-gray-50 dark:text-white dark:bg-gray-900/50 text-black transition text-xs flex items-center justify-between gap-3"
+						>
+							<div class="flex flex-col min-w-0">
+								<span class="text-gray-500 dark:text-gray-400">Token balance</span>
+								<span class="truncate">{$companyWallet.wallet.companyName || $user?.email}</span>
+							</div>
+							<div class="font-semibold tabular-nums shrink-0">
+								{Number($companyWallet.wallet.remainingTokens ?? 0).toLocaleString()}
+							</div>
+						</a>
 					</div>
 				{/if}
 

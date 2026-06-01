@@ -37,7 +37,8 @@
 		showFileNavPath,
 		showFileNavDir,
 		pyodideWorker,
-		desktopEvent
+		desktopEvent,
+		companyWallet
 	} from '$lib/stores';
 	import { getFileContentById } from '$lib/apis/files';
 	import { goto } from '$app/navigation';
@@ -73,6 +74,23 @@
 	import { getUserSettings } from '$lib/apis/users';
 	import dayjs from 'dayjs';
 	import { getChannels } from '$lib/apis/channels';
+	import { getBillingWallet } from '$lib/apis/billing';
+
+	const refreshCompanyWallet = async () => {
+		if (!localStorage.token) return;
+
+		const res = await getBillingWallet(localStorage.token).catch((error) => {
+			console.error('Error fetching billing wallet:', error);
+			return null;
+		});
+
+		if (res) {
+			companyWallet.set({
+				enabled: res.enabled,
+				wallet: res.wallet
+			});
+		}
+	};
 
 	const unregisterServiceWorkers = async () => {
 		if ('serviceWorker' in navigator) {
@@ -584,6 +602,17 @@
 			}
 		}
 
+		if (type === 'billing:wallet') {
+			companyWallet.update((current) => ({
+				enabled: true,
+				wallet: {
+					...(current?.wallet ?? {}),
+					...(data?.wallet ?? {})
+				}
+			}));
+			return;
+		}
+
 		if ((event.chat_id !== $chatId && !$temporaryChatEnabled) || isInBackground) {
 			if (type === 'chat:completion') {
 				const { done, content, title } = data;
@@ -1037,6 +1066,7 @@
 
 					if (sessionUser) {
 						await user.set(sessionUser);
+						await refreshCompanyWallet();
 						try {
 							await config.set(await getBackendConfig());
 						} catch (error) {
