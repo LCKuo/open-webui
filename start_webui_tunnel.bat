@@ -9,6 +9,7 @@ if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "BACKEND_DIR=%ROOT%\backend"
 set "DATA_DIR=%BACKEND_DIR%\data"
 set "PYTHON_EXE=%ROOT%\.venv\Scripts\python.exe"
+set "WEBUI_SECRET_KEY_FILE=%ROOT%\.webui_secret_key"
 
 set "HOST=0.0.0.0"
 set "PORT=8080"
@@ -37,6 +38,20 @@ if not exist "%ROOT%\.env" (
         echo Creating .env from .env.example ...
         copy "%ROOT%\.env.example" "%ROOT%\.env" >nul
     )
+)
+
+if "%WEBUI_SECRET_KEY%"=="" (
+    if not exist "%WEBUI_SECRET_KEY_FILE%" (
+        echo Generating WEBUI_SECRET_KEY ...
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "$b=New-Object byte[] 48; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [Convert]::ToBase64String($b)" > "%WEBUI_SECRET_KEY_FILE%"
+        if errorlevel 1 (
+            echo.
+            echo Failed to generate WEBUI_SECRET_KEY.
+            pause
+            exit /b 1
+        )
+    )
+    set /p WEBUI_SECRET_KEY=<"%WEBUI_SECRET_KEY_FILE%"
 )
 
 if not exist "%ROOT%\build\index.html" (
