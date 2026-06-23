@@ -14,6 +14,8 @@ set "WEBUI_SECRET_KEY_FILE=%ROOT%\.webui_secret_key"
 set "HOST=0.0.0.0"
 set "PORT=8080"
 set "WEBUI_URL=http://localhost:8080"
+set "FORWARDED_ALLOW_IPS=*"
+set "ENABLE_WEBSOCKET_SUPPORT=False"
 
 echo.
 echo ==========================================
@@ -124,10 +126,11 @@ if not exist "%DATA_DIR%" (
 
 echo Starting backend-only WebUI on %WEBUI_URL% ...
 echo Do not start the frontend dev server for tunnel/public access.
+echo WebSocket transport is disabled for tunnel stability; Socket.IO will use polling.
 echo.
 
 pushd "%BACKEND_DIR%" >nul
-"%PYTHON_EXE%" -m uvicorn open_webui.main:app --port %PORT% --host %HOST% --forwarded-allow-ips=127.0.0.1
+"%PYTHON_EXE%" -m uvicorn open_webui.main:app --port %PORT% --host %HOST% --forwarded-allow-ips=%FORWARDED_ALLOW_IPS%
 popd >nul
 
 echo.
