@@ -493,6 +493,7 @@ from open_webui.routers import (
     functions,
     groups,
     images,
+    interact_channels,
     knowledge,
     memories,
     models,
@@ -1452,6 +1453,7 @@ app.include_router(utils.router, prefix='/api/v1/utils', tags=['utils'])
 app.include_router(terminals.router, prefix='/api/v1/terminals', tags=['terminals'])
 app.include_router(automations.router, prefix='/api/v1/automations', tags=['automations'])
 app.include_router(billing.router, prefix='/api/v1/billing', tags=['billing'])
+app.include_router(interact_channels.router, prefix='/api/v1/interact', tags=['interact'])
 app.include_router(calendar.router, prefix='/api/v1/calendars', tags=['calendars'])
 
 # SCIM 2.0 API for identity management
@@ -1787,6 +1789,7 @@ async def chat_completion(
             'files': form_data.get('files', None),
             'features': form_data.get('features', {}),
             'variables': form_data.get('variables', {}),
+            'interact_channel': form_data.pop('interact_channel', None),
             'model': model,
             'direct': model_item.get('direct', False),
             'params': {
@@ -2052,8 +2055,23 @@ async def chat_completion(
             processed_response = await process_chat_response(response, ctx)
 
             if billing_client and billing_authorization:
-                usage = (ctx.get('assistant_message') or {}).get('usage')
-                billing_result = await billing_client.commit(user, billing_authorization, form_data, metadata, usage)
+                assistant_message = ctx.get('assistant_message') or {}
+                usage = assistant_message.get('usage')
+                answer_content = assistant_message.get('content')
+                if not answer_content and metadata.get('chat_id') and metadata.get('message_id'):
+                    stored_assistant = await Chats.get_message_by_id_and_message_id(
+                        metadata['chat_id'],
+                        metadata['message_id'],
+                    )
+                    answer_content = (stored_assistant or {}).get('content')
+                billing_result = await billing_client.commit(
+                    user,
+                    billing_authorization,
+                    form_data,
+                    metadata,
+                    usage,
+                    answer_content,
+                )
                 event_emitter = await get_event_emitter(metadata, update_db=False)
                 if event_emitter:
                     await event_emitter(

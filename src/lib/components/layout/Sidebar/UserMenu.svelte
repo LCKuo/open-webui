@@ -259,7 +259,7 @@
 							class="mb-1 w-full px-3 py-2 rounded-xl bg-gray-50 dark:text-white dark:bg-gray-900/50 text-black transition text-xs flex items-center justify-between gap-3"
 						>
 							<div class="flex flex-col min-w-0">
-								<span class="text-gray-500 dark:text-gray-400">Token balance</span>
+								<span class="text-gray-500 dark:text-gray-400">AI 點數餘額</span>
 								<span class="truncate">{$companyWallet.wallet.companyName || $user?.email}</span>
 							</div>
 							<div class="font-semibold tabular-nums shrink-0">

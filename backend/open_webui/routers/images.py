@@ -609,6 +609,7 @@ async def image_generations(
                 model,
                 billing_usage,
                 len(images) or original_count or 1,
+                'image-generation',
             )
         return images
 
@@ -951,6 +952,7 @@ async def image_edits(
                 model,
                 billing_usage,
                 len(images) or original_count or 1,
+                'image-edit',
             )
         return images
 
