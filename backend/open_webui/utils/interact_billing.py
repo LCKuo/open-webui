@@ -160,6 +160,10 @@ def content_text(content: Any) -> str:
 
 
 def current_user_question(form_data: dict[str, Any], metadata: dict[str, Any]) -> str:
+    channel_metadata = metadata.get("interact_channel") or {}
+    if channel_metadata.get("operation") == "context-summary":
+        return "[Internal channel context summary]"
+
     user_message = metadata.get("user_message") or {}
     question = content_text(user_message.get("content"))
     if question:
@@ -369,6 +373,11 @@ class InteractBillingClient:
         channel_metadata = metadata.get("interact_channel") or {}
         question_text = current_user_question(form_data, metadata)
         answer_text = content_text(answer)
+        logged_answer_text = (
+            "[Channel context summary updated]"
+            if channel_metadata.get("operation") == "context-summary"
+            else answer_text
+        )
         input_tokens, output_tokens, compute_tokens, billable_tokens = usage_token_counts(
             usage,
             authorization.estimated_input_tokens,
@@ -405,7 +414,7 @@ class InteractBillingClient:
                     "content": {
                         "type": "text-chat",
                         "question": question_text,
-                        "answer": answer_text,
+                        "answer": logged_answer_text,
                     },
                     **({"source": "channel", "channel": channel_metadata} if channel_metadata else {}),
                 },

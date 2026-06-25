@@ -183,6 +183,22 @@ class InteractChannelsTable:
             row = result.scalar_one_or_none()
             return self._model(row) if row else None
 
+    async def get_by_platform(
+        self,
+        channel_type: str,
+        channel_identifier: str,
+    ) -> InteractChannelModel | None:
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            result = await db.execute(
+                select(InteractChannel).where(
+                    InteractChannel.channel_type == channel_type,
+                    InteractChannel.channel_identifier == channel_identifier,
+                )
+            )
+            row = result.scalar_one_or_none()
+            return self._model(row) if row else None
+
     async def claim_event(
         self,
         channel: InteractChannelModel,
@@ -298,6 +314,44 @@ class InteractChannelsTable:
                 row.reserved_tokens = 0
                 row.error = error
                 await db.commit()
+
+    async def reserve_event_tokens(
+        self,
+        event_id: str,
+        additional_tokens: int,
+        daily_limit: int,
+        day_start: int,
+    ) -> bool:
+        additional_tokens = max(0, int(additional_tokens))
+        if additional_tokens == 0:
+            return True
+
+        async with get_async_db_context() as db:
+            event = await db.get(InteractChannelEvent, event_id)
+            if not event or event.status not in {'received', 'processing'}:
+                return False
+
+            await db.execute(select(InteractChannel).where(InteractChannel.id == event.channel_id).with_for_update())
+            daily_tokens = await db.scalar(
+                select(
+                    func.coalesce(
+                        func.sum(InteractChannelEvent.billable_tokens + InteractChannelEvent.reserved_tokens),
+                        0,
+                    )
+                ).where(
+                    InteractChannelEvent.channel_id == event.channel_id,
+                    InteractChannelEvent.received_at >= day_start,
+                    InteractChannelEvent.status.in_(
+                        ['received', 'processing', 'ready', 'completed', 'delivery-failed']
+                    ),
+                )
+            )
+            if int(daily_tokens or 0) + additional_tokens > daily_limit:
+                return False
+
+            event.reserved_tokens += additional_tokens
+            await db.commit()
+            return True
 
     async def mark_delivery(self, event_id: str, error: str | None = None) -> None:
         async with get_async_db_context() as db:

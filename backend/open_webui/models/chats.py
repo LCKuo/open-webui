@@ -424,6 +424,36 @@ class ChatTable:
         except Exception:
             return
 
+    async def update_chat_context_summary_by_id(
+        self,
+        id: str,
+        summary: str,
+        state: dict,
+        db: AsyncSession | None = None,
+    ) -> ChatModel | None:
+        """Persist a rolling context summary without replacing chat history."""
+        try:
+            async with get_async_db_context(db) as session:
+                chat_item = await session.get(Chat, id)
+                if chat_item is None:
+                    return None
+
+                chat_data = dict(chat_item.chat or {})
+                chat_meta = dict(chat_data.get('meta') or {})
+                chat_meta['contextSummary'] = self._clean_null_bytes(state)
+                chat_data['meta'] = chat_meta
+
+                chat_item.chat = chat_data
+                chat_item.summary = self._clean_null_bytes(summary)
+                chat_item.updated_at = int(time.time())
+
+                await session.commit()
+                await session.refresh(chat_item)
+                return ChatModel.model_validate(chat_item)
+        except Exception:
+            log.exception('Failed to update context summary for chat %s', id)
+            return None
+
     async def update_chat_last_read_at_by_id(self, id: str, user_id: str, db: AsyncSession | None = None) -> bool:
         try:
             async with get_async_db_context(db) as session:

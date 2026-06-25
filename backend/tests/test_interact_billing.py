@@ -1,8 +1,16 @@
 from open_webui.utils.interact_billing import (
+    current_user_question,
     estimate_reserved_tokens,
     image_usage_estimate,
     usage_token_counts,
 )
+
+
+def test_internal_context_summary_hides_transcript_from_usage_log():
+    assert current_user_question(
+        {"messages": [{"role": "user", "content": "full private transcript"}]},
+        {"interact_channel": {"operation": "context-summary"}},
+    ) == "[Internal channel context summary]"
 
 
 def test_reserved_tokens_use_weighted_output_credits():
