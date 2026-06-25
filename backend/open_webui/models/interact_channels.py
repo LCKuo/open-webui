@@ -166,6 +166,12 @@ class InteractChannelsTable:
             await db.commit()
             return True
 
+    async def get_by_id(self, channel_id: str) -> InteractChannelModel | None:
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            row = await db.get(InteractChannel, channel_id)
+            return self._model(row) if row else None
+
     async def get_enabled(
         self,
         channel_type: str,
@@ -211,7 +217,31 @@ class InteractChannelsTable:
         now = int(time.time())
         event_id = str(uuid4())
         async with get_async_db_context() as db:
-            await db.execute(select(InteractChannel).where(InteractChannel.id == channel.id).with_for_update())
+            locked_channel_result = await db.execute(
+                select(InteractChannel)
+                .where(InteractChannel.id == channel.id)
+                .with_for_update()
+            )
+            locked_channel = locked_channel_result.scalar_one_or_none()
+            if not locked_channel:
+                return InteractEventClaim(
+                    allowed=False,
+                    duplicate=False,
+                    event_id='',
+                    reason='channel-deleted',
+                )
+            if (
+                not locked_channel.enabled
+                or locked_channel.channel_type != channel.channel_type
+                or locked_channel.channel_identifier != channel.channel_identifier
+            ):
+                return InteractEventClaim(
+                    allowed=False,
+                    duplicate=False,
+                    event_id='',
+                    reason='channel-disabled',
+                )
+
             row = InteractChannelEvent(
                 id=event_id,
                 channel_id=channel.id,

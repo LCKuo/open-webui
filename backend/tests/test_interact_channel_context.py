@@ -1,9 +1,16 @@
+import base64
+import hashlib
+import hmac
+import json
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
+from open_webui.models.interact_channels import InteractEventClaim
 from open_webui.routers.interact_channels import (
     ChannelChatRequest,
     _channel_request_messages,
+    _claim_and_respond,
     _estimated_reservation_tokens,
     _generate_context_summary,
     _prepare_channel_context,
@@ -12,7 +19,10 @@ from open_webui.routers.interact_channels import (
     _should_summarize_context,
     _summary_history_state,
     _usage_tokens,
+    delete_channel,
+    platform_webhook,
 )
+from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
 
@@ -37,6 +47,38 @@ def _messages(count: int, content: str = 'message') -> list[dict]:
         }
         for index in range(count)
     ]
+
+
+def _request(
+    body: bytes,
+    headers: list[tuple[bytes, bytes]] | None = None,
+    query_string: bytes = b'',
+) -> Request:
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if sent:
+            return {'type': 'http.disconnect'}
+        sent = True
+        return {'type': 'http.request', 'body': body, 'more_body': False}
+
+    return Request(
+        {
+            'type': 'http',
+            'asgi': {'version': '3.0'},
+            'http_version': '1.1',
+            'method': 'POST',
+            'scheme': 'https',
+            'path': '/webhook',
+            'raw_path': b'/webhook',
+            'query_string': query_string,
+            'headers': headers or [],
+            'client': ('127.0.0.1', 1234),
+            'server': ('testserver', 443),
+        },
+        receive,
+    )
 
 
 def test_summary_state_keeps_only_messages_after_marker():
@@ -77,6 +119,369 @@ def test_stale_summary_marker_is_ignored():
     )
 
     assert _summary_history_state(chat, messages) == ('', messages)
+
+
+@pytest.mark.asyncio
+async def test_claim_and_respond_returns_fallback_when_channel_is_disabled(monkeypatch):
+    async def claim_event(*args, **kwargs):
+        return InteractEventClaim(
+            allowed=False,
+            duplicate=False,
+            event_id='',
+            reason='channel-disabled',
+        )
+
+    async def unexpected_model_call(*args, **kwargs):
+        raise AssertionError('disabled channel must not invoke the model')
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.claim_event',
+        claim_event,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._run_channel_message',
+        unexpected_model_call,
+    )
+
+    channel = SimpleNamespace(reply_mode='ai', fallback_message='service paused')
+    claim, content = await _claim_and_respond(
+        SimpleNamespace(),
+        channel,
+        'event',
+        'external-user',
+        'hello',
+    )
+
+    assert claim.reason == 'channel-disabled'
+    assert content == 'service paused'
+
+
+@pytest.mark.asyncio
+async def test_claim_and_respond_stops_when_channel_was_deleted(monkeypatch):
+    async def claim_event(*args, **kwargs):
+        return InteractEventClaim(
+            allowed=False,
+            duplicate=False,
+            event_id='',
+            reason='channel-deleted',
+        )
+
+    async def unexpected_model_call(*args, **kwargs):
+        raise AssertionError('deleted channel must not invoke the model')
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.claim_event',
+        claim_event,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._run_channel_message',
+        unexpected_model_call,
+    )
+
+    channel = SimpleNamespace(reply_mode='ai', fallback_message='service paused')
+    with pytest.raises(HTTPException) as error:
+        await _claim_and_respond(
+            SimpleNamespace(),
+            channel,
+            'event',
+            'external-user',
+            'hello',
+        )
+
+    assert error.value.status_code == 404
+
+
+async def _disabled_claim(*args, **kwargs):
+    return InteractEventClaim(
+        allowed=False,
+        duplicate=False,
+        event_id='',
+        reason='channel-disabled',
+    )
+
+
+async def _mark_delivery_noop(*args, **kwargs):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_disabled_line_channel_replies_with_fallback(monkeypatch):
+    channel = SimpleNamespace(
+        id='channel-id',
+        enabled=False,
+        reply_mode='silent',
+        fallback_message='service paused',
+        channel_secret='line-secret',
+        channel_access_token='line-access-token',
+    )
+    body = json.dumps(
+        {
+            'events': [
+                {
+                    'type': 'message',
+                    'replyToken': 'reply-token',
+                    'webhookEventId': 'event-id',
+                    'source': {'userId': 'line-user'},
+                    'message': {'type': 'text', 'text': 'hello'},
+                }
+            ]
+        }
+    ).encode()
+    signature = base64.b64encode(
+        hmac.new(b'line-secret', body, hashlib.sha256).digest()
+    )
+    replies = []
+
+    async def get_channel(*args):
+        return channel
+
+    async def send_reply(channel, reply_token, text):
+        replies.append((reply_token, text))
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._platform_channel',
+        get_channel,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.claim_event',
+        _disabled_claim,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._send_line_reply',
+        send_reply,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._mark_delivery',
+        _mark_delivery_noop,
+    )
+
+    response = await platform_webhook(
+        _request(body, [(b'x-line-signature', signature)]),
+        'line',
+        'line-channel',
+    )
+
+    assert response.status_code == 200
+    assert replies == [('reply-token', 'service paused')]
+    assert json.loads(response.body)['results'][0]['rateLimited'] is False
+
+
+@pytest.mark.asyncio
+async def test_disabled_telegram_channel_replies_with_fallback(monkeypatch):
+    channel = SimpleNamespace(
+        id='channel-id',
+        enabled=False,
+        reply_mode='silent',
+        fallback_message='service paused',
+        channel_secret='telegram-bot-token',
+        channel_access_token='telegram-webhook-secret',
+    )
+    body = json.dumps(
+        {
+            'update_id': 123,
+            'message': {
+                'text': 'hello',
+                'chat': {'id': 456},
+                'from': {'id': 789},
+            },
+        }
+    ).encode()
+    replies = []
+
+    async def get_channel(*args):
+        return channel
+
+    async def send_reply(channel, chat_id, text):
+        replies.append((chat_id, text))
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._platform_channel',
+        get_channel,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.claim_event',
+        _disabled_claim,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._send_telegram_reply',
+        send_reply,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._mark_delivery',
+        _mark_delivery_noop,
+    )
+
+    response = await platform_webhook(
+        _request(
+            body,
+            [
+                (
+                    b'x-telegram-bot-api-secret-token',
+                    b'telegram-webhook-secret',
+                )
+            ],
+        ),
+        'telegram',
+        'telegram-channel',
+    )
+
+    assert response['rateLimited'] is False
+    assert replies == [(456, 'service paused')]
+
+
+@pytest.mark.asyncio
+async def test_disabled_wechat_channel_replies_with_fallback(monkeypatch):
+    channel = SimpleNamespace(
+        id='channel-id',
+        enabled=False,
+        reply_mode='silent',
+        fallback_message='service paused',
+        channel_secret='wechat-app-secret',
+        channel_access_token='wechat-verification-token',
+    )
+    body = (
+        b'<xml>'
+        b'<ToUserName><![CDATA[official-account]]></ToUserName>'
+        b'<FromUserName><![CDATA[wechat-user]]></FromUserName>'
+        b'<MsgType><![CDATA[text]]></MsgType>'
+        b'<Content><![CDATA[hello]]></Content>'
+        b'<MsgId>123</MsgId>'
+        b'</xml>'
+    )
+    timestamp = '123456'
+    nonce = 'nonce'
+    signature = hashlib.sha1(
+        ''.join(
+            sorted(['wechat-verification-token', timestamp, nonce])
+        ).encode()
+    ).hexdigest()
+    query = f'signature={signature}&timestamp={timestamp}&nonce={nonce}'.encode()
+
+    async def get_channel(*args):
+        return channel
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._platform_channel',
+        get_channel,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.claim_event',
+        _disabled_claim,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._mark_delivery',
+        _mark_delivery_noop,
+    )
+
+    response = await platform_webhook(
+        _request(body, query_string=query),
+        'wechat',
+        'wechat-channel',
+    )
+
+    assert response.status_code == 200
+    assert 'service paused' in response.body.decode()
+
+
+@pytest.mark.asyncio
+async def test_delete_channel_falls_back_to_verified_platform_identity(monkeypatch):
+    platform_channel = SimpleNamespace(
+        id='current-id',
+        company_email='company@example.com',
+        channel_type='line',
+        channel_identifier='line-channel',
+    )
+    deleted_ids = []
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._require_service_token',
+        lambda *args: None,
+    )
+
+    async def get_by_id(channel_id):
+        return None
+
+    async def get_by_platform(channel_type, channel_identifier):
+        return platform_channel
+
+    async def delete(channel_id):
+        deleted_ids.append(channel_id)
+        return True
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.get_by_id',
+        get_by_id,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.get_by_platform',
+        get_by_platform,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.delete',
+        delete,
+    )
+
+    result = await delete_channel(
+        'legacy-id',
+        'company@example.com',
+        'line',
+        'line-channel',
+        None,
+        None,
+    )
+
+    assert result['deleted'] is True
+    assert result['channelId'] == 'current-id'
+    assert deleted_ids == ['current-id']
+
+
+@pytest.mark.asyncio
+async def test_delete_channel_rejects_another_company(monkeypatch):
+    requested_channel = SimpleNamespace(
+        id='channel-id',
+        company_email='other@example.com',
+        channel_type='line',
+        channel_identifier='line-channel',
+    )
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._require_service_token',
+        lambda *args: None,
+    )
+
+    async def get_by_id(channel_id):
+        return requested_channel
+
+    async def get_by_platform(channel_type, channel_identifier):
+        return requested_channel
+
+    async def unexpected_delete(channel_id):
+        raise AssertionError('another company channel must not be deleted')
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.get_by_id',
+        get_by_id,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.get_by_platform',
+        get_by_platform,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.delete',
+        unexpected_delete,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await delete_channel(
+            'channel-id',
+            'company@example.com',
+            'line',
+            'line-channel',
+            None,
+            None,
+        )
+
+    assert error.value.status_code == 409
 
 
 def test_request_contains_system_memory_recent_history_and_latest_question():

@@ -50,13 +50,11 @@ from starlette.responses import StreamingResponse
 log = logging.getLogger(__name__)
 
 router = APIRouter()
-CHANNEL_CACHE_TTL_SECONDS = 15
 MAX_WEBHOOK_BODY_BYTES = 1_000_000
 MAX_CHANNEL_HISTORY_MESSAGES = 40
 DEFAULT_CONTEXT_SUMMARY_TRIGGER_TOKENS = 12_000
 DEFAULT_CONTEXT_SUMMARY_RECENT_MESSAGES = 12
 DEFAULT_CONTEXT_SUMMARY_MAX_OUTPUT_TOKENS = 1_200
-_channel_cache: dict[tuple[str, str], tuple[float, InteractChannelModel]] = {}
 _context_summary_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
@@ -750,22 +748,13 @@ def _usage_tokens(usage: dict[str, Any] | None) -> int:
     return usage_token_counts(usage, 0)[3]
 
 
-async def _cached_channel(
+async def _platform_channel(
     channel_type: str,
     channel_identifier: str,
 ) -> InteractChannelModel | None:
-    key = (channel_type, channel_identifier)
-    cache_entry = _channel_cache.get(key)
-    if cache_entry:
-        cached_at, cached = cache_entry
-        if cached.enabled and time.monotonic() - cached_at < CHANNEL_CACHE_TTL_SECONDS:
-            return cached
-    channel = await InteractChannels.get_enabled(channel_type, channel_identifier)
-    if channel:
-        _channel_cache[key] = (time.monotonic(), channel)
-    else:
-        _channel_cache.pop(key, None)
-    return channel
+    # Read from the local WebUI database on every request so disable/delete
+    # changes are immediately consistent across workers.
+    return await InteractChannels.get_by_platform(channel_type, channel_identifier)
 
 
 def _fallback_text(channel: InteractChannelModel) -> str:
@@ -778,6 +767,10 @@ def _rate_limit_text(channel: InteractChannelModel, reason: str | None) -> str:
     if reason == 'daily-user':
         return '您今日的詢問次數已達上限，請明日再試。'
     return '訊息傳送速度過快，請稍候一分鐘後再試。'
+
+
+def _is_rate_limited(reason: str | None) -> bool:
+    return reason in {'rpm', 'daily-user', 'daily-token'}
 
 
 def _taipei_day_start() -> int:
@@ -861,6 +854,10 @@ async def _claim_and_respond(
         reserved_tokens,
         _taipei_day_start(),
     )
+    if claim.reason == 'channel-deleted':
+        raise HTTPException(status_code=404, detail='Channel not found or disabled.')
+    if claim.reason == 'channel-disabled':
+        return claim, _fallback_text(channel)
     if claim.duplicate:
         return claim, claim.response_text
     if not claim.allowed:
@@ -1169,14 +1166,6 @@ async def sync_channel(
             detail='The platform channel identifier is already bound.',
         )
 
-    for key, (_, cached) in list(_channel_cache.items()):
-        if cached.id == effective_channel_id:
-            _channel_cache.pop(key, None)
-    if channel.enabled:
-        _channel_cache[(channel.channel_type, channel.channel_identifier)] = (
-            time.monotonic(),
-            channel,
-        )
     return {
         'ok': True,
         'channelId': channel.id,
@@ -1191,15 +1180,74 @@ async def sync_channel(
 @router.delete('/channels/{channel_id}')
 async def delete_channel(
     channel_id: str,
+    company_email: str,
+    channel_type: Literal['line', 'wechat', 'telegram'],
+    channel_identifier: str,
     authorization: str | None = Header(default=None),
     x_interact_service_token: str | None = Header(default=None),
 ):
     _require_service_token(authorization, x_interact_service_token)
-    deleted = await InteractChannels.delete(channel_id)
-    for key, (_, cached) in list(_channel_cache.items()):
-        if cached.id == channel_id:
-            _channel_cache.pop(key, None)
-    return {'ok': True, 'deleted': deleted}
+    normalized_email = company_email.strip().lower()
+    requested_channel = await InteractChannels.get_by_id(channel_id)
+    platform_channel = await InteractChannels.get_by_platform(
+        channel_type,
+        channel_identifier,
+    )
+
+    target_channel = None
+    if requested_channel:
+        if requested_channel.company_email != normalized_email:
+            raise HTTPException(
+                status_code=409,
+                detail='The requested channel belongs to another company.',
+            )
+        if (
+            requested_channel.channel_type == channel_type
+            and requested_channel.channel_identifier == channel_identifier
+        ):
+            target_channel = requested_channel
+
+    if target_channel is None and platform_channel:
+        if platform_channel.company_email != normalized_email:
+            raise HTTPException(
+                status_code=409,
+                detail='The platform channel identifier belongs to another company.',
+            )
+        target_channel = platform_channel
+
+    if target_channel is None and requested_channel:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                'The requested channel ID exists, but its platform identity does not '
+                'match the delete request.'
+            ),
+        )
+
+    if target_channel is None:
+        return {
+            'ok': True,
+            'deleted': False,
+            'absent': True,
+            'channelId': channel_id,
+        }
+
+    deleted = await InteractChannels.delete(target_channel.id)
+    if not deleted:
+        # A concurrent delete already removed the same verified channel.
+        return {
+            'ok': True,
+            'deleted': False,
+            'absent': True,
+            'channelId': target_channel.id,
+        }
+
+    return {
+        'ok': True,
+        'deleted': True,
+        'absent': False,
+        'channelId': target_channel.id,
+    }
 
 
 @router.get('/webhooks/{channel_type}/{channel_identifier}')
@@ -1208,7 +1256,7 @@ async def verify_platform_webhook(
     channel_type: Literal['line', 'wechat', 'telegram'],
     channel_identifier: str,
 ):
-    channel = await _cached_channel(channel_type, channel_identifier)
+    channel = await _platform_channel(channel_type, channel_identifier)
     if not channel:
         raise HTTPException(status_code=404, detail='Channel not found or disabled.')
     if channel_type == 'wechat':
@@ -1219,7 +1267,7 @@ async def verify_platform_webhook(
         'ok': True,
         'channelType': channel_type,
         'channelIdentifier': channel_identifier,
-        'enabled': True,
+        'enabled': channel.enabled,
     }
 
 
@@ -1229,7 +1277,7 @@ async def platform_webhook(  # noqa: C901
     channel_type: Literal['line', 'wechat', 'telegram'],
     channel_identifier: str,
 ):
-    channel = await _cached_channel(channel_type, channel_identifier)
+    channel = await _platform_channel(channel_type, channel_identifier)
     if not channel:
         raise HTTPException(status_code=404, detail='Channel not found or disabled.')
 
@@ -1255,7 +1303,7 @@ async def platform_webhook(  # noqa: C901
         results = []
         for index, event in enumerate(payload.get('events') or []):
             message = event.get('message') or {}
-            if channel.reply_mode == 'silent' or message.get('type') != 'text':
+            if (channel.enabled and channel.reply_mode == 'silent') or message.get('type') != 'text':
                 results.append({'ok': True, 'skipped': True})
                 continue
             source = event.get('source') or {}
@@ -1280,7 +1328,7 @@ async def platform_webhook(  # noqa: C901
                     {
                         'ok': True,
                         'duplicate': claim.duplicate,
-                        'rateLimited': claim.reason is not None,
+                        'rateLimited': _is_rate_limited(claim.reason),
                     }
                 )
             except Exception as error:
@@ -1309,7 +1357,7 @@ async def platform_webhook(  # noqa: C901
             raise HTTPException(status_code=400, detail='Invalid Telegram payload.')
         message_data = payload.get('message') or {}
         message = message_data.get('text')
-        if channel.reply_mode == 'silent' or not message:
+        if (channel.enabled and channel.reply_mode == 'silent') or not message:
             return {'ok': True, 'routed': True, 'channelId': channel.id, 'skipped': True}
         chat_id = (message_data.get('chat') or {}).get('id')
         external_user_id = str((message_data.get('from') or {}).get('id') or chat_id or 'unknown')
@@ -1336,7 +1384,7 @@ async def platform_webhook(  # noqa: C901
             'routed': True,
             'channelId': channel.id,
             'duplicate': claim.duplicate,
-            'rateLimited': claim.reason is not None,
+            'rateLimited': _is_rate_limited(claim.reason),
         }
 
     if not _verify_wechat(channel, request):
@@ -1349,7 +1397,7 @@ async def platform_webhook(  # noqa: C901
     to_user = _xml_value(root, 'ToUserName')
     from_user = _xml_value(root, 'FromUserName')
     message = _xml_value(root, 'Content')
-    if channel.reply_mode == 'silent' or not message:
+    if (channel.enabled and channel.reply_mode == 'silent') or not message:
         return PlainTextResponse('success')
     platform_event_id = _xml_value(root, 'MsgId') or hashlib.sha256(raw_body).hexdigest()
     claim, content = await _claim_and_respond(
