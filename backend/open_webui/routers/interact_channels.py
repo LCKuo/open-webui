@@ -199,6 +199,10 @@ class ProvisionAccountRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=320)
     companyName: str = Field(..., min_length=1, max_length=120)
     contactName: str = Field(..., min_length=1, max_length=80)
+    companyUserId: str | None = Field(default=None, max_length=200)
+    companyMemberId: str | None = Field(default=None, max_length=200)
+    companyMemberRole: str | None = Field(default=None, max_length=40)
+    accountType: Literal['owner', 'member'] = 'owner'
 
 
 class ChannelHealthRequest(BaseModel):
@@ -1460,13 +1464,25 @@ async def provision_account(
     if not display_name or not contact_name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Company and contact names are required.')
 
-    bio = f'聯絡人：{contact_name}'
+    bio_parts = [
+        f'Interact company: {display_name}',
+        f'Contact: {contact_name}',
+        f'Account type: {payload.accountType}',
+    ]
+    if payload.companyUserId:
+        bio_parts.append(f'Company user id: {payload.companyUserId}')
+    if payload.companyMemberId:
+        bio_parts.append(f'Company member id: {payload.companyMemberId}')
+    if payload.companyMemberRole:
+        bio_parts.append(f'Company member role: {payload.companyMemberRole}')
+    bio = '\n'.join(bio_parts)
     existing = await Users.get_user_by_email(email)
 
     if existing:
         updates = {}
         if existing.role == 'pending':
             updates['role'] = 'user'
+        updates['bio'] = bio
         updated = await Users.update_user_by_id(existing.id, updates) if updates else existing
         await apply_default_group_assignment(
             request.app.state.config.DEFAULT_GROUP_ID,
