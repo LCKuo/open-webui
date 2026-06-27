@@ -175,6 +175,12 @@ def current_user_question(form_data: dict[str, Any], metadata: dict[str, Any]) -
 
 
 @dataclass
+class BillingIdentity:
+    company_user: dict[str, Any]
+    company_member: Optional[dict[str, Any]] = None
+
+
+@dataclass
 class BillingAuthorization:
     request_id: str
     company_user_id: str
@@ -182,6 +188,8 @@ class BillingAuthorization:
     estimated_input_tokens: int
     max_output_tokens: int
     reserved_tokens: int
+    company_member_id: Optional[str] = None
+    company_member_email: Optional[str] = None
 
 
 def image_usage_estimate(prompt: str, width: Optional[int], height: Optional[int], count: Optional[int]) -> dict[str, int]:
@@ -234,7 +242,7 @@ class InteractBillingClient:
                     raise HTTPException(status_code=response.status, detail=detail)
                 return data
 
-    async def resolve_user(self, user: Any) -> dict[str, Any]:
+    async def resolve_identity(self, user: Any) -> BillingIdentity:
         if not getattr(user, "email", None):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User email is required for billing.")
 
@@ -246,7 +254,15 @@ class InteractBillingClient:
                 "email": user.email,
             },
         )
-        return data["company_user"]
+        company_user = data["company_user"]
+        company_member = data.get("company_member")
+        return BillingIdentity(
+            company_user=company_user,
+            company_member=company_member if isinstance(company_member, dict) else None,
+        )
+
+    async def resolve_user(self, user: Any) -> dict[str, Any]:
+        return (await self.resolve_identity(user)).company_user
 
     async def wallet(self, user: Any) -> dict[str, Any]:
         company_user = await self.resolve_user(user)
@@ -258,7 +274,9 @@ class InteractBillingClient:
 
     async def authorize(self, user: Any, form_data: dict[str, Any], metadata: dict[str, Any]) -> BillingAuthorization:
         input_tokens, max_output_tokens, reserved_tokens = estimate_reserved_tokens(form_data)
-        company_user = await self.resolve_user(user)
+        identity = await self.resolve_identity(user)
+        company_user = identity.company_user
+        company_member = identity.company_member
         request_id = f"{metadata.get('chat_id') or 'direct'}:{metadata.get('message_id') or uuid4()}"
         channel_metadata = metadata.get("interact_channel") or {}
 
@@ -268,6 +286,14 @@ class InteractBillingClient:
             {
                 "request_id": request_id,
                 "company_user_id": company_user["id"],
+                **(
+                    {
+                        "company_member_id": company_member.get("id"),
+                        "company_member_email": company_member.get("email"),
+                    }
+                    if company_member
+                    else {}
+                ),
                 "open_webui_user_id": user.id,
                 "chat_id": metadata.get("chat_id"),
                 "model": form_data.get("model"),
@@ -277,6 +303,15 @@ class InteractBillingClient:
                 "estimated_billable_tokens": reserved_tokens,
                 "metadata": {
                     "openWebuiEmail": user.email,
+                    **(
+                        {
+                            "companyMemberId": company_member.get("id"),
+                            "companyMemberEmail": company_member.get("email"),
+                            "companyMemberRole": company_member.get("role"),
+                        }
+                        if company_member
+                        else {}
+                    ),
                     "openWebuiMessageId": metadata.get("message_id"),
                     "openWebuiSessionId": metadata.get("session_id"),
                     **({"source": "channel", "channel": channel_metadata} if channel_metadata else {}),
@@ -301,6 +336,8 @@ class InteractBillingClient:
             estimated_input_tokens=input_tokens,
             max_output_tokens=max_output_tokens,
             reserved_tokens=data["reserved_tokens"],
+            company_member_id=company_member.get("id") if company_member else None,
+            company_member_email=company_member.get("email") if company_member else None,
         )
 
     async def authorize_image(
@@ -314,7 +351,9 @@ class InteractBillingClient:
         metadata: Optional[dict[str, Any]] = None,
     ) -> tuple[BillingAuthorization, dict[str, int]]:
         usage = image_usage_estimate(prompt, width, height, count)
-        company_user = await self.resolve_user(user)
+        identity = await self.resolve_identity(user)
+        company_user = identity.company_user
+        company_member = identity.company_member
         request_id = f"image:{uuid4()}"
 
         data = await self._request(
@@ -323,6 +362,14 @@ class InteractBillingClient:
             {
                 "request_id": request_id,
                 "company_user_id": company_user["id"],
+                **(
+                    {
+                        "company_member_id": company_member.get("id"),
+                        "company_member_email": company_member.get("email"),
+                    }
+                    if company_member
+                    else {}
+                ),
                 "open_webui_user_id": user.id,
                 "model": model,
                 "estimated_input_tokens": usage["input_tokens"],
@@ -332,6 +379,15 @@ class InteractBillingClient:
                 "metadata": {
                     **(metadata or {}),
                     "openWebuiEmail": user.email,
+                    **(
+                        {
+                            "companyMemberId": company_member.get("id"),
+                            "companyMemberEmail": company_member.get("email"),
+                            "companyMemberRole": company_member.get("role"),
+                        }
+                        if company_member
+                        else {}
+                    ),
                     "operation": "image-generation",
                     "width": width,
                     "height": height,
@@ -357,6 +413,8 @@ class InteractBillingClient:
                 estimated_input_tokens=usage["input_tokens"],
                 max_output_tokens=usage["output_tokens"],
                 reserved_tokens=data["reserved_tokens"],
+                company_member_id=company_member.get("id") if company_member else None,
+                company_member_email=company_member.get("email") if company_member else None,
             ),
             usage,
         )
@@ -390,6 +448,14 @@ class InteractBillingClient:
                 "request_id": authorization.request_id,
                 "reservation_id": authorization.reservation_id,
                 "company_user_id": authorization.company_user_id,
+                **(
+                    {
+                        "company_member_id": authorization.company_member_id,
+                        "company_member_email": authorization.company_member_email,
+                    }
+                    if authorization.company_member_id or authorization.company_member_email
+                    else {}
+                ),
                 "open_webui_user_id": user.id,
                 "chat_id": metadata.get("chat_id"),
                 "message_id": metadata.get("message_id"),
@@ -409,6 +475,14 @@ class InteractBillingClient:
                 },
                 "parameters": {
                     "openWebuiEmail": user.email,
+                    **(
+                        {
+                            "companyMemberId": authorization.company_member_id,
+                            "companyMemberEmail": authorization.company_member_email,
+                        }
+                        if authorization.company_member_id or authorization.company_member_email
+                        else {}
+                    ),
                     "reservedTokens": authorization.reserved_tokens,
                     "chargedAt": int(time.time()),
                     "content": {
@@ -439,6 +513,14 @@ class InteractBillingClient:
                 "request_id": authorization.request_id,
                 "reservation_id": authorization.reservation_id,
                 "company_user_id": authorization.company_user_id,
+                **(
+                    {
+                        "company_member_id": authorization.company_member_id,
+                        "company_member_email": authorization.company_member_email,
+                    }
+                    if authorization.company_member_id or authorization.company_member_email
+                    else {}
+                ),
                 "open_webui_user_id": user.id,
                 "model": model,
                 "tool_key": "ai-image",
@@ -453,6 +535,14 @@ class InteractBillingClient:
                 },
                 "parameters": {
                     "openWebuiEmail": user.email,
+                    **(
+                        {
+                            "companyMemberId": authorization.company_member_id,
+                            "companyMemberEmail": authorization.company_member_email,
+                        }
+                        if authorization.company_member_id or authorization.company_member_email
+                        else {}
+                    ),
                     "reservedTokens": authorization.reserved_tokens,
                     "imageCount": image_count,
                     "chargedAt": int(time.time()),
