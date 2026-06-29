@@ -31,6 +31,10 @@
 			label: $i18n.t('Channels'),
 			description: $i18n.t('Search channels and channel messages')
 		},
+		interact_database: {
+			label: $i18n.t('Interact Database'),
+			description: $i18n.t('Query authorized enterprise data connectors')
+		},
 		web_search: {
 			label: $i18n.t('Web Search'),
 			description: $i18n.t('Search the web and fetch URLs')
@@ -57,7 +61,13 @@
 		}
 	};
 
-	const allTools = Object.keys(toolLabels);
+	const allTools = Object.keys(toolLabels) as Array<keyof typeof toolLabels>;
+	const defaultEnabledTools: Record<string, boolean> = {
+		interact_database: false
+	};
+
+	const isToolEnabled = (tool: keyof typeof toolLabels) =>
+		builtinTools[tool] ?? defaultEnabledTools[tool] ?? true;
 
 	export let builtinTools: Record<string, boolean> = {};
 </script>
@@ -70,12 +80,20 @@
 		{#each allTools as tool}
 			<div class="flex items-center gap-2 mr-3">
 				<Checkbox
-					state={builtinTools[tool] !== false ? 'checked' : 'unchecked'}
+					state={isToolEnabled(tool) ? 'checked' : 'unchecked'}
 					on:change={(e) => {
 						if (e.detail === 'checked') {
-							delete builtinTools[tool];
+							if (defaultEnabledTools[tool] === false) {
+								builtinTools[tool] = true;
+							} else {
+								delete builtinTools[tool];
+							}
 						} else {
-							builtinTools[tool] = false;
+							if (defaultEnabledTools[tool] === false) {
+								delete builtinTools[tool];
+							} else {
+								builtinTools[tool] = false;
+							}
 						}
 						builtinTools = builtinTools;
 					}}

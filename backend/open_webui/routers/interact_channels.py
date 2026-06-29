@@ -24,6 +24,7 @@ from open_webui.models.interact_channels import (
     InteractChannelModel,
     InteractChannels,
 )
+from open_webui.models.interact_data_connectors import InteractDataConnectors
 from open_webui.models.users import Users
 from open_webui.utils.auth import get_password_hash
 from open_webui.utils.automations import (
@@ -225,6 +226,37 @@ class ChannelSyncRequest(BaseModel):
     rateLimitPerMinute: int = Field(default=5, ge=1, le=120)
     dailyUserLimit: int = Field(default=50, ge=1, le=10000)
     dailyBotTokenLimit: int = Field(default=100000, ge=1000, le=10000000)
+
+
+class DataConnectorSyncRequest(BaseModel):
+    company_user_id: str = Field(..., min_length=1, max_length=200)
+    name: str = Field(..., min_length=1, max_length=120)
+    connector_type: Literal['postgres', 'postgresql', 'mysql', 'mssql', 'sqlite', 'mariadb']
+    execution_mode: Literal['webui_local', 'saas_webui'] = 'webui_local'
+    storage_mode: Literal['metadata_only', 'encrypted_credentials'] = 'metadata_only'
+    enabled: bool = False
+    host: str | None = Field(default=None, max_length=240)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    database_name: str | None = Field(default=None, max_length=160)
+    username: str | None = Field(default=None, max_length=160)
+    password: str | None = Field(default=None, max_length=4000)
+    connection_string: str | None = Field(default=None, max_length=8000)
+    ssl_mode: Literal['disable', 'prefer', 'require'] | None = None
+    allowed_schemas: list[str] = Field(default_factory=list, max_length=300)
+    allowed_tables: list[str] = Field(default_factory=list, max_length=300)
+    blocked_tables: list[str] = Field(default_factory=list, max_length=300)
+    allowed_columns: dict[str, list[str]] = Field(default_factory=dict)
+    blocked_columns: dict[str, list[str]] = Field(default_factory=dict)
+    max_rows: int = Field(default=100, ge=1, le=10000)
+    query_timeout_seconds: int = Field(default=15, ge=1, le=300)
+    allow_write: bool = False
+    access_mode: Literal['company_admins', 'selected_members', 'all_company_members'] = 'company_admins'
+    allowed_member_ids: list[str] = Field(default_factory=list, max_length=300)
+    allowed_group_ids: list[str] = Field(default_factory=list, max_length=300)
+    allowed_model_ids: list[str] = Field(default_factory=list, max_length=300)
+    allowed_channel_ids: list[str] = Field(default_factory=list, max_length=300)
+    notes: str | None = Field(default=None, max_length=1600)
+    updated_at: int | str | None = None
 
 
 def _stable_channel_chat_id(user_id: str, payload: ChannelChatRequest) -> str:
@@ -1178,6 +1210,43 @@ async def sync_channel(
         ),
         'enabled': channel.enabled,
         'updatedAt': channel.updated_at,
+    }
+
+
+@router.put('/data-connectors/{connector_id}')
+async def sync_data_connector(
+    connector_id: str,
+    payload: DataConnectorSyncRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    connector = await InteractDataConnectors.upsert(
+        {
+            **payload.model_dump(),
+            'id': connector_id,
+        }
+    )
+    return {
+        'ok': True,
+        'connectorId': connector.id,
+        'enabled': connector.enabled,
+    }
+
+
+@router.delete('/data-connectors/{connector_id}')
+async def delete_data_connector(
+    connector_id: str,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    deleted = await InteractDataConnectors.delete(connector_id)
+    return {
+        'ok': True,
+        'connectorId': connector_id,
+        'deleted': deleted,
+        'absent': not deleted,
     }
 
 

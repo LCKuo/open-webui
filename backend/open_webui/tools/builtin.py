@@ -8,6 +8,11 @@ IMPORTANT: DO NOT IMPORT THIS MODULE DIRECTLY IN OTHER PARTS OF THE CODEBASE.
 
 from open_webui.tools.knowledge_fs import kb_exec  # noqa: F401 — re-exported
 
+from open_webui.tools.interact_database import (  # noqa: F401 re-exported
+    interact_database_query,
+    interact_database_schema,
+)
+
 import asyncio
 import json
 import logging
