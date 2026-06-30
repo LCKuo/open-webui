@@ -203,6 +203,89 @@ def _split_tool_calls(
     return expanded
 
 
+FUNCTION_CALLS_MARKUP_RE = re.compile(r'<function_calls\b[\s\S]*?</function_calls>', re.IGNORECASE)
+INVOKE_MARKUP_RE = re.compile(
+    r'<invoke\b[^>]*\bname=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</invoke>',
+    re.IGNORECASE,
+)
+PARAMETER_MARKUP_RE = re.compile(
+    r'<parameter\b[^>]*\bname=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</parameter>',
+    re.IGNORECASE,
+)
+
+
+def _coerce_legacy_tool_value(value: str) -> Any:
+    clean = html.unescape(value).strip()
+    if clean == '':
+        return ''
+    try:
+        return json.loads(clean)
+    except Exception:
+        pass
+    try:
+        return ast.literal_eval(clean)
+    except Exception:
+        pass
+    lowered = clean.lower()
+    if lowered == 'true':
+        return True
+    if lowered == 'false':
+        return False
+    if lowered in {'null', 'none'}:
+        return None
+    return clean
+
+
+def _message_output_text(item: dict[str, Any]) -> str:
+    if item.get('type') != 'message':
+        return ''
+    return ''.join(
+        part.get('text', '')
+        for part in item.get('content', [])
+        if isinstance(part, dict) and part.get('type') == 'output_text'
+    )
+
+
+def _set_message_output_text(item: dict[str, Any], text: str) -> None:
+    item['content'] = [{'type': 'output_text', 'text': text}]
+
+
+def _extract_legacy_markup_tool_calls(
+    text: str,
+    available_tool_names: set[str],
+) -> tuple[list[dict], str]:
+    if not text or '<function_calls' not in text:
+        return [], text
+
+    calls: list[dict] = []
+    for block_match in FUNCTION_CALLS_MARKUP_RE.finditer(text):
+        block = block_match.group(0)
+        for invoke_match in INVOKE_MARKUP_RE.finditer(block):
+            name = html.unescape(invoke_match.group(1)).strip()
+            if name not in available_tool_names:
+                continue
+            body = invoke_match.group(2)
+            arguments = {
+                html.unescape(param_match.group(1)).strip(): _coerce_legacy_tool_value(param_match.group(2))
+                for param_match in PARAMETER_MARKUP_RE.finditer(body)
+                if html.unescape(param_match.group(1)).strip()
+            }
+            calls.append(
+                {
+                    'id': f'legacy_{uuid4()}',
+                    'index': len(calls),
+                    'function': {
+                        'name': name,
+                        'arguments': json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+            )
+
+    if not calls:
+        return [], text
+    return calls, FUNCTION_CALLS_MARKUP_RE.sub('', text).strip()
+
+
 def get_citation_source_from_tool_result(
     tool_name: str, tool_params: dict, tool_result: str, tool_id: str = ''
 ) -> list[dict]:
@@ -2838,12 +2921,15 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         if mcp_clients:
             metadata['mcp_clients'] = mcp_clients
 
-        # Inject builtin tools for native function calling based on enabled features and model capability
+        # Inject builtin tools for native function calling based on enabled features and model capability.
         # Check if builtin_tools capability is enabled for this model (defaults to True if not specified)
         builtin_tools_enabled = (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get(
             'builtin_tools', True
         )
-        if metadata.get('params', {}).get('function_calling') == 'native' and builtin_tools_enabled:
+        if (
+            metadata.get('params', {}).get('function_calling') == 'native'
+            and builtin_tools_enabled
+        ):
             # Add file context to user messages
             chat_id = metadata.get('chat_id')
             form_data['messages'] = await add_file_context(form_data.get('messages', []), chat_id, user)
@@ -4504,6 +4590,19 @@ async def streaming_chat_response_handler(response, ctx):
                                 )
                         if responses_api_tool_calls:
                             tool_calls.append(_split_tool_calls(responses_api_tool_calls))
+
+                    if not response_tool_calls and output and not tool_calls:
+                        available_tool_names = set((metadata.get('tools') or {}).keys())
+                        legacy_markup_tool_calls = []
+                        for item in output:
+                            text = _message_output_text(item)
+                            calls, cleaned = _extract_legacy_markup_tool_calls(text, available_tool_names)
+                            if calls:
+                                legacy_markup_tool_calls.extend(calls)
+                                _set_message_output_text(item, cleaned)
+
+                        if legacy_markup_tool_calls:
+                            tool_calls.append(_split_tool_calls(legacy_markup_tool_calls))
 
                 try:
                     await stream_body_handler(response, form_data)

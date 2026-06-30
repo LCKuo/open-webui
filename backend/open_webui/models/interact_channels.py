@@ -6,7 +6,7 @@ from uuid import uuid4
 from open_webui.internal.db import Base, async_engine, get_async_db_context
 from open_webui.utils.oauth import decrypt_data, encrypt_data
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Boolean, Column, Index, Integer, Text, UniqueConstraint, delete, func, select
+from sqlalchemy import BigInteger, Boolean, Column, Index, Integer, Text, UniqueConstraint, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 _tables_ready = False
@@ -154,6 +154,28 @@ class InteractChannelsTable:
             await db.commit()
             await db.refresh(row)
             return self._model(row)
+
+    async def rekey(self, old_id: str, new_id: str) -> bool:
+        if old_id == new_id:
+            return True
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            existing_new = await db.get(InteractChannel, new_id)
+            if existing_new:
+                return False
+
+            row = await db.get(InteractChannel, old_id)
+            if not row:
+                return False
+
+            await db.execute(
+                update(InteractChannelEvent)
+                .where(InteractChannelEvent.channel_id == old_id)
+                .values(channel_id=new_id)
+            )
+            row.id = new_id
+            await db.commit()
+            return True
 
     async def delete(self, channel_id: str) -> bool:
         await self.ensure_tables()

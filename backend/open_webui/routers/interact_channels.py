@@ -6,17 +6,18 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 import weakref
 import xml.etree.ElementTree as ET
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal
 from urllib.parse import quote
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import aiohttp
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from open_webui.models.auths import Auths
 from open_webui.models.chats import ChatForm, Chats
@@ -25,8 +26,9 @@ from open_webui.models.interact_channels import (
     InteractChannels,
 )
 from open_webui.models.interact_data_connectors import InteractDataConnectors
+from open_webui.tools.interact_database import scan_data_connector_schema
 from open_webui.models.users import Users
-from open_webui.utils.auth import get_password_hash
+from open_webui.utils.auth import get_password_hash, get_verified_user
 from open_webui.utils.automations import (
     _resolve_model_features,
     _resolve_model_filter_ids,
@@ -57,6 +59,37 @@ DEFAULT_CONTEXT_SUMMARY_TRIGGER_TOKENS = 12_000
 DEFAULT_CONTEXT_SUMMARY_RECENT_MESSAGES = 12
 DEFAULT_CONTEXT_SUMMARY_MAX_OUTPUT_TOKENS = 1_200
 _context_summary_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+_channel_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_channel_background_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _channel_background_tasks.add(task)
+
+    def _cleanup(completed: asyncio.Task) -> None:
+        _channel_background_tasks.discard(completed)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception('Interact channel background task failed')
+
+    task.add_done_callback(_cleanup)
+    return task
+
+REASONING_DETAILS_RE = re.compile(
+    r'<details\b[^>]*\btype=["\']reasoning["\'][^>]*>[\s\S]*?</details>\s*',
+    re.IGNORECASE,
+)
+FUNCTION_CALL_MARKUP_RE = re.compile(
+    r'<function_calls\b[\s\S]*?</function_calls>\s*|<invoke\b[\s\S]*?</invoke>\s*',
+    re.IGNORECASE,
+)
+TOOL_CALL_DETAILS_RE = re.compile(
+    r'<details\b[^>]*\btype=["\']tool_calls["\'][^>]*>[\s\S]*?</details>\s*',
+    re.IGNORECASE,
+)
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -72,6 +105,44 @@ def _context_summary_enabled() -> bool:
         'false',
         'no',
         'off',
+    }
+
+
+def _public_channel_content(content: str | None) -> str:
+    if not content:
+        return ''
+    clean = REASONING_DETAILS_RE.sub('', content)
+
+    tool_matches = list(TOOL_CALL_DETAILS_RE.finditer(clean))
+    if tool_matches:
+        # Native tool calling stores intermediate tool output in details blocks.
+        # Public channels should only receive the final assistant answer.
+        tail = clean[tool_matches[-1].end() :].strip()
+        clean = tail or TOOL_CALL_DETAILS_RE.sub('', clean).strip()
+    else:
+        clean = TOOL_CALL_DETAILS_RE.sub('', clean).strip()
+
+    if FUNCTION_CALL_MARKUP_RE.search(clean):
+        clean = FUNCTION_CALL_MARKUP_RE.sub('', clean).strip()
+        transitional_patterns = (
+            '請稍候',
+            '我現在執行查詢',
+            '讓我查詢',
+            '讓我嘗試查詢',
+            '我為您查詢',
+            '執行查詢',
+        )
+        if not clean or any(pattern in clean for pattern in transitional_patterns):
+            return '工具呼叫未成功執行，請稍後再試或聯繫管理員。'
+    return clean.strip()
+
+
+def _line_background_replies_enabled() -> bool:
+    return os.environ.get('INTERACT_LINE_BACKGROUND_REPLIES', '').strip().lower() in {
+        '1',
+        'true',
+        'yes',
+        'on',
     }
 
 
@@ -228,8 +299,16 @@ class ChannelSyncRequest(BaseModel):
     dailyBotTokenLimit: int = Field(default=100000, ge=1000, le=10000000)
 
 
+class DataConnectorAllowedChannelRef(BaseModel):
+    id: str = Field(..., min_length=1, max_length=200)
+    company_email: str | None = Field(default=None, min_length=3, max_length=320)
+    channel_type: Literal['line', 'wechat', 'telegram']
+    channel_identifier: str = Field(..., min_length=1, max_length=160)
+
+
 class DataConnectorSyncRequest(BaseModel):
     company_user_id: str = Field(..., min_length=1, max_length=200)
+    company_email: str | None = Field(default=None, min_length=3, max_length=320)
     name: str = Field(..., min_length=1, max_length=120)
     connector_type: Literal['postgres', 'postgresql', 'mysql', 'mssql', 'sqlite', 'mariadb']
     execution_mode: Literal['webui_local', 'saas_webui'] = 'webui_local'
@@ -255,8 +334,23 @@ class DataConnectorSyncRequest(BaseModel):
     allowed_group_ids: list[str] = Field(default_factory=list, max_length=300)
     allowed_model_ids: list[str] = Field(default_factory=list, max_length=300)
     allowed_channel_ids: list[str] = Field(default_factory=list, max_length=300)
+    allowed_channels: list[DataConnectorAllowedChannelRef] = Field(default_factory=list, max_length=300)
     notes: str | None = Field(default=None, max_length=1600)
     updated_at: int | str | None = None
+
+
+class DataConnectorSchemaScanRequest(BaseModel):
+    max_tables: int = Field(default=200, ge=1, le=500)
+
+
+class DataConnectorLocalCredentialsRequest(BaseModel):
+    host: str | None = Field(default=None, max_length=240)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    database_name: str | None = Field(default=None, max_length=160)
+    username: str | None = Field(default=None, max_length=160)
+    password: str | None = Field(default=None, max_length=4000)
+    connection_string: str | None = Field(default=None, max_length=8000)
+    ssl_mode: Literal['disable', 'prefer', 'require'] | None = None
 
 
 def _stable_channel_chat_id(user_id: str, payload: ChannelChatRequest) -> str:
@@ -271,6 +365,16 @@ def _stable_channel_chat_id(user_id: str, payload: ChannelChatRequest) -> str:
         ]
     )
     return f'interact-channel-{uuid5(NAMESPACE_URL, stable_key)}'
+
+
+def _model_has_enabled_builtin_tools(app, model_id: str) -> bool:
+    model = getattr(app.state, 'MODELS', {}).get(model_id, {})
+    meta = model.get('info', {}).get('meta', {}) if isinstance(model, dict) else {}
+    capabilities = meta.get('capabilities', {}) or {}
+    if capabilities.get('builtin_tools', True) is False:
+        return False
+    builtin_tools = meta.get('builtinTools', {}) or {}
+    return any(bool(enabled) for enabled in builtin_tools.values())
 
 
 def _stable_message_id(chat_id: str, platform_event_id: str, role: str) -> str:
@@ -327,6 +431,8 @@ async def _drain_streaming_response(response) -> None:
     if isinstance(response, StreamingResponse):
         async for _ in response.body_iterator:
             pass
+        if response.background is not None:
+            await response.background()
 
 
 def _response_data(response) -> dict[str, Any] | None:
@@ -516,6 +622,7 @@ def _context_summary_form_data(
             'source': 'channel',
             'channelType': payload.channelType,
             'channelId': (payload.metadata or {}).get('channelId'),
+            'modelId': model_id,
             'operation': 'context-summary',
         },
     }
@@ -799,7 +906,7 @@ def _fallback_text(channel: InteractChannelModel) -> str:
 
 def _rate_limit_text(channel: InteractChannelModel, reason: str | None) -> str:
     if reason == 'daily-token':
-        return channel.fallback_message or '今日 AI 使用額度已達上限，請稍後再試或聯絡服務人員。'
+        return '今日 AI 使用額度已達此渠道的每日 Token 上限，請調高渠道每日 Token 上限或明日再試。'
     if reason == 'daily-user':
         return '您今日的詢問次數已達上限，請明日再試。'
     return '訊息傳送速度過快，請稍候一分鐘後再試。'
@@ -882,6 +989,32 @@ async def _claim_and_respond(
     external_user_id: str,
     message: str,
 ) -> tuple[Any, str | None]:
+    claim, immediate_content, should_process = await _claim_channel_event(
+        channel,
+        platform_event_id,
+        external_user_id,
+        message,
+    )
+    if not should_process:
+        return claim, immediate_content
+
+    content = await _complete_claimed_response(
+        request,
+        channel,
+        claim,
+        external_user_id,
+        platform_event_id,
+        message,
+    )
+    return claim, content
+
+
+async def _claim_channel_event(
+    channel: InteractChannelModel,
+    platform_event_id: str,
+    external_user_id: str,
+    message: str,
+) -> tuple[Any, str | None, bool]:
     reserved_tokens = _estimated_reservation_tokens(message) if channel.reply_mode == 'ai' else 0
     claim = await InteractChannels.claim_event(
         channel,
@@ -893,14 +1026,32 @@ async def _claim_and_respond(
     if claim.reason == 'channel-deleted':
         raise HTTPException(status_code=404, detail='Channel not found or disabled.')
     if claim.reason == 'channel-disabled':
-        return claim, _fallback_text(channel)
+        return claim, _fallback_text(channel), False
     if claim.duplicate:
-        return claim, claim.response_text
+        if claim.retry_delivery and not claim.response_text and channel.reply_mode == 'ai':
+            return claim, None, True
+        return claim, _public_channel_content(claim.response_text), False
     if not claim.allowed:
         content = _rate_limit_text(channel, claim.reason)
         await InteractChannels.set_response(claim.event_id, content, 0, claim.reason)
-        return claim, content
+        return claim, content, False
+    if channel.reply_mode != 'ai':
+        content = _fallback_text(channel)
+        await InteractChannels.set_response(claim.event_id, content, 0, None)
+        return claim, content, False
 
+    return claim, None, True
+
+
+async def _complete_claimed_response(
+    request: Request,
+    channel: InteractChannelModel,
+    claim,
+    external_user_id: str,
+    platform_event_id: str,
+    message: str,
+) -> str:
+    reserved_tokens = _estimated_reservation_tokens(message) if channel.reply_mode == 'ai' else 0
     result = await _run_channel_message(
         request,
         channel,
@@ -918,7 +1069,13 @@ async def _claim_and_respond(
         (_usage_tokens(usage) or reserved_tokens) + context_summary_tokens,
         result.get('reason'),
     )
-    return claim, content
+    return content
+
+
+def _line_progress_text(channel: InteractChannelModel) -> str:
+    if channel.reply_mode != 'ai':
+        return _fallback_text(channel)
+    return '已收到，我正在查詢資料並整理答案。完成後會直接傳送結果。'
 
 
 async def _mark_delivery(claim, error: Exception | None = None) -> None:
@@ -955,6 +1112,16 @@ async def _read_webhook_body(request: Request) -> bytes:
     return body
 
 
+def _line_text_messages(text: str) -> list[dict[str, str]]:
+    clean = (text or '').strip() or ' '
+    max_length = 4800
+    chunks = [clean[index : index + max_length] for index in range(0, len(clean), max_length)] or [' ']
+    if len(chunks) > 5:
+        chunks = chunks[:5]
+        chunks[-1] = chunks[-1][: max_length - 18].rstrip() + '\n\n[內容過長，已截斷]'
+    return [{'type': 'text', 'text': chunk} for chunk in chunks]
+
+
 async def _send_line_reply(
     channel: InteractChannelModel,
     reply_token: str | None,
@@ -962,17 +1129,105 @@ async def _send_line_reply(
 ) -> None:
     if not channel.channel_access_token or not reply_token:
         raise RuntimeError('LINE access token or reply token is missing.')
+    messages = _line_text_messages(text)
     await _http_post_json(
         'https://api.line.me/v2/bot/message/reply',
         {
             'replyToken': reply_token,
-            'messages': [{'type': 'text', 'text': text[:5000]}],
+            'messages': messages,
         },
         {
             'Authorization': f'Bearer {channel.channel_access_token}',
             'Content-Type': 'application/json',
         },
     )
+
+
+async def _send_line_push(
+    channel: InteractChannelModel,
+    to: str | None,
+    text: str,
+) -> None:
+    if not channel.channel_access_token or not to:
+        raise RuntimeError('LINE access token or recipient ID is missing.')
+    messages = _line_text_messages(text)
+    await _http_post_json(
+        'https://api.line.me/v2/bot/message/push',
+        {
+            'to': to,
+            'messages': messages,
+        },
+        {
+            'Authorization': f'Bearer {channel.channel_access_token}',
+            'Content-Type': 'application/json',
+        },
+    )
+
+
+async def _send_line_background_progress(
+    channel: InteractChannelModel,
+    line_recipient_id: str,
+    done: asyncio.Event,
+) -> None:
+    updates = [
+        (20, '資料查詢仍在進行，我正在整理可用結果。'),
+        (45, '資料量或關聯較多，仍在分析中；完成後會直接傳送答案。'),
+        (90, '仍在處理中，可能是資料庫或模型回應較慢；請稍候。'),
+    ]
+    elapsed = 0
+    for delay, message in updates:
+        wait_for = max(0, delay - elapsed)
+        try:
+            await asyncio.wait_for(done.wait(), timeout=wait_for)
+            return
+        except TimeoutError:
+            elapsed = delay
+            try:
+                await _send_line_push(channel, line_recipient_id, message)
+            except Exception:
+                log.exception('Interact LINE progress delivery failed')
+
+
+async def _run_line_background_response(
+    request: Request,
+    channel: InteractChannelModel,
+    claim,
+    external_user_id: str,
+    platform_event_id: str,
+    message: str,
+    line_recipient_id: str,
+) -> None:
+    done = asyncio.Event()
+    progress_task = asyncio.create_task(
+        _send_line_background_progress(channel, line_recipient_id, done)
+    )
+    try:
+        content = await _complete_claimed_response(
+            request,
+            channel,
+            claim,
+            external_user_id,
+            platform_event_id,
+            message,
+        )
+        await _send_line_push(channel, line_recipient_id, content or _fallback_text(channel))
+        await _mark_delivery(claim)
+    except Exception as error:
+        log.exception('Interact LINE background response failed')
+        fallback = channel.fallback_message or '資料查詢發生錯誤，請稍後再試或聯繫管理員。'
+        fallback_delivered = False
+        try:
+            await InteractChannels.set_response(claim.event_id, fallback, 0, str(error)[:1000])
+            await _send_line_push(channel, line_recipient_id, fallback)
+            fallback_delivered = True
+        except Exception:
+            log.exception('Interact LINE background fallback delivery failed')
+        await _mark_delivery(claim, None if fallback_delivered else error)
+    finally:
+        done.set()
+        progress_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await progress_task
 
 
 async def _send_telegram_reply(
@@ -1060,6 +1315,7 @@ async def channel_chat(  # noqa: C901
         assistant_message_id = _stable_message_id(chat_id, payload.platformEventId, 'assistant')
         existing_assistant = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
         if existing_assistant and existing_assistant.get('content'):
+            content = _public_channel_content(existing_assistant.get('content'))
             return {
                 'ok': True,
                 'cached': True,
@@ -1067,7 +1323,7 @@ async def channel_chat(  # noqa: C901
                 'userMessageId': user_message_id,
                 'assistantMessageId': assistant_message_id,
                 'model': existing_assistant.get('model') or model_id,
-                'content': existing_assistant.get('content') or '',
+                'content': content,
                 'usage': existing_assistant.get('usage'),
             }
     else:
@@ -1085,7 +1341,7 @@ async def channel_chat(  # noqa: C901
     form_data = {
         'model': model_id,
         'messages': messages,
-        'stream': False,
+        'stream': True,
         'chat_id': chat_id,
         'id': assistant_message_id,
         'parent_id': parent_id,
@@ -1103,10 +1359,13 @@ async def channel_chat(  # noqa: C901
             'source': 'channel',
             'channelType': payload.channelType,
             'channelId': (payload.metadata or {}).get('channelId'),
+            'modelId': model_id,
         },
     }
     if payload.maxTokens:
         form_data['max_completion_tokens'] = payload.maxTokens
+    if _model_has_enabled_builtin_tools(request.app, model_id):
+        form_data['params'] = {'function_calling': 'native'}
 
     tool_ids = _resolve_model_tool_ids(request.app, model_id)
     features = _resolve_model_features(request.app, model_id)
@@ -1128,7 +1387,9 @@ async def channel_chat(  # noqa: C901
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
     assistant_message = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
-    content = (assistant_message or {}).get('content') or _message_content_from_response(_response_data(response))
+    content = _public_channel_content(
+        (assistant_message or {}).get('content') or _message_content_from_response(_response_data(response))
+    )
     usage = (assistant_message or {}).get('usage')
 
     return {
@@ -1172,8 +1433,14 @@ async def sync_channel(
                 ),
             )
 
-        # Reclaim a same-company orphan without losing its channel event history.
-        effective_channel_id = existing_platform_channel.id
+        # Reclaim a same-company orphan without losing event history, but keep
+        # the main-site channel id so data-connector channel grants still match.
+        rekeyed = await InteractChannels.rekey(existing_platform_channel.id, channel_id)
+        if not rekeyed:
+            raise HTTPException(
+                status_code=409,
+                detail='The platform channel identifier is already bound.',
+            )
 
     try:
         channel = await InteractChannels.upsert(
@@ -1213,6 +1480,46 @@ async def sync_channel(
     }
 
 
+async def _resolve_data_connector_channel_ids(payload: DataConnectorSyncRequest) -> list[str]:
+    allowed_ids = [str(item).strip() for item in payload.allowed_channel_ids if str(item).strip()]
+    if not allowed_ids or not payload.allowed_channels:
+        return allowed_ids
+
+    refs_by_id = {item.id: item for item in payload.allowed_channels}
+    payload_email = (payload.company_email or '').strip().lower()
+    resolved: list[str] = []
+
+    def channel_matches_ref(channel: InteractChannelModel, ref: DataConnectorAllowedChannelRef) -> bool:
+        ref_email = (ref.company_email or payload_email).strip().lower()
+        if not ref_email or channel.company_email != ref_email:
+            return False
+        return channel.channel_type == ref.channel_type and channel.channel_identifier == ref.channel_identifier
+
+    for channel_id in allowed_ids:
+        ref = refs_by_id.get(channel_id)
+        if not ref:
+            resolved.append(channel_id)
+            continue
+
+        by_id = await InteractChannels.get_by_id(ref.id)
+        if by_id and channel_matches_ref(by_id, ref):
+            resolved.append(ref.id)
+            continue
+
+        by_platform = await InteractChannels.get_by_platform(ref.channel_type, ref.channel_identifier)
+        if by_platform and channel_matches_ref(by_platform, ref):
+            if by_platform.id != ref.id and not await InteractChannels.get_by_id(ref.id):
+                if await InteractChannels.rekey(by_platform.id, ref.id):
+                    resolved.append(ref.id)
+                    continue
+            resolved.append(by_platform.id)
+            continue
+
+        resolved.append(ref.id)
+
+    return list(dict.fromkeys(resolved))
+
+
 @router.put('/data-connectors/{connector_id}')
 async def sync_data_connector(
     connector_id: str,
@@ -1221,9 +1528,11 @@ async def sync_data_connector(
     x_interact_service_token: str | None = Header(default=None),
 ):
     _require_service_token(authorization, x_interact_service_token)
+    data = payload.model_dump(exclude={'allowed_channels', 'company_email'})
+    data['allowed_channel_ids'] = await _resolve_data_connector_channel_ids(payload)
     connector = await InteractDataConnectors.upsert(
         {
-            **payload.model_dump(),
+            **data,
             'id': connector_id,
         }
     )
@@ -1247,6 +1556,157 @@ async def delete_data_connector(
         'connectorId': connector_id,
         'deleted': deleted,
         'absent': not deleted,
+    }
+
+
+async def _require_data_connector_company_admin(user: Any) -> str:
+    if not is_billing_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Interact company identity is not configured on this WebUI node.',
+        )
+
+    identity = await InteractBillingClient().resolve_identity(user)
+    company_user = identity.company_user
+    company_member = identity.company_member
+    company_user_id = str(company_user.get('id') or '').strip()
+    if not company_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Unable to resolve company account for this user.',
+        )
+
+    if not company_member:
+        return company_user_id
+
+    role = str(company_member.get('role') or '').lower()
+    if role not in {'owner', 'admin'}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Only the company owner or company admins can manage data connector credentials.',
+        )
+
+    return company_user_id
+
+
+async def _require_company_connector(connector_id: str, company_user_id: str):
+    connector = await InteractDataConnectors.get_by_id(connector_id)
+    if not connector or connector.company_user_id != company_user_id:
+        raise HTTPException(status_code=404, detail='Data connector not found.')
+    return connector
+
+
+@router.get('/data-connectors')
+async def list_data_connectors(
+    user=Depends(get_verified_user),
+):
+    company_user_id = await _require_data_connector_company_admin(user)
+    connectors = await InteractDataConnectors.list_by_company_user_id(company_user_id)
+    return {
+        'ok': True,
+        'connectors': [
+            {
+                'id': connector.id,
+                'companyUserId': connector.company_user_id,
+                'name': connector.name,
+                'connectorType': connector.connector_type,
+                'executionMode': connector.execution_mode,
+                'storageMode': connector.storage_mode,
+                'enabled': connector.enabled,
+                'host': connector.host,
+                'port': connector.port,
+                'databaseName': connector.database_name,
+                'username': connector.username,
+                'hasPassword': bool(connector.password),
+                'hasConnectionString': bool(connector.connection_string),
+                'sslMode': connector.ssl_mode,
+                'updatedAt': connector.updated_at,
+            }
+            for connector in connectors
+        ],
+    }
+
+
+@router.put('/data-connectors/{connector_id}/local-credentials')
+async def update_data_connector_local_credentials(
+    connector_id: str,
+    payload: DataConnectorLocalCredentialsRequest,
+    user=Depends(get_verified_user),
+):
+    company_user_id = await _require_data_connector_company_admin(user)
+    connector = await InteractDataConnectors.update_local_credentials_for_company(
+        connector_id,
+        company_user_id,
+        payload.model_dump(exclude_unset=True),
+    )
+    if not connector:
+        raise HTTPException(status_code=404, detail='Data connector not found.')
+    return {
+        'ok': True,
+        'connectorId': connector.id,
+        'storageMode': connector.storage_mode,
+        'hasPassword': bool(connector.password),
+        'hasConnectionString': bool(connector.connection_string),
+    }
+
+
+@router.delete('/data-connectors/{connector_id}/local')
+async def delete_local_data_connector(
+    connector_id: str,
+    user=Depends(get_verified_user),
+):
+    company_user_id = await _require_data_connector_company_admin(user)
+    deleted = await InteractDataConnectors.delete_for_company(connector_id, company_user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail='Data connector not found.')
+    return {
+        'ok': True,
+        'connectorId': connector_id,
+        'deleted': True,
+    }
+
+
+@router.post('/data-connectors/{connector_id}/schema-scan')
+async def scan_data_connector(
+    connector_id: str,
+    payload: DataConnectorSchemaScanRequest | None = None,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    try:
+        schema = await scan_data_connector_schema(
+            connector_id,
+            max_tables=(payload.max_tables if payload else 200),
+        )
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        'ok': True,
+        'connectorId': connector_id,
+        'schema': schema,
+    }
+
+
+@router.post('/data-connectors/{connector_id}/schema-scan-local')
+async def scan_data_connector_local_admin(
+    connector_id: str,
+    payload: DataConnectorSchemaScanRequest | None = None,
+    user=Depends(get_verified_user),
+):
+    company_user_id = await _require_data_connector_company_admin(user)
+    await _require_company_connector(connector_id, company_user_id)
+    try:
+        schema = await scan_data_connector_schema(
+            connector_id,
+            max_tables=(payload.max_tables if payload else 200),
+        )
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        'ok': True,
+        'connectorId': connector_id,
+        'schema': schema,
     }
 
 
@@ -1376,6 +1836,7 @@ async def platform_webhook(  # noqa: C901
         results = []
         for index, event in enumerate(payload.get('events') or []):
             message = event.get('message') or {}
+            message_text = message.get('text') or ''
             if (channel.enabled and channel.reply_mode == 'silent') or message.get('type') != 'text':
                 results.append({'ok': True, 'skipped': True})
                 continue
@@ -1384,23 +1845,52 @@ async def platform_webhook(  # noqa: C901
             platform_event_id = (
                 event.get('webhookEventId') or hashlib.sha256(raw_body + str(index).encode()).hexdigest()
             )
-            claim, content = await _claim_and_respond(
-                request,
+            claim, content, should_process = await _claim_channel_event(
                 channel,
                 platform_event_id,
                 external_user_id,
-                message.get('text') or '',
+                message_text,
             )
             if claim.duplicate and not claim.retry_delivery:
                 results.append({'ok': True, 'duplicate': True, 'skipped': True})
                 continue
             try:
-                await _send_line_reply(channel, event.get('replyToken'), content or '')
-                await _mark_delivery(claim)
+                defer_response = False
+                if should_process:
+                    defer_response = _line_background_replies_enabled()
+                    line_recipient_id = external_user_id if external_user_id != 'unknown' else None
+                    if not line_recipient_id or not defer_response:
+                        content = await _complete_claimed_response(
+                            request,
+                            channel,
+                            claim,
+                            external_user_id,
+                            platform_event_id,
+                            message_text,
+                        )
+                        await _send_line_reply(channel, event.get('replyToken'), content or '')
+                        await _mark_delivery(claim)
+                    else:
+                        await _send_line_reply(channel, event.get('replyToken'), _line_progress_text(channel))
+                        _spawn_channel_background_task(
+                            _run_line_background_response(
+                                request,
+                                channel,
+                                claim,
+                                external_user_id,
+                                platform_event_id,
+                                message_text,
+                                line_recipient_id,
+                            )
+                        )
+                else:
+                    await _send_line_reply(channel, event.get('replyToken'), content or '')
+                    await _mark_delivery(claim)
                 results.append(
                     {
                         'ok': True,
                         'duplicate': claim.duplicate,
+                        'background': should_process and defer_response,
                         'rateLimited': _is_rate_limited(claim.reason),
                     }
                 )

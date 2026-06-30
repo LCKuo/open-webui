@@ -1775,6 +1775,8 @@ async def chat_completion(
         ):
             tool_servers = None
 
+        requested_function_calling = form_data.get('params', {}).get('function_calling')
+
         metadata = {
             'user_id': user.id,
             'chat_id': form_data.pop('chat_id', None) or '',
@@ -1790,6 +1792,7 @@ async def chat_completion(
             'features': form_data.get('features', {}),
             'variables': form_data.get('variables', {}),
             'interact_channel': form_data.pop('interact_channel', None),
+            'model_id': model_id,
             'model': model,
             'direct': model_item.get('direct', False),
             'params': {
@@ -1798,8 +1801,11 @@ async def chat_completion(
                 'function_calling': (
                     'native'
                     if (
-                        form_data.get('params', {}).get('function_calling') == 'native'
-                        or model_info_params.get('function_calling') == 'native'
+                        requested_function_calling == 'native'
+                        or (
+                            requested_function_calling is None
+                            and model_info_params.get('function_calling') == 'native'
+                        )
                     )
                     else 'default'
                 ),

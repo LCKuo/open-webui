@@ -144,6 +144,15 @@
 								{$i18n.t('Tools')}
 							</a>
 						{/if}
+
+						<a
+							draggable="false"
+							aria-current={$page.url.pathname.includes('/workspace/data-connectors') ? 'page' : null}
+							class="min-w-fit p-1.5 {$page.url.pathname.includes('/workspace/data-connectors')
+								? ''
+								: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition select-none"
+							href="/workspace/data-connectors">資料連線</a
+						>
 					</div>
 				</div>
 

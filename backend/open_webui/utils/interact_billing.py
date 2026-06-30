@@ -277,6 +277,18 @@ class InteractBillingClient:
         identity = await self.resolve_identity(user)
         company_user = identity.company_user
         company_member = identity.company_member
+        metadata["interact_company"] = {
+            "companyUserId": company_user.get("id"),
+            **(
+                {
+                    "companyMemberId": company_member.get("id"),
+                    "companyMemberEmail": company_member.get("email"),
+                    "companyMemberRole": company_member.get("role"),
+                }
+                if company_member
+                else {}
+            ),
+        }
         request_id = f"{metadata.get('chat_id') or 'direct'}:{metadata.get('message_id') or uuid4()}"
         channel_metadata = metadata.get("interact_channel") or {}
 

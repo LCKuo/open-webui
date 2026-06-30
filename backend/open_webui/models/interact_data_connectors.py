@@ -145,6 +145,13 @@ def _decrypt_secret(value: str | None) -> str | None:
         return None
 
 
+def _local_value(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return value
+
+
 def _coerce_updated_at(value: Any) -> int:
     if isinstance(value, (int, float)):
         return int(value)
@@ -226,13 +233,28 @@ class InteractDataConnectorsTable:
             row.execution_mode = data.get('execution_mode') or 'webui_local'
             row.storage_mode = data.get('storage_mode') or 'metadata_only'
             row.enabled = bool(data.get('enabled'))
-            row.host = data.get('host')
-            row.port = data.get('port')
-            row.database_name = data.get('database_name')
-            row.username = data.get('username')
-            row.password = _encrypt_secret(data.get('password'))
-            row.connection_string = _encrypt_secret(data.get('connection_string'))
-            row.ssl_mode = data.get('ssl_mode')
+            if data.get('storage_mode') == 'metadata_only':
+                row.host = row.host if data.get('host') is None else _local_value(data.get('host'))
+                row.port = row.port if data.get('port') is None else data.get('port')
+                row.database_name = (
+                    row.database_name if data.get('database_name') is None else _local_value(data.get('database_name'))
+                )
+                row.username = row.username if data.get('username') is None else _local_value(data.get('username'))
+                row.password = row.password if not data.get('password') else _encrypt_secret(data.get('password'))
+                row.connection_string = (
+                    row.connection_string
+                    if not data.get('connection_string')
+                    else _encrypt_secret(data.get('connection_string'))
+                )
+                row.ssl_mode = row.ssl_mode if data.get('ssl_mode') is None else data.get('ssl_mode')
+            else:
+                row.host = _local_value(data.get('host'))
+                row.port = data.get('port')
+                row.database_name = _local_value(data.get('database_name'))
+                row.username = _local_value(data.get('username'))
+                row.password = _encrypt_secret(data.get('password'))
+                row.connection_string = _encrypt_secret(data.get('connection_string'))
+                row.ssl_mode = data.get('ssl_mode')
             row.allowed_schemas = _json_dump(_json_list(data.get('allowed_schemas')))
             row.allowed_tables = _json_dump(_json_list(data.get('allowed_tables')))
             row.blocked_tables = _json_dump(_json_list(data.get('blocked_tables')))
@@ -252,10 +274,105 @@ class InteractDataConnectorsTable:
             await db.refresh(row)
             return self._model(row)
 
+    async def list_all(self) -> list[InteractDataConnectorModel]:
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            result = await db.execute(
+                select(InteractDataConnector).order_by(
+                    InteractDataConnector.updated_at.desc(),
+                    InteractDataConnector.name.asc(),
+                )
+            )
+            return [self._model(row) for row in result.scalars().all()]
+
+    async def list_by_company_user_id(self, company_user_id: str) -> list[InteractDataConnectorModel]:
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            result = await db.execute(
+                select(InteractDataConnector)
+                .where(InteractDataConnector.company_user_id == company_user_id)
+                .order_by(
+                    InteractDataConnector.updated_at.desc(),
+                    InteractDataConnector.name.asc(),
+                )
+            )
+            return [self._model(row) for row in result.scalars().all()]
+
+    async def update_local_credentials(self, connector_id: str, data: dict[str, Any]) -> InteractDataConnectorModel | None:
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            row = await db.get(InteractDataConnector, connector_id)
+            if not row:
+                return None
+
+            for field in ('host', 'port', 'database_name', 'username', 'ssl_mode'):
+                if field in data:
+                    setattr(row, field, _local_value(data.get(field)))
+
+            if data.get('password'):
+                row.password = _encrypt_secret(data.get('password'))
+            if data.get('connection_string'):
+                row.connection_string = _encrypt_secret(data.get('connection_string'))
+
+            row.storage_mode = 'metadata_only'
+            row.updated_at = int(time.time())
+            await db.commit()
+            await db.refresh(row)
+            return self._model(row)
+
+    async def update_local_credentials_for_company(
+        self,
+        connector_id: str,
+        company_user_id: str,
+        data: dict[str, Any],
+    ) -> InteractDataConnectorModel | None:
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            result = await db.execute(
+                select(InteractDataConnector).where(
+                    InteractDataConnector.id == connector_id,
+                    InteractDataConnector.company_user_id == company_user_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if not row:
+                return None
+
+            for field in ('host', 'port', 'database_name', 'username', 'ssl_mode'):
+                if field in data:
+                    setattr(row, field, _local_value(data.get(field)))
+
+            if data.get('password'):
+                row.password = _encrypt_secret(data.get('password'))
+            if data.get('connection_string'):
+                row.connection_string = _encrypt_secret(data.get('connection_string'))
+
+            row.storage_mode = 'metadata_only'
+            row.updated_at = int(time.time())
+            await db.commit()
+            await db.refresh(row)
+            return self._model(row)
+
     async def delete(self, connector_id: str) -> bool:
         await self.ensure_tables()
         async with get_async_db_context() as db:
             row = await db.get(InteractDataConnector, connector_id)
+            if not row:
+                return False
+            await db.delete(row)
+            await db.commit()
+            return True
+
+    async def delete_for_company(self, connector_id: str, company_user_id: str) -> bool:
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            result = await db.execute(
+                select(InteractDataConnector).where(
+                    InteractDataConnector.id == connector_id,
+                    InteractDataConnector.company_user_id == company_user_id,
+                )
+            )
+            row = result.scalar_one_or_none()
             if not row:
                 return False
             await db.delete(row)
