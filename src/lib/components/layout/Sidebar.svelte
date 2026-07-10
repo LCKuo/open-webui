@@ -85,7 +85,7 @@
 	import HotkeyHint from '../common/HotkeyHint.svelte';
 
 	const BREAKPOINT = 768;
-	const DEFAULT_PINNED_ITEMS = ['notes', 'workspace'];
+	const DEFAULT_PINNED_ITEMS = ['notes', 'workspace', 'workflows'];
 
 	let scrollTop = 0;
 
@@ -139,6 +139,11 @@
 					$config?.features?.enable_automations &&
 					($user?.role === 'admin' || $user?.permissions?.features?.automations)
 				);
+			case 'workflows':
+				return (
+					($config?.features?.enable_workflows ?? true) &&
+					($user?.role === 'admin' || ($user?.permissions?.features?.workflows ?? true))
+				);
 			case 'calendar':
 				return (
 					$config?.features?.enable_calendar &&
@@ -155,6 +160,7 @@
 		const items = {
 			notes: { label: 'Notes', href: '/notes', iconType: 'note' },
 			workspace: { label: 'Workspace', href: '/workspace', iconType: 'workspace' },
+			workflows: { label: 'Workflows', href: '/workflows', iconType: 'workflows' },
 			automations: { label: 'Automations', href: '/automations', iconType: 'automations' },
 			calendar: { label: 'Calendar', href: '/calendar', iconType: 'calendar' },
 			playground: { label: 'Playground', href: '/playground', iconType: 'playground' }
@@ -950,6 +956,21 @@
 													d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
 												/>
 											</svg>
+										{:else if itemId === 'workflows'}
+											<svg
+												xmlns="http://www.w3.org/2000/svg"
+												fill="none"
+												viewBox="0 0 24 24"
+												stroke-width="1.5"
+												stroke="currentColor"
+												class="size-4.5"
+											>
+												<path
+													stroke-linecap="round"
+													stroke-linejoin="round"
+													d="M6 6h4.5v4.5H6V6Zm7.5 0H18v4.5h-4.5V6ZM6 13.5h4.5V18H6v-4.5Zm4.5-5.25h3m-3 7.5h3m0-7.5v7.5m0 0H18"
+												/>
+											</svg>
 										{:else if itemId === 'calendar'}
 											<svg
 												xmlns="http://www.w3.org/2000/svg"
@@ -1197,6 +1218,21 @@
 														stroke-linecap="round"
 														stroke-linejoin="round"
 														d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
+													/>
+												</svg>
+											{:else if itemId === 'workflows'}
+												<svg
+													xmlns="http://www.w3.org/2000/svg"
+													fill="none"
+													viewBox="0 0 24 24"
+													stroke-width="2"
+													stroke="currentColor"
+													class="size-4.5"
+												>
+													<path
+														stroke-linecap="round"
+														stroke-linejoin="round"
+														d="M6 6h4.5v4.5H6V6Zm7.5 0H18v4.5h-4.5V6ZM6 13.5h4.5V18H6v-4.5Zm4.5-5.25h3m-3 7.5h3m0-7.5v7.5m0 0H18"
 													/>
 												</svg>
 											{:else if itemId === 'calendar'}

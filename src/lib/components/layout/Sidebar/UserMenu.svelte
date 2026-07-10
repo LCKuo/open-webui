@@ -60,7 +60,7 @@
 
 	const dispatch = createEventDispatcher();
 
-	const DEFAULT_PINNED_ITEMS = ['notes', 'workspace'];
+	const DEFAULT_PINNED_ITEMS = ['notes', 'workspace', 'workflows'];
 
 	$: pinnedItems = $settings?.pinnedMenuItems ?? DEFAULT_PINNED_ITEMS;
 
@@ -484,6 +484,63 @@
 								on:click|preventDefault|stopPropagation={() => togglePin('calendar')}
 							>
 								{#if isPinned('calendar')}
+									<PinSlash className="size-3.5" strokeWidth="1.5" />
+								{:else}
+									<Pin className="size-3.5" strokeWidth="1.5" />
+								{/if}
+							</button>
+						</Tooltip>
+					{/if}
+				</div>
+			{/if}
+
+			{#if ($config?.features?.enable_workflows ?? true) && ($user?.role === 'admin' || ($user?.permissions?.features?.workflows ?? true))}
+				<div class="flex items-center w-full">
+					<a
+						href="/workflows"
+						draggable="false"
+						class="flex flex-1 rounded-xl py-1.5 px-3 hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
+						on:click={async (e) => {
+							if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+							e.preventDefault();
+							show = false;
+							goto('/workflows');
+							if ($mobile) {
+								await tick();
+								showSidebar.set(false);
+							}
+						}}
+					>
+						<div class="self-center mr-3">
+							<svg
+								xmlns="http://www.w3.org/2000/svg"
+								fill="none"
+								viewBox="0 0 24 24"
+								stroke-width="1.5"
+								stroke="currentColor"
+								class="size-5"
+							>
+								<path
+									stroke-linecap="round"
+									stroke-linejoin="round"
+									d="M6 6h4.5v4.5H6V6Zm7.5 0H18v4.5h-4.5V6ZM6 13.5h4.5V18H6v-4.5Zm4.5-5.25h3m-3 7.5h3m0-7.5v7.5m0 0H18"
+								/>
+							</svg>
+						</div>
+						<div class="self-center truncate">{$i18n.t('Workflows')}</div>
+					</a>
+					{#if shiftKey}
+						<Tooltip
+							content={isPinned('workflows')
+								? $i18n.t('Unpin from Sidebar')
+								: $i18n.t('Pin to Sidebar')}
+						>
+							<button
+								type="button"
+								class="p-1 mr-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+								on:click|preventDefault|stopPropagation={() => togglePin('workflows')}
+							>
+								{#if isPinned('workflows')}
 									<PinSlash className="size-3.5" strokeWidth="1.5" />
 								{:else}
 									<Pin className="size-3.5" strokeWidth="1.5" />
