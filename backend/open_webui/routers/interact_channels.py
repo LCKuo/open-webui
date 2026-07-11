@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from open_webui.models.auths import Auths
 from open_webui.models.chats import ChatForm, Chats
+from open_webui.models.config import Config
 from open_webui.models.interact_channels import (
     InteractChannelModel,
     InteractChannels,
@@ -30,6 +31,7 @@ from open_webui.models.interact_data_connectors import InteractDataConnectors
 from open_webui.tools.interact_database import scan_data_connector_schema
 from open_webui.models.users import Users
 from open_webui.utils.auth import get_password_hash, get_verified_user
+from open_webui.utils.assistant_content import output_text, response_text
 from open_webui.utils.automations import (
     _resolve_model_features,
     _resolve_model_filter_ids,
@@ -277,8 +279,30 @@ def _public_channel_content(content: str | None) -> str:
             '執行查詢',
         )
         if not clean or any(pattern in clean for pattern in transitional_patterns):
-            return '工具呼叫未成功執行，請稍後再試或聯繫管理員。'
+            return '模型產生了工具指令，但系統未能執行。（錯誤代碼：TOOL-CALL-NOT-EXECUTED）'
     return clean.strip()
+
+
+CHANNEL_RUNTIME_ERROR_MESSAGES = {
+    'AI-MODEL-NOT-CONFIGURED': '此渠道尚未設定 AI 模型。',
+    'AI-MODEL-NOT-FOUND': '此渠道設定的 AI 模型不存在或已停用。',
+    'AI-ACCOUNT-NOT-FOUND': '此渠道綁定的 WebUI 帳號不存在。',
+    'AI-ACCOUNT-PENDING': '此渠道綁定的 WebUI 帳號尚未完成啟用。',
+    'AI-RUNTIME-FAILED': 'AI 執行服務發生未分類錯誤，請聯繫管理員。',
+}
+
+
+def _channel_runtime_failure(detail: str) -> tuple[str, str]:
+    lowered = detail.lower()
+    if 'configured open webui model was not found' in lowered:
+        code = 'AI-MODEL-NOT-FOUND'
+    elif 'interact web ai user not found' in lowered:
+        code = 'AI-ACCOUNT-NOT-FOUND'
+    elif 'pending approval' in lowered:
+        code = 'AI-ACCOUNT-PENDING'
+    else:
+        code = 'AI-RUNTIME-FAILED'
+    return code, f'{CHANNEL_RUNTIME_ERROR_MESSAGES[code]}（錯誤代碼：{code}）'
 
 
 def _context_summary_settings() -> tuple[int, int, int]:
@@ -416,6 +440,7 @@ class ProvisionAccountRequest(BaseModel):
 
 class ChannelHealthRequest(BaseModel):
     companyEmail: str = Field(..., min_length=3, max_length=320)
+    allowMissingUser: bool = False
 
 
 class ChannelSyncRequest(BaseModel):
@@ -558,16 +583,7 @@ async def _ensure_channel_chat(user_id: str, chat_id: str, payload: ChannelChatR
 
 
 def _message_content_from_response(data: dict[str, Any] | None) -> str:
-    if not data:
-        return ''
-    choices = data.get('choices') or []
-    if choices:
-        message = choices[0].get('message') or {}
-        content = message.get('content')
-        if isinstance(content, str):
-            return content
-    content = data.get('content')
-    return content if isinstance(content, str) else ''
+    return response_text(data)
 
 
 def _workflow_outputs_from_items(items: Any) -> list[dict[str, Any]]:
@@ -580,6 +596,42 @@ def _workflow_outputs_from_items(items: Any) -> list[dict[str, Any]]:
         and item.get('type') == 'open_webui:workflow_output'
         and isinstance(item.get('workflow_output'), dict)
     ]
+
+
+def _tool_failure_from_items(items: Any) -> tuple[str, str] | None:
+    if not isinstance(items, list):
+        return None
+
+    calls = {
+        str(item.get('call_id') or ''): str(item.get('name') or '')
+        for item in items
+        if isinstance(item, dict) and item.get('type') == 'function_call'
+    }
+    for item in items:
+        if not isinstance(item, dict) or item.get('type') != 'function_call_output':
+            continue
+        tool_name = calls.get(str(item.get('call_id') or ''), '')
+        for part in item.get('output') or []:
+            if not isinstance(part, dict) or part.get('type') not in ('input_text', 'output_text', 'text'):
+                continue
+            raw = part.get('text')
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict) and payload.get('ok') is False:
+                code = str(payload.get('error_code') or 'TOOL-EXECUTION-FAILED')
+                message = str(payload.get('message') or '工具執行失敗，請聯繫管理員。')
+                return code, f'{message}（錯誤代碼：{code}）'
+            if raw.startswith('Error: Tool call arguments could not be parsed'):
+                return 'TOOL-ARGUMENTS-INVALID', '模型產生的工具參數格式不正確，請重新描述需求。（錯誤代碼：TOOL-ARGUMENTS-INVALID）'
+            if raw.startswith('Error: Tool "') and raw.endswith('not found.'):
+                return 'TOOL-NOT-AVAILABLE', '模型要求的工具目前不可用或未獲授權。（錯誤代碼：TOOL-NOT-AVAILABLE）'
+            if tool_name.startswith('interact_database') and raw.lower().startswith('error:'):
+                return 'DB-INTERNAL-ERROR', '資料庫工具執行失敗，請聯繫管理員。（錯誤代碼：DB-INTERNAL-ERROR）'
+    return None
 
 
 async def _drain_streaming_response(response) -> None:
@@ -1061,12 +1113,12 @@ def _fallback_text(channel: InteractChannelModel) -> str:
 
 def _rate_limit_text(channel: InteractChannelModel, reason: str | None) -> str:
     if reason == 'daily-token':
-        return '今日 AI 使用額度已達此渠道的每日 Token 上限，請調高渠道每日 Token 上限或明日再試。'
+        return '此 Bot 今日 AI token 額度已用完。（錯誤代碼：CHANNEL-BOT-DAILY-TOKEN-LIMIT）'
     if reason == 'daily-user':
-        return '您今日的詢問次數已達上限，請明日再試。'
+        return '您今日的 AI 詢問次數已達上限。（錯誤代碼：CHANNEL-USER-DAILY-LIMIT）'
     if reason == 'user-rpm':
-        return '您的訊息傳送速度過快，請稍候一分鐘後再試。'
-    return '訊息傳送速度過快，請稍候一分鐘後再試。'
+        return '您的訊息傳送速度過快，請稍候一分鐘後再試。（錯誤代碼：CHANNEL-USER-RATE-LIMIT）'
+    return '此 Bot 目前訊息量過高，請稍候一分鐘後再試。（錯誤代碼：CHANNEL-BOT-RATE-LIMIT）'
 
 
 def _is_rate_limited(reason: str | None) -> bool:
@@ -1102,11 +1154,13 @@ async def _run_channel_message(
     if channel.reply_mode != 'ai':
         return {'ok': True, 'content': _fallback_text(channel), 'usage': {}}
     if not channel.model_id:
+        code = 'AI-MODEL-NOT-CONFIGURED'
         return {
             'ok': False,
-            'content': _fallback_text(channel),
+            'content': f'{CHANNEL_RUNTIME_ERROR_MESSAGES[code]}（錯誤代碼：{code}）',
             'usage': {},
-            'reason': 'missing-model',
+            'reason': code,
+            'errorCode': code,
         }
 
     try:
@@ -1135,11 +1189,13 @@ async def _run_channel_message(
     except Exception as error:
         log.exception('Interact platform message failed')
         detail = error.detail if isinstance(error, HTTPException) else str(error)
+        code, public_message = _channel_runtime_failure(str(detail))
         return {
             'ok': False,
-            'content': _fallback_text(channel),
+            'content': public_message,
             'usage': {},
-            'reason': str(detail)[:1000],
+            'reason': code,
+            'errorCode': code,
         }
 
 
@@ -1572,6 +1628,7 @@ async def channel_chat(  # noqa: C901
     x_interact_service_token: str | None = Header(default=None),
 ):
     _require_service_token(authorization, x_interact_service_token)
+    request.state.interact_channel_runtime = True
     if not payload.message.strip() and not payload.parts:
         raise HTTPException(status_code=400, detail='A message or media part is required.')
 
@@ -1660,7 +1717,7 @@ async def channel_chat(  # noqa: C901
         form_data['params'] = {'function_calling': 'native'}
 
     tool_ids = _resolve_model_tool_ids(request.app, model_id)
-    features = _resolve_model_features(request.app, model_id)
+    features = await _resolve_model_features(request.app, model_id)
     filter_ids = _resolve_model_filter_ids(request.app, model_id)
     if tool_ids:
         form_data['tool_ids'] = tool_ids
@@ -1698,8 +1755,16 @@ async def channel_chat(  # noqa: C901
 
     assistant_message = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
     response_data = _response_data(response)
-    content = _public_channel_content(
-        (assistant_message or {}).get('content') or _message_content_from_response(response_data)
+    assistant_output = (assistant_message or {}).get('output') or (response_data or {}).get('output')
+    tool_failure = _tool_failure_from_items(assistant_output)
+    content = (
+        tool_failure[1]
+        if tool_failure
+        else _public_channel_content(
+            (assistant_message or {}).get('content')
+            or output_text((assistant_message or {}).get('output'))
+            or _message_content_from_response(response_data)
+        )
     )
     usage = (assistant_message or {}).get('usage')
     outputs = _workflow_outputs_from_items(
@@ -1716,6 +1781,7 @@ async def channel_chat(  # noqa: C901
         'outputs': outputs,
         'usage': usage,
         'contextSummaryTokens': context_summary_tokens,
+        **({'reason': tool_failure[0], 'errorCode': tool_failure[0]} if tool_failure else {}),
     }
 
 
@@ -2378,9 +2444,30 @@ async def channel_health(
     x_interact_service_token: str | None = Header(default=None),
 ):
     _require_service_token(authorization, x_interact_service_token)
-    user = await Users.get_user_by_email(payload.companyEmail)
+    company_email = payload.companyEmail.strip().lower()
+    user = await Users.get_user_by_email(company_email)
     if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Interact Web Ai user not found.')
+        if not payload.allowMissingUser:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Interact Web Ai user not found.')
+        if not is_billing_enabled():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail='Interact billing is not configured.',
+            )
+        return {
+            'ok': True,
+            'service': 'interact-channel',
+            'serviceTokenVerified': True,
+            'billingConfigured': True,
+            'userVerified': False,
+            'billingVerified': False,
+            'accountRequired': True,
+            'workersReady': _channel_worker_expected > 0
+            and len(_channel_worker_tasks) == _channel_worker_expected,
+            'workerCount': len(_channel_worker_tasks),
+            'expectedWorkerCount': _channel_worker_expected,
+            'queue': {},
+        }
     if user.role == 'pending':
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Interact Web Ai user is pending approval.')
     if not is_billing_enabled():
@@ -2390,12 +2477,15 @@ async def channel_health(
         )
 
     await InteractBillingClient().resolve_user(user)
-    queue = await InteractChannels.queue_health(payload.companyEmail)
+    queue = await InteractChannels.queue_health(company_email)
     return {
         'ok': True,
         'service': 'interact-channel',
+        'serviceTokenVerified': True,
+        'billingConfigured': True,
         'userVerified': True,
         'billingVerified': True,
+        'accountRequired': False,
         'workersReady': _channel_worker_expected > 0 and len(_channel_worker_tasks) == _channel_worker_expected,
         'workerCount': len(_channel_worker_tasks),
         'expectedWorkerCount': _channel_worker_expected,
@@ -2435,13 +2525,19 @@ async def provision_account(
     existing = await Users.get_user_by_email(email)
 
     if existing:
+        temporary_password = secrets.token_urlsafe(24)
+        credential_created = await Auths.ensure_auth_for_existing_user(
+            existing.id,
+            email,
+            await get_password_hash(temporary_password),
+        )
         updates = {}
         if existing.role == 'pending':
             updates['role'] = 'user'
         updates['bio'] = bio
         updated = await Users.update_user_by_id(existing.id, updates) if updates else existing
         await apply_default_group_assignment(
-            request.app.state.config.DEFAULT_GROUP_ID,
+            await Config.get('ui.default_group_id'),
             existing.id,
         )
         return {
@@ -2451,14 +2547,14 @@ async def provision_account(
             'email': email,
             'name': updated.name if updated else existing.name,
             'role': updated.role if updated else existing.role,
-            'temporaryPassword': None,
+            'temporaryPassword': temporary_password if credential_created else None,
         }
 
     temporary_password = secrets.token_urlsafe(24)
     try:
         user = await Auths.insert_new_auth(
             email=email,
-            password=get_password_hash(temporary_password),
+            password=await get_password_hash(temporary_password),
             name=display_name,
             role='user',
         )
@@ -2467,7 +2563,7 @@ async def provision_account(
         if not user:
             raise
         await apply_default_group_assignment(
-            request.app.state.config.DEFAULT_GROUP_ID,
+            await Config.get('ui.default_group_id'),
             user.id,
         )
         return {
@@ -2487,7 +2583,7 @@ async def provision_account(
 
     await Users.update_user_by_id(user.id, {'bio': bio})
     await apply_default_group_assignment(
-        request.app.state.config.DEFAULT_GROUP_ID,
+        await Config.get('ui.default_group_id'),
         user.id,
     )
 

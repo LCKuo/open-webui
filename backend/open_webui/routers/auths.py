@@ -737,14 +737,15 @@ async def signin(
                 db=db,
             )
     else:
-        if signin_rate_limiter.is_limited(form_data.email.lower()):
+        normalized_email = form_data.email.strip().lower()
+        if signin_rate_limiter.is_limited(normalized_email):
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
             )
 
         user = await Auths.authenticate_user(
-            form_data.email.lower(),
+            normalized_email,
             lambda pw: verify_password(form_data.password, pw),
             db=db,
         )

@@ -1,5 +1,14 @@
 import pytest
-from open_webui.routers.interact_channels import _line_result_messages, _wechat_media_response
+from types import SimpleNamespace
+
+from open_webui.routers.interact_channels import (
+    ChannelHealthRequest,
+    ProvisionAccountRequest,
+    _line_result_messages,
+    _wechat_media_response,
+    provision_account,
+    channel_health,
+)
 from open_webui.utils.interact_billing import estimate_reserved_tokens
 from open_webui.utils.workflow_runtime import (
     WorkflowRuntimeError,
@@ -173,6 +182,150 @@ def test_wechat_adapter_can_reuse_native_media_id():
 
     assert '<MsgType><![CDATA[voice]]></MsgType>' in xml
     assert '<Voice><MediaId><![CDATA[media-1]]></MediaId></Voice>' in xml
+
+
+@pytest.mark.asyncio
+async def test_account_provision_awaits_password_hash(monkeypatch):
+    captured = {}
+    user = SimpleNamespace(id='user-1', email='new@example.com', name='New User', role='user')
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._require_service_token',
+        lambda *args: None,
+    )
+
+    async def get_user_by_email(email):
+        return None
+
+    async def hash_password(password):
+        return f'hashed:{password}'
+
+    async def insert_auth(**kwargs):
+        captured.update(kwargs)
+        return user
+
+    async def update_user(user_id, updates):
+        return user
+
+    async def assign_group(*args, **kwargs):
+        return None
+
+    async def get_config(key):
+        assert key == 'ui.default_group_id'
+        return ''
+
+    monkeypatch.setattr('open_webui.routers.interact_channels.Users.get_user_by_email', get_user_by_email)
+    monkeypatch.setattr('open_webui.routers.interact_channels.get_password_hash', hash_password)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Auths.insert_new_auth', insert_auth)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Users.update_user_by_id', update_user)
+    monkeypatch.setattr('open_webui.routers.interact_channels.apply_default_group_assignment', assign_group)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Config.get', get_config)
+
+    result = await provision_account(
+        SimpleNamespace(),
+        ProvisionAccountRequest(
+            email='new@example.com',
+            companyName='Example Company',
+            contactName='New User',
+            accountType='owner',
+        ),
+        None,
+        None,
+    )
+
+    assert captured['password'].startswith('hashed:')
+    assert result['created'] is True
+    assert result['temporaryPassword']
+
+
+@pytest.mark.asyncio
+async def test_account_provision_repairs_user_without_credentials(monkeypatch):
+    captured = {}
+    user = SimpleNamespace(id='user-1', email='orphan@example.com', name='Orphan User', role='user')
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._require_service_token',
+        lambda *args: None,
+    )
+
+    async def get_user_by_email(email):
+        return user
+
+    async def hash_password(password):
+        return f'hashed:{password}'
+
+    async def ensure_auth(user_id, email, password):
+        captured.update(user_id=user_id, email=email, password=password)
+        return True
+
+    async def update_user(user_id, updates):
+        return user
+
+    async def get_config(key):
+        return ''
+
+    async def assign_group(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr('open_webui.routers.interact_channels.Users.get_user_by_email', get_user_by_email)
+    monkeypatch.setattr('open_webui.routers.interact_channels.get_password_hash', hash_password)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Auths.ensure_auth_for_existing_user', ensure_auth)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Users.update_user_by_id', update_user)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Config.get', get_config)
+    monkeypatch.setattr('open_webui.routers.interact_channels.apply_default_group_assignment', assign_group)
+
+    result = await provision_account(
+        SimpleNamespace(),
+        ProvisionAccountRequest(
+            email='orphan@example.com',
+            companyName='Example Company',
+            contactName='Orphan User',
+            accountType='owner',
+        ),
+        None,
+        None,
+    )
+
+    assert captured['password'].startswith('hashed:')
+    assert result['created'] is False
+    assert result['temporaryPassword']
+
+
+@pytest.mark.asyncio
+async def test_binding_health_allows_account_to_be_created_later(monkeypatch):
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._require_service_token',
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.is_billing_enabled',
+        lambda: True,
+    )
+
+    async def missing_user(email):
+        return None
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.Users.get_user_by_email',
+        missing_user,
+    )
+    monkeypatch.setattr('open_webui.routers.interact_channels._channel_worker_expected', 1)
+    monkeypatch.setattr('open_webui.routers.interact_channels._channel_worker_tasks', {object()})
+
+    result = await channel_health(
+        ChannelHealthRequest(
+            companyEmail=' New@Example.com ',
+            allowMissingUser=True,
+        ),
+        None,
+        None,
+    )
+
+    assert result['serviceTokenVerified'] is True
+    assert result['billingConfigured'] is True
+    assert result['accountRequired'] is True
+    assert result['userVerified'] is False
+    assert result['workersReady'] is True
 
 
 @pytest.mark.asyncio

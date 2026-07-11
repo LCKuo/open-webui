@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from open_webui.models.chats import Chats
 from open_webui.models.config import Config
+from open_webui.utils.assistant_content import response_text
 from open_webui.utils.misc import get_content_from_message, get_last_user_message, get_message_list
 from open_webui.utils.task import (
     get_task_model_id,
@@ -328,17 +329,7 @@ def _response_text(response: Any) -> str:
     if not isinstance(response, dict):
         return ''
 
-    choices = response.get('choices') or []
-    if choices:
-        message = choices[0].get('message') or {}
-        return message.get('content') or message.get('reasoning_content') or ''
-
-    parts = []
-    for item in response.get('output') or []:
-        for content in item.get('content') or []:
-            if isinstance(content, dict):
-                parts.append(content.get('text') or content.get('content') or '')
-    return '\n'.join(part for part in parts if part)
+    return response_text(response)
 
 
 def _estimate_messages_tokens(messages: list[dict]) -> int:

@@ -319,7 +319,7 @@ export const userSignIn = async (email: string, password: string) => {
 		},
 		credentials: 'include',
 		body: JSON.stringify({
-			email: email,
+			email: email.trim(),
 			password: password
 		})
 	})

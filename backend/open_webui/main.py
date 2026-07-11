@@ -1588,7 +1588,7 @@ async def chat_completion(
             if billing_client and billing_authorization:
                 await billing_client.cancel(billing_authorization, 'chat-error')
             error_detail = e.detail if isinstance(e, HTTPException) else str(e)
-            log.error('Error processing chat payload: %s', error_detail)
+            log.exception('Error processing chat payload: %s', error_detail)
             if metadata.get('chat_id') and metadata.get('message_id'):
                 # Update the chat message with the error
                 try:

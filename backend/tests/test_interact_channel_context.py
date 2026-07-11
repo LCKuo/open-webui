@@ -20,6 +20,7 @@ from open_webui.routers.interact_channels import (
     _should_summarize_context,
     _summary_history_state,
     _usage_tokens,
+    channel_chat,
     delete_channel,
     platform_webhook,
 )
@@ -660,6 +661,74 @@ async def test_streaming_summary_content_is_collected():
         yield 'data: [DONE]\n\n'
 
     assert await _response_content(StreamingResponse(body(), media_type='text/event-stream')) == 'first second'
+
+
+@pytest.mark.asyncio
+async def test_channel_chat_awaits_model_features(monkeypatch):
+    captured = {}
+    captured_runtime = {}
+    user = SimpleNamespace(id='shared-user', role='user')
+    chat = SimpleNamespace(chat={'history': {'currentId': None}})
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._require_service_token', lambda *args: None)
+
+    async def get_user(email):
+        return user
+
+    async def ensure_chat(*args):
+        return chat
+
+    async def prepare_context(*args):
+        return [{'role': 'user', 'content': 'hello'}], 0
+
+    async def resolve_features(*args):
+        return {'image_generation': True}
+
+    async def select_workflow(*args, **kwargs):
+        return SimpleNamespace(decision='none', selected_workflow_id=None, selected_version_id=None)
+
+    async def get_message(*args):
+        return {
+            'content': '',
+            'output': [
+                {
+                    'type': 'reasoning',
+                    'content': [{'type': 'output_text', 'text': 'private reasoning'}],
+                },
+                {
+                    'type': 'message',
+                    'role': 'assistant',
+                    'content': [{'type': 'output_text', 'text': 'done'}],
+                },
+            ],
+        }
+
+    async def handler(request, form_data, user):
+        captured.update(form_data)
+        captured_runtime['trusted'] = request.state.interact_channel_runtime
+        return {}
+
+    monkeypatch.setattr('open_webui.routers.interact_channels.Users.get_user_by_email', get_user)
+    monkeypatch.setattr('open_webui.routers.interact_channels._ensure_channel_chat', ensure_chat)
+    monkeypatch.setattr('open_webui.routers.interact_channels._prepare_channel_context', prepare_context)
+    monkeypatch.setattr('open_webui.routers.interact_channels._resolve_model_features', resolve_features)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Chats.get_message_by_id_and_message_id', get_message)
+    monkeypatch.setattr('open_webui.routers.workflows.select_workflow_for_user_context', select_workflow)
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                MODELS={'model': {}},
+                CHAT_COMPLETION_HANDLER=handler,
+            )
+        )
+    )
+    response = await channel_chat(request, _payload(), None, None)
+
+    assert captured['features'] == {'image_generation': True}
+    assert captured_runtime['trusted'] is True
+    assert response['content'] == 'done'
 
 
 @pytest.mark.asyncio

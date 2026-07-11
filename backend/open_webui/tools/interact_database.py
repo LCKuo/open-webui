@@ -356,6 +356,71 @@ async def _load_connector_for_service_scan(connector_id: str) -> InteractDataCon
     return connector
 
 
+DATABASE_ERROR_MESSAGES = {
+    'DB-COMPANY-CONTEXT-MISSING': '目前請求缺少企業身分，無法判斷可使用的資料來源。',
+    'DB-CONNECTOR-NOT-CONFIGURED': '此企業尚未設定可用的資料庫連接器。',
+    'DB-CONNECTOR-DISABLED': '資料庫連接器不存在或目前已停用。',
+    'DB-MODEL-NOT-ALLOWED': '目前模型未獲授權使用這個資料庫連接器。',
+    'DB-CHANNEL-NOT-ALLOWED': '目前通訊渠道未獲授權使用這個資料庫連接器。',
+    'DB-USER-NOT-ALLOWED': '目前使用者或企業身分未獲授權使用這個資料庫連接器。',
+    'DB-CONNECTOR-AMBIGUOUS': '可用的資料庫連接器不只一個，必須明確指定資料來源。',
+    'DB-TABLE-NOT-ALLOWED': '要求的資料表不存在或未列入授權白名單。',
+    'DB-COLUMN-NOT-ALLOWED': '要求的欄位不存在或未列入授權白名單。',
+    'DB-QUERY-INVALID': '資料庫查詢條件或參數格式不正確。',
+    'DB-AUTHENTICATION-FAILED': '資料庫連線驗證失敗，請由管理員檢查連接器憑證。',
+    'DB-CONNECTION-FAILED': '目前無法連線到資料庫，請由管理員檢查服務狀態。',
+    'DB-TIMEOUT': '資料庫查詢逾時，請縮小查詢範圍後再試。',
+    'DB-INTERNAL-ERROR': '資料庫工具發生未分類錯誤，請聯繫管理員並提供錯誤代碼。',
+}
+
+
+def _database_error_code(error: Exception) -> str:
+    message = str(error).lower()
+    if 'no company identity' in message:
+        return 'DB-COMPANY-CONTEXT-MISSING'
+    if 'no data connector is synced' in message:
+        return 'DB-CONNECTOR-NOT-CONFIGURED'
+    if 'multiple data connectors' in message:
+        return 'DB-CONNECTOR-AMBIGUOUS'
+    if 'model ' in message and ('not assigned' in message or 'no model assigned' in message):
+        return 'DB-MODEL-NOT-ALLOWED'
+    if 'channel ' in message and 'not assigned' in message:
+        return 'DB-CHANNEL-NOT-ALLOWED'
+    if 'another company' in message or 'not company admin' in message or 'member ' in message and 'not assigned' in message:
+        return 'DB-USER-NOT-ALLOWED'
+    if 'user/model/channel is not allowed' in message or 'no enabled data connector is assigned' in message:
+        return 'DB-USER-NOT-ALLOWED'
+    if 'connector not found or disabled' in message or 'data connector not found' in message:
+        return 'DB-CONNECTOR-DISABLED'
+    if 'table is not allowed' in message or 'table is blocked' in message or 'no allowed tables' in message:
+        return 'DB-TABLE-NOT-ALLOWED'
+    if 'column does not exist' in message or 'column is not allowed' in message or 'column is blocked' in message:
+        return 'DB-COLUMN-NOT-ALLOWED'
+    if 'no readable columns' in message:
+        return 'DB-COLUMN-NOT-ALLOWED'
+    if 'timeout' in message or 'timed out' in message or 'statement timeout' in message:
+        return 'DB-TIMEOUT'
+    if 'authentication failed' in message or 'password authentication failed' in message or 'access denied for user' in message:
+        return 'DB-AUTHENTICATION-FAILED'
+    if any(
+        marker in message
+        for marker in ('connection refused', 'could not connect', 'cannot connect', 'server closed the connection')
+    ):
+        return 'DB-CONNECTION-FAILED'
+    if isinstance(error, (PermissionError, ValueError)):
+        return 'DB-QUERY-INVALID'
+    return 'DB-INTERNAL-ERROR'
+
+
+def _database_error_result(error: Exception) -> dict[str, Any]:
+    code = _database_error_code(error)
+    return {
+        'ok': False,
+        'error_code': code,
+        'message': DATABASE_ERROR_MESSAGES[code],
+    }
+
+
 def _connector_context_allowed(connector: InteractDataConnectorModel, ctx: QueryContext) -> bool:
     if connector.id != 'webui_local':
         if not connector.allowed_model_ids:
@@ -1867,7 +1932,7 @@ async def interact_database_schema(
         return _json_result({'ok': True, 'connector_id': connector.id, 'name': connector.name, 'schemas': schemas})
     except Exception as error:
         await _record_event(connector_id, ctx, table, 'error', error=str(error))
-        return _json_result({'ok': False, 'error': str(error)})
+        return _json_result(_database_error_result(error))
 
 
 async def interact_database_query(
@@ -1951,7 +2016,7 @@ async def interact_database_query(
         return _json_result({'ok': True, **result})
     except Exception as error:
         await _record_event(connector_id, ctx, table, 'error', row_count=row_count, error=str(error))
-        return _json_result({'ok': False, 'error': str(error)})
+        return _json_result(_database_error_result(error))
 
 
 async def _database_count_compat(
@@ -1993,4 +2058,4 @@ async def _database_count_compat(
         return _json_result({'ok': True, **result})
     except Exception as error:
         await _record_event(connector_id, ctx, table, 'error', row_count=0, error=str(error))
-        return _json_result({'ok': False, 'error': str(error)})
+        return _json_result(_database_error_result(error))

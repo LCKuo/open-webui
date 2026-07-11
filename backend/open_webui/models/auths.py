@@ -145,6 +145,7 @@ class AuthsTable:
         db: AsyncSession | None = None,
     ) -> UserModel | None:
         """Verify email + password credentials and return the matching user."""
+        email = email.strip().lower()
         log.info('authenticate_user: %s', email)
         resolved = await Users.get_user_by_email(email, db=db)
         if not resolved:
@@ -178,6 +179,7 @@ class AuthsTable:
         db: AsyncSession | None = None,
     ) -> UserModel | None:
         """Single-query auth via JOIN on Auth ↔ User, filtered by active flag."""
+        email = email.strip().lower()
         log.info('authenticate_user_by_email: %s', email)
         # single JOIN avoids N+1 — returns (Auth, User) tuple or None
         async with get_async_db_context(db) as session:
@@ -205,7 +207,36 @@ class AuthsTable:
             await session.commit()
             await Users.update_user_by_id(user_id, {'email': email}, db=session)
             return True
-        # --- password modification ---
+
+    async def ensure_auth_for_existing_user(
+        self,
+        user_id: str,
+        email: str,
+        password: str,
+        db: AsyncSession | None = None,
+    ) -> bool:
+        """Create or reactivate a credential row without replacing a valid password."""
+        async with get_async_db_context(db) as session:
+            credential = await session.get(Auth, user_id)
+            if credential and credential.active:
+                return False
+            if credential:
+                credential.email = email
+                credential.password = password
+                credential.active = True
+            else:
+                session.add(
+                    Auth(
+                        id=user_id,
+                        email=email,
+                        password=password,
+                        active=True,
+                    )
+                )
+            await session.commit()
+            return True
+
+    # --- password modification ---
 
     async def update_user_password_by_id(
         self,

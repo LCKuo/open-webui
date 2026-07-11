@@ -2,6 +2,7 @@ import ast
 import asyncio
 import base64
 import copy
+import html
 import inspect
 import json
 import logging
@@ -74,6 +75,7 @@ from open_webui.socket.main import (
 )
 from open_webui.utils.access_control import has_connection_access, has_permission
 from open_webui.utils.access_control.files import get_accessible_folder_files
+from open_webui.utils.assistant_content import output_text
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.context_compaction import compact_messages_for_request
@@ -229,7 +231,10 @@ def _split_tool_calls(
     return expanded
 
 
-FUNCTION_CALLS_MARKUP_RE = re.compile(r'<function_calls\b[\s\S]*?</function_calls>', re.IGNORECASE)
+TOOL_CALLS_MARKUP_RE = re.compile(
+    r'<(?P<tag>function_calls|minimax:tool_call|tool_calls?)\b[^>]*>[\s\S]*?</(?P=tag)>',
+    re.IGNORECASE,
+)
 INVOKE_MARKUP_RE = re.compile(
     r'<invoke\b[^>]*\bname=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</invoke>',
     re.IGNORECASE,
@@ -280,11 +285,11 @@ def _extract_legacy_markup_tool_calls(
     text: str,
     available_tool_names: set[str],
 ) -> tuple[list[dict], str]:
-    if not text or '<function_calls' not in text:
+    if not text or not TOOL_CALLS_MARKUP_RE.search(text):
         return [], text
 
     calls: list[dict] = []
-    for block_match in FUNCTION_CALLS_MARKUP_RE.finditer(text):
+    for block_match in TOOL_CALLS_MARKUP_RE.finditer(text):
         block = block_match.group(0)
         for invoke_match in INVOKE_MARKUP_RE.finditer(block):
             name = html.unescape(invoke_match.group(1)).strip()
@@ -309,7 +314,27 @@ def _extract_legacy_markup_tool_calls(
 
     if not calls:
         return [], text
-    return calls, FUNCTION_CALLS_MARKUP_RE.sub('', text).strip()
+    return calls, TOOL_CALLS_MARKUP_RE.sub('', text).strip()
+
+
+def _is_builtin_tool_runtime(request: Request, metadata: dict[str, Any]) -> bool:
+    """Return whether server-managed builtin tools may be injected.
+
+    Browser chats are authenticated by their websocket session. External channel
+    chats have no browser session, so their router marks the request only after
+    validating the internal service token. Requiring both that trusted marker and
+    channel metadata prevents ordinary API callers from enabling hidden tools by
+    spoofing request fields.
+    """
+    if metadata.get('session_id'):
+        return True
+
+    channel_metadata = metadata.get('interact_channel')
+    return bool(
+        getattr(request.state, 'interact_channel_runtime', False)
+        and isinstance(channel_metadata, dict)
+        and channel_metadata.get('source') == 'channel'
+    )
 
 
 def get_citation_source_from_tool_result(
@@ -1622,8 +1647,10 @@ async def add_file_context(messages: list, chat_id: str, user) -> list:
     for message, stored_message in zip(user_messages, stored_user_messages):
         files_with_urls = [
             file
-            for file in stored_message.get('files', [])
-            if file.get('url') and not file.get('url').startswith('data:')
+            for file in (stored_message.get('files') or [])
+            if isinstance(file, dict)
+            and file.get('url')
+            and not file.get('url').startswith('data:')
         ]
         if not files_with_urls:
             continue
@@ -2599,7 +2626,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     available_skills = []
     view_skill_ids = []
     use_builtin_tools = (
-        bool(metadata.get('session_id'))
+        _is_builtin_tool_runtime(request, metadata)
         and metadata.get('params', {}).get('function_calling') != 'legacy'
         and (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get('builtin_tools', True)
     )
@@ -2818,8 +2845,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             metadata['mcp_clients'] = mcp_clients
 
         # Inject builtin tools for native function calling based on enabled features and model capability.
-        # Only inject when the request originates from the UI (identified by session_id).
-        # API callers don't expect hidden tools; they can explicitly request tools via tool_ids.
+        # Inject for authenticated UI sessions and service-token-verified channel
+        # runtimes. Other API callers must explicitly request tools via tool_ids.
         if use_builtin_tools:
             # Add file context to user messages
             chat_id = metadata.get('chat_id')
@@ -5306,6 +5333,9 @@ async def streaming_chat_response_handler(response, ctx):
                     if item.get('status') == 'in_progress':
                         item['status'] = 'completed'
 
+                canonical_content = output_text(output).strip() or str(content or '').strip()
+                content = canonical_content
+
                 title = (
                     await Chats.get_chat_title_by_id(metadata['chat_id'])
                     if not metadata.get('chat_id', '').startswith('channel:')
@@ -5313,6 +5343,7 @@ async def streaming_chat_response_handler(response, ctx):
                 )
                 data = {
                     'done': True,
+                    'content': canonical_content,
                     'output': output,
                     'title': title,
                     **({'usage': usage} if usage else {}),
@@ -5326,6 +5357,7 @@ async def streaming_chat_response_handler(response, ctx):
                             metadata['message_id'],
                             {
                                 'done': True,
+                                'content': canonical_content,
                                 'output': output,
                                 **({'usage': usage} if usage else {}),
                             },
@@ -5334,13 +5366,13 @@ async def streaming_chat_response_handler(response, ctx):
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
-                            {'done': True, 'usage': usage},
+                            {'done': True, 'content': canonical_content, 'usage': usage},
                         )
                     else:
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
-                            {'done': True},
+                            {'done': True, 'content': canonical_content},
                         )
 
                 # Send a webhook notification if the user is not active
@@ -5368,6 +5400,7 @@ async def streaming_chat_response_handler(response, ctx):
                 )
 
                 ctx['assistant_message'] = {
+                    'content': canonical_content,
                     'output': output,
                     **({'usage': usage} if usage else {}),
                 }

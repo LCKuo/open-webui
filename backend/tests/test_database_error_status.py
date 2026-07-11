@@ -1,0 +1,69 @@
+import json
+
+from open_webui.routers.interact_channels import _channel_runtime_failure, _rate_limit_text, _tool_failure_from_items
+from open_webui.tools.interact_database import _database_error_result
+
+
+def test_database_errors_have_stable_public_codes():
+    cases = [
+        (PermissionError('No data connector is synced for this company.'), 'DB-CONNECTOR-NOT-CONFIGURED'),
+        (PermissionError('model zxh001 is not assigned'), 'DB-MODEL-NOT-ALLOWED'),
+        (PermissionError('channel abc is not assigned'), 'DB-CHANNEL-NOT-ALLOWED'),
+        (PermissionError('Table is not allowed: crm.secret'), 'DB-TABLE-NOT-ALLOWED'),
+        (PermissionError('Column is not allowed: password'), 'DB-COLUMN-NOT-ALLOWED'),
+        (RuntimeError('connection refused'), 'DB-CONNECTION-FAILED'),
+        (TimeoutError('query timed out'), 'DB-TIMEOUT'),
+    ]
+
+    for error, expected in cases:
+        result = _database_error_result(error)
+        assert result['error_code'] == expected
+        assert result['message']
+        assert str(error) not in result.values()
+
+
+def test_channel_uses_database_error_code_without_exposing_internal_detail():
+    output = [
+        {
+            'type': 'function_call',
+            'call_id': 'call-1',
+            'name': 'interact_database_query',
+        },
+        {
+            'type': 'function_call_output',
+            'call_id': 'call-1',
+            'output': [
+                {
+                    'type': 'input_text',
+                    'text': json.dumps(
+                        {
+                            'ok': False,
+                            'error_code': 'DB-CHANNEL-NOT-ALLOWED',
+                            'message': '目前通訊渠道未獲授權使用這個資料庫連接器。',
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+        },
+    ]
+
+    assert _tool_failure_from_items(output) == (
+        'DB-CHANNEL-NOT-ALLOWED',
+        '目前通訊渠道未獲授權使用這個資料庫連接器。（錯誤代碼：DB-CHANNEL-NOT-ALLOWED）',
+    )
+
+
+def test_channel_runtime_failures_are_distinct():
+    assert _channel_runtime_failure('Configured Open WebUI model was not found.')[0] == 'AI-MODEL-NOT-FOUND'
+    assert _channel_runtime_failure('Interact Web Ai user not found.')[0] == 'AI-ACCOUNT-NOT-FOUND'
+    assert _channel_runtime_failure('Interact Web Ai user is pending approval.')[0] == 'AI-ACCOUNT-PENDING'
+    assert _channel_runtime_failure('unexpected internal detail')[0] == 'AI-RUNTIME-FAILED'
+
+
+def test_channel_rate_limit_messages_include_stable_codes():
+    channel = object()
+    assert 'CHANNEL-BOT-DAILY-TOKEN-LIMIT' in _rate_limit_text(channel, 'daily-token')
+    assert 'CHANNEL-USER-DAILY-LIMIT' in _rate_limit_text(channel, 'daily-user')
+    assert 'CHANNEL-USER-RATE-LIMIT' in _rate_limit_text(channel, 'user-rpm')
+    assert 'CHANNEL-BOT-RATE-LIMIT' in _rate_limit_text(channel, 'rpm')
