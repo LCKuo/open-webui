@@ -411,6 +411,8 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning(f'Failed to initialize terminal servers at startup: {e}')
 
+    await interact_channels.start_channel_job_workers(app)
+
     # Mark application as ready to accept traffic from a startup perspective.
     app.state.startup_complete = True
     await publish_event(app, EVENTS.SYSTEM_STARTUP_COMPLETED, source='system')
@@ -418,6 +420,7 @@ async def lifespan(app: FastAPI):
     yield
 
     await publish_event(app, EVENTS.SYSTEM_SHUTDOWN_STARTED, source='system')
+    await interact_channels.stop_channel_job_workers()
 
     # Shutdown: clean up shared resources
     from open_webui.utils.session_pool import close_session
@@ -1024,6 +1027,7 @@ async def chat_completion(
     model_id = form_data.get('model', None)
     model_item = form_data.pop('model_item', {})
     tasks = form_data.pop('background_tasks', None)
+    workflow_request = form_data.pop('workflow', None)
 
     metadata = {}
     try:
@@ -1152,6 +1156,7 @@ async def chat_completion(
             'features': form_data.get('features', {}),
             'variables': form_data.get('variables', {}),
             'interact_channel': form_data.pop('interact_channel', None),
+            'workflow': workflow_request if isinstance(workflow_request, dict) else None,
             'model_id': model_id,
             'model': model,
             'direct': model_item.get('direct', False),
@@ -1492,11 +1497,25 @@ async def chat_completion(
         billing_authorization = None
         try:
             if billing_client:
-                billing_authorization = await billing_client.authorize(user, form_data, metadata)
+                billing_form_data = (
+                    await workflows.workflow_billing_form_data(workflow_request, form_data)
+                    if isinstance(workflow_request, dict)
+                    else form_data
+                )
+                billing_authorization = await billing_client.authorize(user, billing_form_data, metadata)
 
-            form_data, metadata, events = await process_chat_payload(request, form_data, user, metadata, model)
-
-            response = await chat_completion_handler(request, form_data, user)
+            if isinstance(workflow_request, dict):
+                events = []
+                response = await workflows.execute_chat_workflow(
+                    request,
+                    user,
+                    workflow_request,
+                    form_data,
+                    metadata,
+                )
+            else:
+                form_data, metadata, events = await process_chat_payload(request, form_data, user, metadata, model)
+                response = await chat_completion_handler(request, form_data, user)
 
             # When the upstream provider returns an error (e.g. HTTP 400
             # content-filter, quota exceeded), generate_chat_completion

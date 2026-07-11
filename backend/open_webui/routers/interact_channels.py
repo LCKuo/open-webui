@@ -12,6 +12,7 @@ import time
 import weakref
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, suppress
+from types import SimpleNamespace
 from typing import Any, Literal
 from urllib.parse import quote
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -59,24 +60,167 @@ DEFAULT_CONTEXT_SUMMARY_TRIGGER_TOKENS = 12_000
 DEFAULT_CONTEXT_SUMMARY_RECENT_MESSAGES = 12
 DEFAULT_CONTEXT_SUMMARY_MAX_OUTPUT_TOKENS = 1_200
 _context_summary_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-_channel_background_tasks: set[asyncio.Task] = set()
+_channel_worker_tasks: set[asyncio.Task] = set()
+_channel_worker_stop: asyncio.Event | None = None
+_channel_worker_wakeup: asyncio.Event | None = None
+_channel_worker_expected = 0
 
 
-def _spawn_channel_background_task(coro) -> asyncio.Task:
-    task = asyncio.create_task(coro)
-    _channel_background_tasks.add(task)
+def _channel_worker_setting(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(maximum, int(os.environ.get(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
 
-    def _cleanup(completed: asyncio.Task) -> None:
-        _channel_background_tasks.discard(completed)
+
+async def _channel_job_heartbeat(job_id: str, worker_id: str, lease_seconds: int, done: asyncio.Event) -> None:
+    while not done.is_set():
         try:
-            completed.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception('Interact channel background task failed')
+            await asyncio.wait_for(done.wait(), timeout=max(10, lease_seconds // 3))
+        except TimeoutError:
+            if not await InteractChannels.extend_job_lease(job_id, worker_id, lease_seconds):
+                return
 
-    task.add_done_callback(_cleanup)
-    return task
+
+def _channel_worker_request(app) -> Request:
+    return Request(
+        {
+            'type': 'http',
+            'asgi': {'version': '3.0'},
+            'http_version': '1.1',
+            'method': 'POST',
+            'scheme': 'https',
+            'path': '/api/v1/interact/internal/channel-worker',
+            'raw_path': b'/api/v1/interact/internal/channel-worker',
+            'query_string': b'',
+            'headers': [],
+            'client': ('127.0.0.1', 0),
+            'server': ('channel-worker', 443),
+            'app': app,
+        }
+    )
+
+
+async def _process_channel_job(app, worker_id: str, job, lease_seconds: int, max_attempts: int) -> None:
+    done = asyncio.Event()
+    heartbeat = asyncio.create_task(_channel_job_heartbeat(job.id, worker_id, lease_seconds, done))
+    channel = None
+    try:
+        channel = await InteractChannels.get_by_id(job.channel_id)
+        if not channel or not channel.enabled:
+            raise RuntimeError('Channel is disabled or no longer exists.')
+        payload = job.payload
+        result = job.result
+        if result is None:
+            result = await _complete_claimed_result(
+                _channel_worker_request(app),
+                channel,
+                SimpleNamespace(event_id=job.event_id),
+                job.external_user_id,
+                str(payload.get('platformEventId') or job.event_id),
+                str(payload.get('message') or ''),
+                payload.get('parts') if isinstance(payload.get('parts'), list) else [],
+                str(payload.get('recipientId') or job.external_user_id),
+            )
+            await InteractChannels.save_job_result(job.id, result, lease_seconds)
+
+        if job.platform == 'line':
+            await _send_line_push_result(
+                channel,
+                str(payload.get('recipientId') or ''),
+                result,
+                retry_key=job.id,
+            )
+        else:
+            raise RuntimeError(f'Unsupported queued channel platform: {job.platform}')
+        await InteractChannels.complete_job(job.id)
+    except asyncio.CancelledError:
+        await InteractChannels.release_job(job.id)
+        raise
+    except Exception as error:
+        log.exception('Interact channel job failed: job=%s attempt=%s', job.id, job.attempts)
+        will_retry = await InteractChannels.retry_job(job.id, str(error), max_attempts=max_attempts)
+        if not will_retry and channel and job.platform == 'line':
+            fallback = channel.fallback_message or '資料查詢發生錯誤，請稍後再試或聯繫管理員。'
+            try:
+                await _send_line_push(
+                    channel,
+                    str(job.payload.get('recipientId') or ''),
+                    fallback,
+                    retry_key=str(uuid5(NAMESPACE_URL, f'{job.id}:fallback')),
+                )
+                await InteractChannels.complete_job(job.id)
+            except Exception:
+                log.exception('Interact channel terminal fallback delivery failed: job=%s', job.id)
+    finally:
+        done.set()
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
+
+
+async def _channel_worker_loop(app, worker_id: str) -> None:
+    lease_seconds = _channel_worker_setting('INTERACT_CHANNEL_JOB_LEASE_SECONDS', 300, 60, 3600)
+    max_attempts = _channel_worker_setting('INTERACT_CHANNEL_JOB_MAX_ATTEMPTS', 5, 1, 20)
+    while _channel_worker_stop is not None and not _channel_worker_stop.is_set():
+        try:
+            job = await InteractChannels.claim_next_job(worker_id, lease_seconds=lease_seconds)
+            if job:
+                await _process_channel_job(app, worker_id, job, lease_seconds, max_attempts)
+                continue
+            if _channel_worker_wakeup is not None:
+                _channel_worker_wakeup.clear()
+                try:
+                    await asyncio.wait_for(_channel_worker_wakeup.wait(), timeout=1)
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('Interact channel worker loop failed: %s', worker_id)
+            await asyncio.sleep(1)
+
+
+async def start_channel_job_workers(app) -> None:
+    global _channel_worker_stop, _channel_worker_wakeup, _channel_worker_expected
+    await InteractChannels.ensure_tables()
+    await InteractChannels.cleanup_jobs()
+    if _channel_worker_tasks:
+        return
+    _channel_worker_stop = asyncio.Event()
+    _channel_worker_wakeup = asyncio.Event()
+    worker_count = _channel_worker_setting('INTERACT_CHANNEL_WORKERS', 8, 1, 32)
+    _channel_worker_expected = worker_count
+    instance_id = str(getattr(app.state, 'instance_id', 'instance'))
+    for index in range(worker_count):
+        task = asyncio.create_task(
+            _channel_worker_loop(app, f'{instance_id}:{os.getpid()}:{index}'),
+            name=f'interact-channel-worker-{index}',
+        )
+        _channel_worker_tasks.add(task)
+        task.add_done_callback(_channel_worker_tasks.discard)
+    log.info('Started %s durable interact channel workers.', worker_count)
+
+
+async def stop_channel_job_workers() -> None:
+    global _channel_worker_stop, _channel_worker_wakeup, _channel_worker_expected
+    if _channel_worker_stop is not None:
+        _channel_worker_stop.set()
+    tasks = list(_channel_worker_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _channel_worker_tasks.clear()
+    _channel_worker_stop = None
+    _channel_worker_wakeup = None
+    _channel_worker_expected = 0
+
+
+def wake_channel_job_workers() -> None:
+    if _channel_worker_wakeup is not None:
+        _channel_worker_wakeup.set()
+
 
 REASONING_DETAILS_RE = re.compile(
     r'<details\b[^>]*\btype=["\']reasoning["\'][^>]*>[\s\S]*?</details>\s*',
@@ -135,15 +279,6 @@ def _public_channel_content(content: str | None) -> str:
         if not clean or any(pattern in clean for pattern in transitional_patterns):
             return '工具呼叫未成功執行，請稍後再試或聯繫管理員。'
     return clean.strip()
-
-
-def _line_background_replies_enabled() -> bool:
-    return os.environ.get('INTERACT_LINE_BACKGROUND_REPLIES', '').strip().lower() in {
-        '1',
-        'true',
-        'yes',
-        'on',
-    }
 
 
 def _context_summary_settings() -> tuple[int, int, int]:
@@ -258,9 +393,11 @@ class ChannelChatRequest(BaseModel):
     channelType: Literal['line', 'wechat', 'telegram']
     channelIdentifier: str = Field(..., min_length=1)
     externalUserId: str = Field(..., min_length=1)
+    conversationId: str | None = Field(default=None, min_length=1, max_length=200)
     platformEventId: str | None = Field(default=None, min_length=1, max_length=200)
     modelId: str = Field(..., min_length=1)
-    message: str = Field(..., min_length=1, max_length=100000)
+    message: str = Field(default='', max_length=100000)
+    parts: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     system: str | None = None
     fallbackModelId: str | None = None
     metadata: dict[str, Any] | None = None
@@ -294,7 +431,9 @@ class ChannelSyncRequest(BaseModel):
     modelId: str | None = Field(default=None, max_length=160)
     fallbackModelId: str | None = Field(default=None, max_length=160)
     fallbackMessage: str | None = Field(default=None, max_length=1000)
-    rateLimitPerMinute: int = Field(default=5, ge=1, le=120)
+    rateLimitPerMinute: int = Field(default=60, ge=1, le=10000)
+    userRateLimitPerMinute: int = Field(default=5, ge=1, le=120)
+    maxConcurrentJobs: int = Field(default=8, ge=1, le=64)
     dailyUserLimit: int = Field(default=50, ge=1, le=10000)
     dailyBotTokenLimit: int = Field(default=100000, ge=1000, le=10000000)
 
@@ -360,7 +499,7 @@ def _stable_channel_chat_id(user_id: str, payload: ChannelChatRequest) -> str:
             user_id,
             payload.channelType,
             payload.channelIdentifier,
-            payload.externalUserId,
+            payload.conversationId or payload.externalUserId,
             payload.modelId,
         ]
     )
@@ -387,31 +526,35 @@ async def _ensure_channel_chat(user_id: str, chat_id: str, payload: ChannelChatR
         return chat
 
     title = f'{payload.channelType}:{payload.channelIdentifier}'
-    return await Chats.insert_new_chat(
-        chat_id,
-        user_id,
-        ChatForm(
-            chat={
-                'id': chat_id,
-                'title': title,
-                'models': [payload.modelId],
-                'history': {
-                    'currentId': None,
-                    'messages': {},
+    try:
+        return await Chats.insert_new_chat(
+            chat_id,
+            user_id,
+            ChatForm(
+                chat={
+                    'id': chat_id,
+                    'title': title,
+                    'models': [payload.modelId],
+                    'history': {
+                        'currentId': None,
+                        'messages': {},
+                    },
+                    'messages': [],
+                    'files': [],
+                    'tags': ['external-channel', payload.channelType],
+                    'meta': {
+                        'source': 'interact-channel',
+                        'channelType': payload.channelType,
+                        'channelIdentifier': payload.channelIdentifier,
+                        'externalUserId': payload.externalUserId,
+                        'conversationId': payload.conversationId or payload.externalUserId,
+                    },
+                    'timestamp': int(time.time() * 1000),
                 },
-                'messages': [],
-                'files': [],
-                'tags': ['external-channel', payload.channelType],
-                'meta': {
-                    'source': 'interact-channel',
-                    'channelType': payload.channelType,
-                    'channelIdentifier': payload.channelIdentifier,
-                    'externalUserId': payload.externalUserId,
-                },
-                'timestamp': int(time.time() * 1000),
-            },
-        ),
-    )
+            ),
+        )
+    except IntegrityError:
+        return await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
 
 
 def _message_content_from_response(data: dict[str, Any] | None) -> str:
@@ -425,6 +568,18 @@ def _message_content_from_response(data: dict[str, Any] | None) -> str:
             return content
     content = data.get('content')
     return content if isinstance(content, str) else ''
+
+
+def _workflow_outputs_from_items(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    return [
+        dict(item['workflow_output'])
+        for item in items
+        if isinstance(item, dict)
+        and item.get('type') == 'open_webui:workflow_output'
+        and isinstance(item.get('workflow_output'), dict)
+    ]
 
 
 async def _drain_streaming_response(response) -> None:
@@ -909,6 +1064,8 @@ def _rate_limit_text(channel: InteractChannelModel, reason: str | None) -> str:
         return '今日 AI 使用額度已達此渠道的每日 Token 上限，請調高渠道每日 Token 上限或明日再試。'
     if reason == 'daily-user':
         return '您今日的詢問次數已達上限，請明日再試。'
+    if reason == 'user-rpm':
+        return '您的訊息傳送速度過快，請稍候一分鐘後再試。'
     return '訊息傳送速度過快，請稍候一分鐘後再試。'
 
 
@@ -939,6 +1096,8 @@ async def _run_channel_message(
     external_user_id: str,
     platform_event_id: str,
     message: str,
+    parts: list[dict[str, Any]] | None = None,
+    conversation_id: str | None = None,
 ) -> dict[str, Any]:
     if channel.reply_mode != 'ai':
         return {'ok': True, 'content': _fallback_text(channel), 'usage': {}}
@@ -958,10 +1117,12 @@ async def _run_channel_message(
                 channelType=channel.channel_type,
                 channelIdentifier=channel.channel_identifier,
                 externalUserId=external_user_id,
+                conversationId=conversation_id,
                 platformEventId=platform_event_id,
                 modelId=channel.model_id,
                 fallbackModelId=channel.fallback_model_id,
                 message=message,
+                parts=parts or [],
                 metadata={
                     'channelId': channel.id,
                     'channelName': channel.name,
@@ -1051,6 +1212,27 @@ async def _complete_claimed_response(
     platform_event_id: str,
     message: str,
 ) -> str:
+    result = await _complete_claimed_result(
+        request,
+        channel,
+        claim,
+        external_user_id,
+        platform_event_id,
+        message,
+    )
+    return str(result.get('content') or '')
+
+
+async def _complete_claimed_result(
+    request: Request,
+    channel: InteractChannelModel,
+    claim,
+    external_user_id: str,
+    platform_event_id: str,
+    message: str,
+    parts: list[dict[str, Any]] | None = None,
+    conversation_id: str | None = None,
+) -> dict[str, Any]:
     reserved_tokens = _estimated_reservation_tokens(message) if channel.reply_mode == 'ai' else 0
     result = await _run_channel_message(
         request,
@@ -1059,6 +1241,8 @@ async def _complete_claimed_response(
         external_user_id,
         platform_event_id,
         message,
+        parts,
+        conversation_id,
     )
     content = str(result.get('content') or _fallback_text(channel)).strip()
     usage = result.get('usage') if isinstance(result.get('usage'), dict) else {}
@@ -1069,7 +1253,35 @@ async def _complete_claimed_response(
         (_usage_tokens(usage) or reserved_tokens) + context_summary_tokens,
         result.get('reason'),
     )
-    return content
+    return {**result, 'content': content, 'outputs': result.get('outputs') or []}
+
+
+async def _claim_and_respond_result(
+    request: Request,
+    channel: InteractChannelModel,
+    platform_event_id: str,
+    external_user_id: str,
+    message: str,
+    parts: list[dict[str, Any]] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    claim, immediate_content, should_process = await _claim_channel_event(
+        channel,
+        platform_event_id,
+        external_user_id,
+        message,
+    )
+    if not should_process:
+        return claim, {'content': immediate_content or '', 'outputs': []}
+    result = await _complete_claimed_result(
+        request,
+        channel,
+        claim,
+        external_user_id,
+        platform_event_id,
+        message,
+        parts,
+    )
+    return claim, result
 
 
 def _line_progress_text(channel: InteractChannelModel) -> str:
@@ -1089,11 +1301,12 @@ async def _http_post_json(
     url: str,
     payload: dict[str, Any],
     headers: dict[str, str] | None = None,
+    accepted_statuses: set[int] | None = None,
 ) -> None:
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload, headers=headers) as response:
-            if response.status < 200 or response.status >= 300:
+            if (response.status < 200 or response.status >= 300) and response.status not in (accepted_statuses or set()):
                 detail = (await response.text())[:300]
                 raise RuntimeError(f'Platform reply failed ({response.status}): {detail}')
 
@@ -1122,6 +1335,46 @@ def _line_text_messages(text: str) -> list[dict[str, str]]:
     return [{'type': 'text', 'text': chunk} for chunk in chunks]
 
 
+def _channel_output_text(output: dict[str, Any]) -> str:
+    label = str(output.get('title') or output.get('filename') or output.get('alt') or output.get('type') or '')
+    url = str(output.get('url') or '')
+    if output.get('type') == 'handoff':
+        return str(output.get('reason') or '已轉交人工服務。')
+    if output.get('type') == 'card':
+        return '\n'.join(filter(None, [str(output.get('title') or ''), str(output.get('body') or ''), url]))
+    return f'{label}: {url}' if url else label
+
+
+def _line_result_messages(result: dict[str, Any]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    content = str(result.get('content') or '').strip()
+    outputs = result.get('outputs') or []
+    if content:
+        messages.extend(_line_text_messages(content)[: 4 if outputs else 5])
+    for output in outputs:
+        if not isinstance(output, dict) or len(messages) >= 5:
+            break
+        output_type = output.get('type')
+        url = str(output.get('url') or '')
+        if output_type == 'image' and url.startswith('https://'):
+            messages.append(
+                {'type': 'image', 'originalContentUrl': url, 'previewImageUrl': str(output.get('thumbnailUrl') or url)}
+            )
+        elif (
+            output_type == 'video'
+            and url.startswith('https://')
+            and str(output.get('thumbnailUrl') or '').startswith('https://')
+        ):
+            messages.append({'type': 'video', 'originalContentUrl': url, 'previewImageUrl': output['thumbnailUrl']})
+        elif output_type == 'audio' and url.startswith('https://') and output.get('duration'):
+            messages.append({'type': 'audio', 'originalContentUrl': url, 'duration': int(output['duration'])})
+        else:
+            fallback = _channel_output_text(output)
+            if fallback:
+                messages.extend(_line_text_messages(fallback))
+    return messages[:5] or _line_text_messages(' ')
+
+
 async def _send_line_reply(
     channel: InteractChannelModel,
     reply_token: str | None,
@@ -1143,10 +1396,28 @@ async def _send_line_reply(
     )
 
 
+async def _send_line_reply_result(
+    channel: InteractChannelModel,
+    reply_token: str | None,
+    result: dict[str, Any],
+) -> None:
+    if not channel.channel_access_token or not reply_token:
+        raise RuntimeError('LINE access token or reply token is missing.')
+    await _http_post_json(
+        'https://api.line.me/v2/bot/message/reply',
+        {'replyToken': reply_token, 'messages': _line_result_messages(result)},
+        {
+            'Authorization': f'Bearer {channel.channel_access_token}',
+            'Content-Type': 'application/json',
+        },
+    )
+
+
 async def _send_line_push(
     channel: InteractChannelModel,
     to: str | None,
     text: str,
+    retry_key: str | None = None,
 ) -> None:
     if not channel.channel_access_token or not to:
         raise RuntimeError('LINE access token or recipient ID is missing.')
@@ -1160,74 +1431,30 @@ async def _send_line_push(
         {
             'Authorization': f'Bearer {channel.channel_access_token}',
             'Content-Type': 'application/json',
+            **({'X-Line-Retry-Key': retry_key} if retry_key else {}),
         },
+        accepted_statuses={409} if retry_key else None,
     )
 
 
-async def _send_line_background_progress(
+async def _send_line_push_result(
     channel: InteractChannelModel,
-    line_recipient_id: str,
-    done: asyncio.Event,
+    to: str | None,
+    result: dict[str, Any],
+    retry_key: str | None = None,
 ) -> None:
-    updates = [
-        (20, '資料查詢仍在進行，我正在整理可用結果。'),
-        (45, '資料量或關聯較多，仍在分析中；完成後會直接傳送答案。'),
-        (90, '仍在處理中，可能是資料庫或模型回應較慢；請稍候。'),
-    ]
-    elapsed = 0
-    for delay, message in updates:
-        wait_for = max(0, delay - elapsed)
-        try:
-            await asyncio.wait_for(done.wait(), timeout=wait_for)
-            return
-        except TimeoutError:
-            elapsed = delay
-            try:
-                await _send_line_push(channel, line_recipient_id, message)
-            except Exception:
-                log.exception('Interact LINE progress delivery failed')
-
-
-async def _run_line_background_response(
-    request: Request,
-    channel: InteractChannelModel,
-    claim,
-    external_user_id: str,
-    platform_event_id: str,
-    message: str,
-    line_recipient_id: str,
-) -> None:
-    done = asyncio.Event()
-    progress_task = asyncio.create_task(
-        _send_line_background_progress(channel, line_recipient_id, done)
+    if not channel.channel_access_token or not to:
+        raise RuntimeError('LINE access token or recipient ID is missing.')
+    await _http_post_json(
+        'https://api.line.me/v2/bot/message/push',
+        {'to': to, 'messages': _line_result_messages(result)},
+        {
+            'Authorization': f'Bearer {channel.channel_access_token}',
+            'Content-Type': 'application/json',
+            **({'X-Line-Retry-Key': retry_key} if retry_key else {}),
+        },
+        accepted_statuses={409} if retry_key else None,
     )
-    try:
-        content = await _complete_claimed_response(
-            request,
-            channel,
-            claim,
-            external_user_id,
-            platform_event_id,
-            message,
-        )
-        await _send_line_push(channel, line_recipient_id, content or _fallback_text(channel))
-        await _mark_delivery(claim)
-    except Exception as error:
-        log.exception('Interact LINE background response failed')
-        fallback = channel.fallback_message or '資料查詢發生錯誤，請稍後再試或聯繫管理員。'
-        fallback_delivered = False
-        try:
-            await InteractChannels.set_response(claim.event_id, fallback, 0, str(error)[:1000])
-            await _send_line_push(channel, line_recipient_id, fallback)
-            fallback_delivered = True
-        except Exception:
-            log.exception('Interact LINE background fallback delivery failed')
-        await _mark_delivery(claim, None if fallback_delivered else error)
-    finally:
-        done.set()
-        progress_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await progress_task
 
 
 async def _send_telegram_reply(
@@ -1241,6 +1468,46 @@ async def _send_telegram_reply(
         f'https://api.telegram.org/bot{channel.channel_secret}/sendMessage',
         {'chat_id': chat_id, 'text': text[:4096]},
     )
+
+
+async def _send_telegram_result(
+    channel: InteractChannelModel,
+    chat_id: str | int | None,
+    result: dict[str, Any],
+) -> None:
+    if not channel.channel_secret or chat_id is None:
+        raise RuntimeError('Telegram bot token or chat ID is missing.')
+    content = str(result.get('content') or '').strip()
+    if content:
+        await _send_telegram_reply(channel, chat_id, content)
+    methods = {
+        'image': ('sendPhoto', 'photo'),
+        'audio': ('sendAudio', 'audio'),
+        'video': ('sendVideo', 'video'),
+        'file': ('sendDocument', 'document'),
+    }
+    for output in (result.get('outputs') or [])[:8]:
+        if not isinstance(output, dict):
+            continue
+        method = methods.get(str(output.get('type') or ''))
+        url = str(output.get('url') or '')
+        platform_file_id = str(output.get('platformFileId') or '')
+        media_reference = url or (
+            platform_file_id if output.get('platform') == 'telegram' else ''
+        )
+        if method and media_reference:
+            await _http_post_json(
+                f'https://api.telegram.org/bot{channel.channel_secret}/{method[0]}',
+                {
+                    'chat_id': chat_id,
+                    method[1]: media_reference,
+                    'caption': str(output.get('title') or output.get('filename') or '')[:1024],
+                },
+            )
+        else:
+            fallback = _channel_output_text(output)
+            if fallback:
+                await _send_telegram_reply(channel, chat_id, fallback)
 
 
 def _safe_equal(left: str, right: str) -> bool:
@@ -1276,6 +1543,27 @@ def _wechat_response(to_user: str, from_user: str, text: str) -> str:
     )
 
 
+def _wechat_media_response(
+    to_user: str,
+    from_user: str,
+    output_type: str,
+    media_id: str,
+) -> str:
+    wechat_type = 'voice' if output_type == 'audio' else output_type
+    container = {'image': 'Image', 'voice': 'Voice', 'video': 'Video'}.get(wechat_type)
+    if not container:
+        raise ValueError('Unsupported WeChat media response type.')
+    return (
+        '<xml>'
+        f'<ToUserName><![CDATA[{from_user}]]></ToUserName>'
+        f'<FromUserName><![CDATA[{to_user}]]></FromUserName>'
+        f'<CreateTime>{int(time.time())}</CreateTime>'
+        f'<MsgType><![CDATA[{wechat_type}]]></MsgType>'
+        f'<{container}><MediaId><![CDATA[{media_id}]]></MediaId></{container}>'
+        '</xml>'
+    )
+
+
 @router.post('/channel-chat')
 async def channel_chat(  # noqa: C901
     request: Request,
@@ -1284,6 +1572,8 @@ async def channel_chat(  # noqa: C901
     x_interact_service_token: str | None = Header(default=None),
 ):
     _require_service_token(authorization, x_interact_service_token)
+    if not payload.message.strip() and not payload.parts:
+        raise HTTPException(status_code=400, detail='A message or media part is required.')
 
     user = await Users.get_user_by_email(payload.companyEmail)
     if not user:
@@ -1324,6 +1614,7 @@ async def channel_chat(  # noqa: C901
                 'assistantMessageId': assistant_message_id,
                 'model': existing_assistant.get('model') or model_id,
                 'content': content,
+                'outputs': _workflow_outputs_from_items(existing_assistant.get('output')),
                 'usage': existing_assistant.get('usage'),
             }
     else:
@@ -1350,6 +1641,7 @@ async def channel_chat(  # noqa: C901
             'parentId': parent_id,
             'role': 'user',
             'content': payload.message,
+            'files': payload.parts or None,
             'childrenIds': [assistant_message_id],
             'timestamp': int(time.time()),
             'models': [model_id],
@@ -1377,6 +1669,24 @@ async def channel_chat(  # noqa: C901
     if filter_ids:
         form_data['filter_ids'] = filter_ids
 
+    # External channels use the same deterministic selector and ACL context as
+    # WebUI chat. Ambiguous requests remain normal chat instead of guessing.
+    from open_webui.routers import workflows as workflow_routes
+
+    selection = await workflow_routes.select_workflow_for_user_context(
+        user,
+        payload.message or ' '.join(str(part.get('type') or '') for part in payload.parts),
+        channel_id=(payload.metadata or {}).get('channelId'),
+        model_id=model_id,
+    )
+    if selection.decision == 'selected' and selection.selected_workflow_id:
+        form_data['workflow'] = {
+            'id': selection.selected_workflow_id,
+            'versionId': selection.selected_version_id,
+            'trigger': f'{payload.channelType}.message',
+            'parts': payload.parts,
+        }
+
     try:
         response = await request.app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
         await _drain_streaming_response(response)
@@ -1387,10 +1697,14 @@ async def channel_chat(  # noqa: C901
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
     assistant_message = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
+    response_data = _response_data(response)
     content = _public_channel_content(
-        (assistant_message or {}).get('content') or _message_content_from_response(_response_data(response))
+        (assistant_message or {}).get('content') or _message_content_from_response(response_data)
     )
     usage = (assistant_message or {}).get('usage')
+    outputs = _workflow_outputs_from_items(
+        (assistant_message or {}).get('output') or (response_data or {}).get('output')
+    )
 
     return {
         'ok': True,
@@ -1399,6 +1713,7 @@ async def channel_chat(  # noqa: C901
         'assistantMessageId': assistant_message_id,
         'model': model_id,
         'content': content or '',
+        'outputs': outputs,
         'usage': usage,
         'contextSummaryTokens': context_summary_tokens,
     }
@@ -1459,6 +1774,8 @@ async def sync_channel(
                 'fallback_model_id': payload.fallbackModelId,
                 'fallback_message': payload.fallbackMessage,
                 'rate_limit_per_minute': payload.rateLimitPerMinute,
+                'user_rate_limit_per_minute': payload.userRateLimitPerMinute,
+                'max_concurrent_jobs': payload.maxConcurrentJobs,
                 'daily_user_limit': payload.dailyUserLimit,
                 'daily_bot_token_limit': payload.dailyBotTokenLimit,
             }
@@ -1751,10 +2068,7 @@ async def delete_channel(
     if target_channel is None and requested_channel:
         raise HTTPException(
             status_code=409,
-            detail=(
-                'The requested channel ID exists, but its platform identity does not '
-                'match the delete request.'
-            ),
+            detail=('The requested channel ID exists, but its platform identity does not match the delete request.'),
         )
 
     if target_channel is None:
@@ -1836,12 +2150,33 @@ async def platform_webhook(  # noqa: C901
         results = []
         for index, event in enumerate(payload.get('events') or []):
             message = event.get('message') or {}
-            message_text = message.get('text') or ''
-            if (channel.enabled and channel.reply_mode == 'silent') or message.get('type') != 'text':
+            message_type = str(message.get('type') or '')
+            if (channel.enabled and channel.reply_mode == 'silent') or message_type not in {
+                'text',
+                'image',
+                'video',
+                'audio',
+                'file',
+            }:
                 results.append({'ok': True, 'skipped': True})
                 continue
+            parts = (
+                []
+                if message_type == 'text'
+                else [
+                    {
+                        'type': message_type,
+                        'platform': 'line',
+                        'platformFileId': message.get('id'),
+                        'filename': message.get('fileName'),
+                        'size': message.get('fileSize'),
+                    }
+                ]
+            )
+            message_text = message.get('text') or f'[LINE {message_type}]'
             source = event.get('source') or {}
-            external_user_id = source.get('userId') or source.get('groupId') or source.get('roomId') or 'unknown'
+            line_recipient_id = source.get('groupId') or source.get('roomId') or source.get('userId')
+            external_user_id = source.get('userId') or line_recipient_id or 'unknown'
             platform_event_id = (
                 event.get('webhookEventId') or hashlib.sha256(raw_body + str(index).encode()).hexdigest()
             )
@@ -1855,34 +2190,24 @@ async def platform_webhook(  # noqa: C901
                 results.append({'ok': True, 'duplicate': True, 'skipped': True})
                 continue
             try:
-                defer_response = False
                 if should_process:
-                    defer_response = _line_background_replies_enabled()
-                    line_recipient_id = external_user_id if external_user_id != 'unknown' else None
-                    if not line_recipient_id or not defer_response:
-                        content = await _complete_claimed_response(
-                            request,
-                            channel,
-                            claim,
-                            external_user_id,
-                            platform_event_id,
-                            message_text,
-                        )
-                        await _send_line_reply(channel, event.get('replyToken'), content or '')
-                        await _mark_delivery(claim)
-                    else:
-                        await _send_line_reply(channel, event.get('replyToken'), _line_progress_text(channel))
-                        _spawn_channel_background_task(
-                            _run_line_background_response(
-                                request,
-                                channel,
-                                claim,
-                                external_user_id,
-                                platform_event_id,
-                                message_text,
-                                line_recipient_id,
-                            )
-                        )
+                    if not line_recipient_id:
+                        raise RuntimeError('LINE recipient ID is missing.')
+                    await InteractChannels.enqueue_job(
+                        event_id=claim.event_id,
+                        channel_id=channel.id,
+                        external_user_id=external_user_id,
+                        platform='line',
+                        conversation_id=line_recipient_id,
+                        payload={
+                            'platformEventId': platform_event_id,
+                            'recipientId': line_recipient_id,
+                            'message': message_text,
+                            'parts': parts,
+                        },
+                    )
+                    wake_channel_job_workers()
+                    await _send_line_reply(channel, event.get('replyToken'), _line_progress_text(channel))
                 else:
                     await _send_line_reply(channel, event.get('replyToken'), content or '')
                     await _mark_delivery(claim)
@@ -1890,7 +2215,7 @@ async def platform_webhook(  # noqa: C901
                     {
                         'ok': True,
                         'duplicate': claim.duplicate,
-                        'background': should_process and defer_response,
+                        'queued': should_process,
                         'rateLimited': _is_rate_limited(claim.reason),
                     }
                 )
@@ -1919,25 +2244,51 @@ async def platform_webhook(  # noqa: C901
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise HTTPException(status_code=400, detail='Invalid Telegram payload.')
         message_data = payload.get('message') or {}
-        message = message_data.get('text')
+        media = None
+        if message_data.get('photo'):
+            media = {'type': 'image', **message_data['photo'][-1]}
+        elif message_data.get('video'):
+            media = {'type': 'video', **message_data['video']}
+        elif message_data.get('audio') or message_data.get('voice'):
+            media = {'type': 'audio', **(message_data.get('audio') or message_data.get('voice'))}
+        elif message_data.get('document'):
+            media = {'type': 'file', **message_data['document']}
+        message = (
+            message_data.get('text') or message_data.get('caption') or (f'[Telegram {media["type"]}]' if media else '')
+        )
         if (channel.enabled and channel.reply_mode == 'silent') or not message:
             return {'ok': True, 'routed': True, 'channelId': channel.id, 'skipped': True}
+        parts = (
+            []
+            if not media
+            else [
+                {
+                    'type': media['type'],
+                    'platform': 'telegram',
+                    'platformFileId': media.get('file_id'),
+                    'filename': media.get('file_name'),
+                    'mimeType': media.get('mime_type'),
+                    'size': media.get('file_size'),
+                }
+            ]
+        )
         chat_id = (message_data.get('chat') or {}).get('id')
         external_user_id = str((message_data.get('from') or {}).get('id') or chat_id or 'unknown')
         platform_event_id = str(
             payload.get('update_id') or hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         )
-        claim, content = await _claim_and_respond(
+        claim, result = await _claim_and_respond_result(
             request,
             channel,
             platform_event_id,
             external_user_id,
             message,
+            parts,
         )
         if claim.duplicate and not claim.retry_delivery:
             return {'ok': True, 'duplicate': True, 'skipped': True}
         try:
-            await _send_telegram_reply(channel, chat_id, content or '')
+            await _send_telegram_result(channel, chat_id, result)
             await _mark_delivery(claim)
         except Exception as error:
             await _mark_delivery(claim, error)
@@ -1959,17 +2310,58 @@ async def platform_webhook(  # noqa: C901
         raise HTTPException(status_code=400, detail='Invalid WeChat payload.')
     to_user = _xml_value(root, 'ToUserName')
     from_user = _xml_value(root, 'FromUserName')
-    message = _xml_value(root, 'Content')
+    message_type = _xml_value(root, 'MsgType') or 'text'
+    normalized_type = {'voice': 'audio', 'shortvideo': 'video'}.get(message_type, message_type)
+    parts = []
+    if normalized_type in {'image', 'audio', 'video', 'file'}:
+        parts.append(
+            {
+                'type': normalized_type,
+                'platform': 'wechat',
+                'platformFileId': _xml_value(root, 'MediaId'),
+                'url': _xml_value(root, 'PicUrl') or None,
+            }
+        )
+    message = _xml_value(root, 'Content') or (f'[WeChat {normalized_type}]' if parts else '')
     if (channel.enabled and channel.reply_mode == 'silent') or not message:
         return PlainTextResponse('success')
     platform_event_id = _xml_value(root, 'MsgId') or hashlib.sha256(raw_body).hexdigest()
-    claim, content = await _claim_and_respond(
+    claim, result = await _claim_and_respond_result(
         request,
         channel,
         platform_event_id,
         from_user or 'unknown',
         message,
+        parts,
     )
+    content = str(result.get('content') or '')
+    native_media = next(
+        (
+            output
+            for output in result.get('outputs') or []
+            if isinstance(output, dict)
+            and output.get('platform') == 'wechat'
+            and output.get('platformFileId')
+            and output.get('type') in {'image', 'audio', 'video'}
+        ),
+        None,
+    )
+    if native_media:
+        await _mark_delivery(claim)
+        return Response(
+            _wechat_media_response(
+                to_user,
+                from_user,
+                native_media['type'],
+                str(native_media['platformFileId']),
+            ),
+            media_type='application/xml',
+        )
+    media_fallbacks = [
+        _channel_output_text(output) for output in result.get('outputs') or [] if isinstance(output, dict)
+    ]
+    if media_fallbacks:
+        content = '\n\n'.join(filter(None, [content, *media_fallbacks]))
     if claim.duplicate and not content:
         return PlainTextResponse('success')
     await _mark_delivery(claim)
@@ -1998,11 +2390,16 @@ async def channel_health(
         )
 
     await InteractBillingClient().resolve_user(user)
+    queue = await InteractChannels.queue_health(payload.companyEmail)
     return {
         'ok': True,
         'service': 'interact-channel',
         'userVerified': True,
         'billingVerified': True,
+        'workersReady': _channel_worker_expected > 0 and len(_channel_worker_tasks) == _channel_worker_expected,
+        'workerCount': len(_channel_worker_tasks),
+        'expectedWorkerCount': _channel_worker_expected,
+        'queue': queue,
     }
 
 

@@ -168,3 +168,47 @@ async def test_commit_sends_authorized_company_member_context():
     assert commit_payload["company_member_email"] == "member@example.com"
     assert commit_payload["parameters"]["companyMemberId"] == "member-1"
     assert commit_payload["parameters"]["companyMemberEmail"] == "member@example.com"
+
+
+@pytest.mark.asyncio
+async def test_commit_sends_only_auditable_workflow_labels():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-user", email="member@example.com")
+    authorization = BillingAuthorization(
+        request_id="request-1",
+        company_user_id="company-1",
+        reservation_id="reservation-1",
+        estimated_input_tokens=5,
+        max_output_tokens=10,
+        reserved_tokens=55,
+    )
+
+    await client.commit(
+        user,
+        authorization,
+        {"model": "model", "messages": [{"role": "user", "content": "hello"}]},
+        {
+            "chat_id": "chat",
+            "message_id": "message",
+            "workflow": {
+                "id": "workflow-1",
+                "name": "客服摘要",
+                "versionId": "version-2",
+                "runId": "run-3",
+                "trigger": "webui_chat.manual",
+                "data": {"secret": "must-not-leak"},
+            },
+        },
+        {"prompt_tokens": 5, "completion_tokens": 2},
+        "answer",
+    )
+
+    commit_payload = client.requests[-1][2]
+    assert commit_payload["request_summary"] == "Workflow: 客服摘要"
+    assert commit_payload["parameters"]["workflow"] == {
+        "id": "workflow-1",
+        "name": "客服摘要",
+        "versionId": "version-2",
+        "runId": "run-3",
+        "trigger": "webui_chat.manual",
+    }

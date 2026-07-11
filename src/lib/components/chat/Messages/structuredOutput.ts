@@ -22,7 +22,24 @@ export type OutputItem = {
 	action?: Record<string, unknown>;
 	actions?: Array<Record<string, unknown>>;
 	queries?: unknown[];
+	workflow_output?: WorkflowOutput;
 	[key: string]: unknown;
+};
+
+export type WorkflowOutput = {
+	type: 'text' | 'image' | 'audio' | 'video' | 'file' | 'card' | 'handoff' | 'json';
+	text?: string;
+	url?: string;
+	fileId?: string;
+	filename?: string;
+	mimeType?: string;
+	alt?: string;
+	title?: string;
+	body?: string;
+	thumbnailUrl?: string;
+	reason?: string;
+	value?: unknown;
+	actions?: Array<Record<string, unknown>>;
 };
 
 export type OutputDetailToken = {
@@ -56,6 +73,11 @@ export type OutputDisplayItem =
 			type: 'detail_group';
 			id: string;
 			tokens: OutputDetailToken[];
+	  }
+	| {
+			type: 'workflow_output';
+			id: string;
+			output: WorkflowOutput;
 	  };
 
 const GROUPABLE_OUTPUT_TYPES = new Set([
@@ -279,6 +301,16 @@ export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDispla
 
 	output.forEach((item, index) => {
 		if (item?.type === 'function_call_output') {
+			return;
+		}
+
+		if (item?.type === 'open_webui:workflow_output' && item.workflow_output) {
+			flushDetails();
+			displayItems.push({
+				type: 'workflow_output',
+				id: item.id ?? `workflow-output-${index}`,
+				output: item.workflow_output
+			});
 			return;
 		}
 

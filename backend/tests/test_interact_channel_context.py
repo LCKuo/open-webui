@@ -14,6 +14,7 @@ from open_webui.routers.interact_channels import (
     _estimated_reservation_tokens,
     _generate_context_summary,
     _prepare_channel_context,
+    _process_channel_job,
     _response_content,
     _response_event_content,
     _should_summarize_context,
@@ -221,7 +222,7 @@ async def test_disabled_line_channel_replies_with_fallback(monkeypatch):
                     'type': 'message',
                     'replyToken': 'reply-token',
                     'webhookEventId': 'event-id',
-                    'source': {'userId': 'line-user'},
+                    'source': {'type': 'group', 'groupId': 'line-group', 'userId': 'line-user'},
                     'message': {'type': 'text', 'text': 'hello'},
                 }
             ]
@@ -264,6 +265,113 @@ async def test_disabled_line_channel_replies_with_fallback(monkeypatch):
     assert response.status_code == 200
     assert replies == [('reply-token', 'service paused')]
     assert json.loads(response.body)['results'][0]['rateLimited'] is False
+
+
+@pytest.mark.asyncio
+async def test_enabled_line_webhook_queues_without_waiting_for_model(monkeypatch):
+    channel = SimpleNamespace(
+        id='channel-id',
+        enabled=True,
+        reply_mode='ai',
+        fallback_message='fallback',
+        channel_secret='line-secret',
+        channel_access_token='line-access-token',
+    )
+    body = json.dumps(
+        {
+            'events': [
+                {
+                    'type': 'message',
+                    'replyToken': 'reply-token',
+                    'webhookEventId': 'event-id',
+                    'source': {'type': 'group', 'groupId': 'line-group', 'userId': 'line-user'},
+                    'message': {'type': 'text', 'text': 'hello'},
+                }
+            ]
+        }
+    ).encode()
+    signature = base64.b64encode(hmac.new(b'line-secret', body, hashlib.sha256).digest())
+    queued = []
+    replies = []
+
+    async def get_channel(*args):
+        return channel
+
+    async def claim_event(*args, **kwargs):
+        return InteractEventClaim(allowed=True, duplicate=False, event_id='claimed-event')
+
+    async def enqueue_job(**kwargs):
+        queued.append(kwargs)
+        return SimpleNamespace(id='job-id')
+
+    async def send_reply(channel, reply_token, text):
+        replies.append((reply_token, text))
+
+    async def unexpected_model_call(*args, **kwargs):
+        raise AssertionError('LINE webhook must not wait for the model')
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._platform_channel', get_channel)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.claim_event', claim_event)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.enqueue_job', enqueue_job)
+    monkeypatch.setattr('open_webui.routers.interact_channels._send_line_reply', send_reply)
+    monkeypatch.setattr('open_webui.routers.interact_channels._complete_claimed_result', unexpected_model_call)
+    monkeypatch.setattr('open_webui.routers.interact_channels.wake_channel_job_workers', lambda: None)
+
+    response = await platform_webhook(
+        _request(body, [(b'x-line-signature', signature)]),
+        'line',
+        'line-channel',
+    )
+
+    result = json.loads(response.body)
+    assert response.status_code == 200
+    assert result['results'][0]['queued'] is True
+    assert queued[0]['event_id'] == 'claimed-event'
+    assert queued[0]['external_user_id'] == 'line-user'
+    assert queued[0]['conversation_id'] == 'line-group'
+    assert queued[0]['payload']['recipientId'] == 'line-group'
+    assert replies == [('reply-token', '已收到，我正在查詢資料並整理答案。完成後會直接傳送結果。')]
+
+
+@pytest.mark.asyncio
+async def test_delivery_retry_reuses_saved_result_without_rerunning_model(monkeypatch):
+    channel = SimpleNamespace(id='channel-id', enabled=True)
+    saved_result = {'content': 'done', 'outputs': []}
+    job = SimpleNamespace(
+        id='job-id',
+        event_id='event-id',
+        channel_id='channel-id',
+        external_user_id='line-user',
+        platform='line',
+        payload={'recipientId': 'line-user', 'platformEventId': 'platform-event', 'message': 'hello'},
+        result=saved_result,
+        attempts=2,
+    )
+    deliveries = []
+    completed = []
+
+    async def get_channel(channel_id):
+        return channel
+
+    async def send_result(channel, recipient, result, retry_key=None):
+        deliveries.append((recipient, result, retry_key))
+
+    async def complete_job(job_id):
+        completed.append(job_id)
+
+    async def unexpected_model_call(*args, **kwargs):
+        raise AssertionError('delivery retry must not rerun the model or workflow')
+
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.get_by_id', get_channel)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.extend_job_lease', lambda *args: True)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.complete_job', complete_job)
+    monkeypatch.setattr('open_webui.routers.interact_channels._send_line_push_result', send_result)
+    monkeypatch.setattr('open_webui.routers.interact_channels._complete_claimed_result', unexpected_model_call)
+
+    await _process_channel_job(SimpleNamespace(state=SimpleNamespace()), 'worker', job, 300, 5)
+
+    assert deliveries == [('line-user', saved_result, 'job-id')]
+    assert completed == ['job-id']
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from open_webui.internal.db import Base, async_engine, get_async_db_context
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import BigInteger, Column, Index, JSON, String, Text, cast, delete, func, or_, select
+from sqlalchemy import JSON, BigInteger, Column, Index, String, Text, cast, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 _tables_ready = False
@@ -91,6 +91,8 @@ class WorkflowRunForm(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     trigger_type: str = 'manual'
     workflow_version_id: Optional[str] = None
+    model_id: Optional[str] = None
+    channel_id: Optional[str] = None
 
 
 class WorkflowModel(BaseModel):
@@ -206,11 +208,14 @@ class WorkflowTable:
         skip: int = 0,
         limit: int = 30,
         include_public_templates: bool = True,
+        include_shared: bool = False,
         db: Optional[AsyncSession] = None,
     ) -> WorkflowListResponse:
         await self.ensure_tables()
         async with get_async_db_context(db) as db:
             access_filter = Workflow.user_id == user_id
+            if include_shared:
+                access_filter = or_(access_filter, Workflow.visibility == 'shared')
             if include_public_templates:
                 access_filter = or_(access_filter, Workflow.visibility == 'public_template')
 
@@ -255,6 +260,8 @@ class WorkflowTable:
                 if key == 'name' and isinstance(value, str):
                     value = value.strip()
                 setattr(row, key, value)
+            if {'graph', 'meta', 'visibility'}.intersection(payload) and 'status' not in payload:
+                row.status = 'draft'
             row.updated_at = int(time.time_ns())
 
             await db.commit()
@@ -320,6 +327,16 @@ class WorkflowTable:
                 .order_by(WorkflowVersion.version.desc())
             )
             return [WorkflowVersionModel.model_validate(row) for row in result.scalars().all()]
+
+    async def get_version_by_id(
+        self,
+        version_id: str,
+        db: Optional[AsyncSession] = None,
+    ) -> Optional[WorkflowVersionModel]:
+        await self.ensure_tables()
+        async with get_async_db_context(db) as db:
+            row = await db.get(WorkflowVersion, version_id)
+            return WorkflowVersionModel.model_validate(row) if row else None
 
     async def insert_run(
         self,

@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB-openwebui}
+      POSTGRES_USER: ${POSTGRES_USER-openwebui}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - open-webui-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER-openwebui} -d ${POSTGRES_DB-openwebui}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  open-webui:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER-openwebui}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB-openwebui}
+      UVICORN_WORKERS: ${UVICORN_WORKERS-2}
+      INTERACT_CHANNEL_WORKERS: ${INTERACT_CHANNEL_WORKERS-4}
+      INTERACT_CHANNEL_JOB_LEASE_SECONDS: ${INTERACT_CHANNEL_JOB_LEASE_SECONDS-300}
+      INTERACT_CHANNEL_JOB_MAX_ATTEMPTS: ${INTERACT_CHANNEL_JOB_MAX_ATTEMPTS-5}
+
+volumes:
+  open-webui-postgres: {}

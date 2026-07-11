@@ -101,6 +101,11 @@
 	import { getFunctions } from '$lib/apis/functions';
 	import { initiateOAuthRedirect } from '$lib/apis/configs';
 	import { updateFolderById } from '$lib/apis/folders';
+	import {
+		getWorkflowById,
+		selectAgentWorkflows,
+		type WorkflowResponse
+	} from '$lib/apis/workflows';
 
 	import Banner from '../common/Banner.svelte';
 	import MessageInput from '$lib/components/chat/MessageInput.svelte';
@@ -117,6 +122,7 @@
 	import Tooltip from '../common/Tooltip.svelte';
 	import Sidebar from '../icons/Sidebar.svelte';
 	import Image from '../common/Image.svelte';
+	import SelectedWorkflowBar from '../workflows/SelectedWorkflowBar.svelte';
 
 	export let chatIdProp = '';
 
@@ -216,6 +222,52 @@
 
 	let chat = null;
 	let tags = [];
+	let selectedWorkflow: WorkflowResponse | null = null;
+	let selectedWorkflowVersionId: string | null = null;
+	let selectedWorkflowLoadingId: string | null = null;
+
+	const loadSelectedWorkflow = async (workflowId: string, versionId: string | null) => {
+		if (!workflowId || selectedWorkflowLoadingId === workflowId) return;
+		selectedWorkflowLoadingId = workflowId;
+		try {
+			const workflow = await getWorkflowById(localStorage.token, workflowId);
+			if (workflow.status !== 'published' || !workflow.default_version_id) {
+				throw new Error('這個工作流尚未發布，不能在聊天中使用。');
+			}
+			selectedWorkflow = workflow;
+			selectedWorkflowVersionId = versionId || workflow.default_version_id;
+		} catch (error) {
+			selectedWorkflow = null;
+			selectedWorkflowVersionId = null;
+			toast.error(`${error}`);
+		} finally {
+			selectedWorkflowLoadingId = null;
+		}
+	};
+
+	const clearSelectedWorkflow = () => {
+		selectedWorkflow = null;
+		selectedWorkflowVersionId = null;
+		const url = new URL(window.location.href);
+		url.searchParams.delete('workflow');
+		url.searchParams.delete('version');
+		window.history.replaceState(
+			window.history.state,
+			'',
+			`${url.pathname}${url.search}${url.hash}`
+		);
+	};
+
+	$: selectedWorkflowModelLabel = (() => {
+		const configuredModels = [
+			...new Set(
+				(selectedWorkflow?.graph?.nodes ?? [])
+					.map((node) => node?.data?.config?.model_id)
+					.filter(Boolean)
+			)
+		];
+		return configuredModels.length ? configuredModels.join(', ') : '沿用目前聊天模型';
+	})();
 
 	// Read-only when viewing someone else's chat (e.g. via shared folder access)
 	$: readOnly = chat != null && chat.user_id !== $user?.id;
@@ -957,6 +1009,10 @@
 		}
 
 		const pageSubscribe = page.subscribe(async (p) => {
+			const workflowId = p.url.searchParams.get('workflow');
+			if (workflowId) {
+				await loadSelectedWorkflow(workflowId, p.url.searchParams.get('version'));
+			}
 			if (p.url.pathname === '/') {
 				await tick();
 				initNewChat();
@@ -2222,6 +2278,25 @@
 			}
 		}
 
+		if (!selectedWorkflow && userPrompt.trim()) {
+			const selectorModelId = atSelectedModel?.id || selectedModels[0];
+			const selection = await selectAgentWorkflows(
+				localStorage.token,
+				userPrompt,
+				undefined,
+				selectorModelId,
+				3
+			).catch(() => null);
+			if (selection?.decision === 'selected' && selection.selected_workflow_id) {
+				await loadSelectedWorkflow(selection.selected_workflow_id, selection.selected_version_id);
+				if (selectedWorkflow) {
+					toast.info(`將使用工作流「${selectedWorkflow.name}」`);
+				}
+			} else if (selection?.decision === 'ambiguous') {
+				toast.info('找到多個相近工作流，本次維持一般聊天；可從企業工作流中心明確選擇。');
+			}
+		}
+
 		// Clear input and submit
 		messageInput?.setText('');
 		prompt = '';
@@ -2261,6 +2336,11 @@
 			: atSelectedModel !== undefined
 				? [atSelectedModel.id]
 				: selectedModels;
+		// A workflow run is one deterministic execution. Side-by-side model fan-out
+		// would otherwise execute the same published version multiple times.
+		if (selectedWorkflow && selectedModelIds.length > 1) {
+			selectedModelIds = [selectedModelIds[0]];
+		}
 
 		// Create response messages for each selected model
 		// Build message_ids list: [{model_id, message_id}, ...]
@@ -2592,6 +2672,14 @@
 				session_id: $socket?.id,
 				chat_id: _chatId || undefined,
 				folder_id: $selectedFolder?.id ?? undefined,
+				workflow: selectedWorkflow
+					? {
+							id: selectedWorkflow.id,
+							versionId: selectedWorkflowVersionId || selectedWorkflow.default_version_id,
+							trigger: 'webui_chat.manual',
+							includeChatContext: true
+						}
+					: undefined,
 
 				id: responseMessageId,
 				...(messageIdsList ? { message_ids: messageIdsList } : {}),
@@ -3295,6 +3383,14 @@
 								</div>
 							{:else}
 								<div class=" pb-2 {dragged ? 'z-0' : 'z-10'}">
+									{#if selectedWorkflow}
+										<SelectedWorkflowBar
+											name={selectedWorkflow.name}
+											description={selectedWorkflow.description || ''}
+											modelLabel={selectedWorkflowModelLabel}
+											onClear={clearSelectedWorkflow}
+										/>
+									{/if}
 									<MessageInput
 										bind:this={messageInput}
 										{history}
@@ -3380,6 +3476,16 @@
 							{/if}
 						{:else}
 							<div class="flex items-center h-full">
+								{#if selectedWorkflow}
+									<div class="absolute bottom-[8.5rem] left-0 right-0 z-20 px-4">
+										<SelectedWorkflowBar
+											name={selectedWorkflow.name}
+											description={selectedWorkflow.description || ''}
+											modelLabel={selectedWorkflowModelLabel}
+											onClear={clearSelectedWorkflow}
+										/>
+									</div>
+								{/if}
 								<Placeholder
 									{history}
 									{selectedModels}

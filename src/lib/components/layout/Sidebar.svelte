@@ -160,7 +160,7 @@
 		const items = {
 			notes: { label: 'Notes', href: '/notes', iconType: 'note' },
 			workspace: { label: 'Workspace', href: '/workspace', iconType: 'workspace' },
-			workflows: { label: 'Workflows', href: '/workflows', iconType: 'workflows' },
+			workflows: { label: '企業工作流中心', href: '/workflows', iconType: 'workflows' },
 			automations: { label: 'Automations', href: '/automations', iconType: 'automations' },
 			calendar: { label: 'Calendar', href: '/calendar', iconType: 'calendar' },
 			playground: { label: 'Playground', href: '/playground', iconType: 'playground' }

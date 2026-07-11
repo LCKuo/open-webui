@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { onMount, getContext } from 'svelte';
+	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { toast } from 'svelte-sonner';
-	import { WEBUI_NAME, showSidebar } from '$lib/stores';
+	import { WEBUI_NAME, showSidebar, user } from '$lib/stores';
 	import {
 		createWorkflow,
 		deleteWorkflowById,
@@ -11,8 +11,8 @@
 	} from '$lib/apis/workflows';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
-
-	const i18n = getContext('i18n');
+	import Pagination from '$lib/components/common/Pagination.svelte';
+	import WorkflowOverviewDrawer from '$lib/components/workflows/WorkflowOverviewDrawer.svelte';
 
 	let loaded = false;
 	let loading = false;
@@ -25,6 +25,55 @@
 	let visibility = 'all';
 	let page = 1;
 	let searchTimer: ReturnType<typeof setTimeout>;
+	let selectedWorkflow: WorkflowResponse | null = null;
+	let centerView: 'available' | 'mine' | 'company' = 'available';
+
+	const VISIBILITY_OPTIONS = [
+		{
+			value: 'all',
+			label: '全部工作流',
+			description: '你的工作流與公開範本。'
+		},
+		{
+			value: 'private',
+			label: '私人',
+			description: '只有擁有者與管理員可以使用。'
+		},
+		{
+			value: 'shared',
+			label: '指定範圍共享',
+			description: '只會依工作流存取政策開放，例如公司、成員、群組、頻道或模型範圍。'
+		},
+		{
+			value: 'public_template',
+			label: '公開範本',
+			description: '登入工作區的使用者可見的可重用範本，不適合公司內部自動化。'
+		}
+	];
+
+	const visibilityLabel = (value: string) =>
+		VISIBILITY_OPTIONS.find((option) => option.value === value)?.label ?? value;
+	const statusLabel = (value: string) =>
+		({
+			draft: '草稿',
+			published: '已發布',
+			archived: '已封存'
+		})[value] ?? value;
+	const canManageWorkflow = (workflow: WorkflowResponse) =>
+		$user?.role === 'admin' || workflow.user_id === $user?.id;
+	$: visibleWorkflows = workflows.filter((workflow) => {
+		if (centerView === 'mine') return canManageWorkflow(workflow);
+		if (centerView === 'company')
+			return workflow.visibility === 'shared' && !canManageWorkflow(workflow);
+		return true;
+	});
+
+	const useWorkflowInChat = (workflow: WorkflowResponse) => {
+		if (!workflow.default_version_id) return;
+		goto(
+			`/?workflow=${encodeURIComponent(workflow.id)}&version=${encodeURIComponent(workflow.default_version_id)}`
+		);
+	};
 
 	const defaultGraph = () => ({
 		nodes: [
@@ -32,13 +81,13 @@
 				id: 'input',
 				type: 'input',
 				position: { x: 80, y: 120 },
-				data: { label: 'Chat / Channel Input', type: 'channel_input' }
+				data: { label: '聊天 / 頻道輸入', type: 'channel_input' }
 			},
 			{
 				id: 'reply',
 				type: 'output',
 				position: { x: 420, y: 120 },
-				data: { label: 'Reply to User', type: 'channel_reply' }
+				data: { label: '回覆使用者', type: 'channel_reply' }
 			}
 		],
 		edges: [{ id: 'input-reply', source: 'input', target: 'reply' }]
@@ -60,17 +109,21 @@
 	const handleSearch = () => {
 		clearTimeout(searchTimer);
 		searchTimer = setTimeout(() => {
-			page = 1;
-			loadWorkflows();
+			if (page !== 1) page = 1;
+			else loadWorkflows();
 		}, 250);
 	};
+
+	$: if (loaded && page) {
+		loadWorkflows();
+	}
 
 	const createBlankWorkflow = async () => {
 		creating = true;
 		try {
 			const workflow = await createWorkflow(localStorage.token, {
-				name: $i18n.t('Untitled workflow'),
-				description: $i18n.t('Use this workflow from chat or connected channels.'),
+				name: '未命名工作流',
+				description: '尚未設定用途的工作流草稿。',
 				graph: defaultGraph(),
 				meta: { channels: ['chat', 'line', 'wechat', 'telegram'] },
 				visibility: 'private',
@@ -87,7 +140,7 @@
 	const deleteWorkflow = async (workflow: WorkflowResponse) => {
 		try {
 			await deleteWorkflowById(localStorage.token, workflow.id);
-			toast.success($i18n.t('Workflow deleted'));
+			toast.success('工作流已刪除');
 			deleteTarget = null;
 			loadWorkflows();
 		} catch (err) {
@@ -99,28 +152,35 @@
 
 	onMount(() => {
 		loaded = true;
-		loadWorkflows();
 
 		return () => clearTimeout(searchTimer);
 	});
 </script>
 
 <svelte:head>
-	<title>{$i18n.t('Workflows')} | {$WEBUI_NAME}</title>
+	<title>工作流 | {$WEBUI_NAME}</title>
 </svelte:head>
 
 <DeleteConfirmDialog
 	bind:show={showDeleteConfirm}
-	title={$i18n.t('Delete workflow?')}
-	confirmLabel={$i18n.t('Delete')}
+	title="刪除工作流？"
+	confirmLabel="刪除"
 	on:confirm={() => {
 		if (deleteTarget) deleteWorkflow(deleteTarget);
 	}}
 >
 	<div class="truncate text-sm text-gray-500">
-		{$i18n.t('This will delete')} <span class="font-medium">{deleteTarget?.name}</span>.
+		這會刪除 <span class="font-medium">{deleteTarget?.name}</span>。
 	</div>
 </DeleteConfirmDialog>
+
+<WorkflowOverviewDrawer
+	workflow={selectedWorkflow}
+	canManage={selectedWorkflow ? canManageWorkflow(selectedWorkflow) : false}
+	onClose={() => (selectedWorkflow = null)}
+	onUse={useWorkflowInChat}
+	onEdit={(workflow) => goto(`/workflows/${workflow.id}/edit`)}
+/>
 
 <div
 	class="flex flex-col w-full h-screen max-h-[100dvh] transition-width duration-200 ease-in-out {$showSidebar
@@ -132,15 +192,11 @@
 			<div class="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
 				<div class="space-y-2">
 					<div class="text-xs font-semibold uppercase tracking-wide text-gray-500">
-						{$i18n.t('Chat-driven automation')}
+						企業工作流中心
 					</div>
-					<h1 class="text-2xl font-semibold text-gray-900 dark:text-gray-100">
-						{$i18n.t('Workflows')}
-					</h1>
+					<h1 class="text-2xl font-semibold text-gray-900 dark:text-gray-100">工作流</h1>
 					<p class="max-w-2xl text-sm text-gray-500">
-						{$i18n.t(
-							'Build once, run from chat, LINE, WeChat, Telegram, webhooks, or scheduled triggers.'
-						)}
+						建立工作流圖、發布版本並設定公司、成員、群組、頻道與模型存取政策。
 					</p>
 				</div>
 
@@ -149,7 +205,7 @@
 					disabled={creating}
 					on:click={createBlankWorkflow}
 				>
-					{creating ? $i18n.t('Creating...') : $i18n.t('New workflow')}
+					{creating ? '建立中...' : '新增工作流'}
 				</button>
 			</div>
 
@@ -158,7 +214,7 @@
 			>
 				<input
 					class="min-w-0 flex-1 rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none focus:border-gray-400 dark:border-gray-800 dark:focus:border-gray-600"
-					placeholder={$i18n.t('Search workflows')}
+					placeholder="搜尋工作流"
 					bind:value={query}
 					on:input={handleSearch}
 				/>
@@ -166,49 +222,56 @@
 					class="rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
 					bind:value={visibility}
 					on:change={() => {
-						page = 1;
-						loadWorkflows();
+						if (page !== 1) page = 1;
+						else loadWorkflows();
 					}}
+					title={VISIBILITY_OPTIONS.find((option) => option.value === visibility)?.description}
 				>
-					<option value="all">{$i18n.t('All visibility')}</option>
-					<option value="private">{$i18n.t('Private')}</option>
-					<option value="shared">{$i18n.t('Shared')}</option>
-					<option value="public_template">{$i18n.t('Public templates')}</option>
+					{#each VISIBILITY_OPTIONS as option}
+						<option value={option.value}>{option.label}</option>
+					{/each}
 				</select>
+			</div>
+
+			<div class="flex gap-2 overflow-x-auto border-b border-gray-200 dark:border-gray-800">
+				{#each [{ value: 'available', label: '我能使用的' }, { value: 'mine', label: '我建立的' }, { value: 'company', label: '企業共享' }] as option}
+					<button
+						class="border-b-2 px-3 py-2 text-sm {centerView === option.value
+							? 'border-gray-900 font-medium text-gray-900 dark:border-white dark:text-white'
+							: 'border-transparent text-gray-500'}"
+						on:click={() => (centerView = option.value as typeof centerView)}>{option.label}</button
+					>
+				{/each}
 			</div>
 
 			{#if !loaded || loading}
 				<div class="flex justify-center py-16">
 					<Spinner />
 				</div>
-			{:else if workflows.length === 0}
+			{:else if visibleWorkflows.length === 0}
 				<div
 					class="rounded-xl border border-dashed border-gray-300 bg-white p-10 text-center dark:border-gray-800 dark:bg-gray-950"
 				>
-					<div class="text-base font-medium text-gray-900 dark:text-gray-100">
-						{$i18n.t('No workflows yet')}
-					</div>
+					<div class="text-base font-medium text-gray-900 dark:text-gray-100">目前沒有工作流</div>
 					<p class="mt-2 text-sm text-gray-500">
-						{$i18n.t(
-							'Create a workflow and test it from the same editor before connecting it to channels.'
-						)}
+						先建立工作流，設定節點與存取政策，再進行結構驗證。
 					</p>
 					<button
 						class="mt-5 rounded-xl bg-gray-900 px-4 py-2.5 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
 						on:click={createBlankWorkflow}
 					>
-						{$i18n.t('Create first workflow')}
+						建立第一個工作流
 					</button>
 				</div>
 			{:else}
 				<div class="grid gap-3">
-					{#each workflows as workflow}
+					{#each visibleWorkflows as workflow}
 						<div
 							class="flex flex-col gap-4 rounded-xl border border-gray-200 bg-white p-4 transition hover:border-gray-300 dark:border-gray-800 dark:bg-gray-950 md:flex-row md:items-center md:justify-between"
 						>
 							<button
 								class="min-w-0 flex-1 text-left"
-								on:click={() => goto(`/workflows/${workflow.id}/edit`)}
+								on:click={() => (selectedWorkflow = workflow)}
 							>
 								<div class="flex flex-wrap items-center gap-2">
 									<div class="truncate text-base font-medium text-gray-900 dark:text-gray-100">
@@ -217,47 +280,62 @@
 									<span
 										class="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600 dark:bg-gray-800 dark:text-gray-300"
 									>
-										{workflow.status}
+										{statusLabel(workflow.status)}
 									</span>
 									<span
 										class="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600 dark:bg-gray-800 dark:text-gray-300"
 									>
-										{workflow.visibility}
+										{visibilityLabel(workflow.visibility)}
 									</span>
 								</div>
 								<div class="mt-1 line-clamp-2 text-sm text-gray-500">
-									{workflow.description || $i18n.t('No description')}
+									{workflow.description || '沒有描述'}
 								</div>
 								<div class="mt-2 text-xs text-gray-400">
-									{$i18n.t('Updated')} {formatDate(workflow.updated_at)}
+									更新時間 {formatDate(workflow.updated_at)}
 								</div>
 							</button>
 
 							<div class="flex shrink-0 items-center gap-2">
 								<button
 									class="rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
+									on:click={() => (selectedWorkflow = workflow)}>概覽</button
+								>
+								<button
+									class="rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-white dark:text-gray-900"
+									disabled={!workflow.default_version_id || workflow.status !== 'published'}
+									on:click={() => useWorkflowInChat(workflow)}>在聊天中使用</button
+								>
+								<button
+									class="rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
 									on:click={() => goto(`/workflows/${workflow.id}/edit`)}
 								>
-									{$i18n.t('Edit')}
+									{canManageWorkflow(workflow) ? '編輯' : '檢視'}
 								</button>
-								<button
-									class="rounded-lg border border-red-200 px-3 py-2 text-sm text-red-600 hover:bg-red-50 dark:border-red-900 dark:hover:bg-red-950"
-									on:click={() => {
-										deleteTarget = workflow;
-										showDeleteConfirm = true;
-									}}
-								>
-									{$i18n.t('Delete')}
-								</button>
+								{#if canManageWorkflow(workflow)}
+									<button
+										class="rounded-lg border border-red-200 px-3 py-2 text-sm text-red-600 hover:bg-red-50 dark:border-red-900 dark:hover:bg-red-950"
+										on:click={() => {
+											deleteTarget = workflow;
+											showDeleteConfirm = true;
+										}}
+									>
+										刪除
+									</button>
+								{/if}
 							</div>
 						</div>
 					{/each}
 				</div>
 
 				<div class="text-sm text-gray-500">
-					{$i18n.t('Showing')} {workflows.length} {$i18n.t('of')} {total}
-					{$i18n.t('workflows')}
+					顯示 {workflows.length} / {total} 個工作流
 				</div>
+				{#if total > 30}
+					<div class="flex justify-center">
+						<Pagination bind:page count={total} perPage={30} />
+					</div>
+				{/if}
 			{/if}
 		</div>
 	</div>

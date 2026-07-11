@@ -23,6 +23,9 @@ services:
     environment:
       - 'OLLAMA_BASE_URL=http://ollama:11434'
       - 'WEBUI_SECRET_KEY='
+      - 'INTERACT_CHANNEL_WORKERS=${INTERACT_CHANNEL_WORKERS-8}'
+      - 'INTERACT_CHANNEL_JOB_LEASE_SECONDS=${INTERACT_CHANNEL_JOB_LEASE_SECONDS-300}'
+      - 'INTERACT_CHANNEL_JOB_MAX_ATTEMPTS=${INTERACT_CHANNEL_JOB_MAX_ATTEMPTS-5}'
     extra_hosts:
       - host.docker.internal:host-gateway
     restart: unless-stopped

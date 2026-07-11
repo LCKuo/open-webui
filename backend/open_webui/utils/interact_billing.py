@@ -75,6 +75,13 @@ def estimate_reserved_tokens(form_data: dict[str, Any]) -> tuple[int, int, int]:
     except (TypeError, ValueError):
         max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS
 
+    try:
+        reservation_multiplier = max(1, min(8, int(form_data.get("_billing_multiplier") or 1)))
+    except (TypeError, ValueError):
+        reservation_multiplier = 1
+    input_tokens *= reservation_multiplier
+    max_output_tokens *= reservation_multiplier
+
     return (
         input_tokens,
         max_output_tokens,
@@ -172,6 +179,25 @@ def current_user_question(form_data: dict[str, Any], metadata: dict[str, Any]) -
         if message.get("role") == "user":
             return content_text(message.get("content"))
     return ""
+
+
+def billing_workflow_metadata(metadata: dict[str, Any]) -> dict[str, str]:
+    workflow = metadata.get("workflow")
+    if not isinstance(workflow, dict):
+        return {}
+
+    result: dict[str, str] = {}
+    for source_key, target_key in (
+        ("id", "id"),
+        ("name", "name"),
+        ("versionId", "versionId"),
+        ("runId", "runId"),
+        ("trigger", "trigger"),
+    ):
+        value = workflow.get(source_key)
+        if isinstance(value, str) and value.strip():
+            result[target_key] = value.strip()[:200]
+    return result
 
 
 @dataclass
@@ -291,6 +317,7 @@ class InteractBillingClient:
         }
         request_id = f"{metadata.get('chat_id') or 'direct'}:{metadata.get('message_id') or uuid4()}"
         channel_metadata = metadata.get("interact_channel") or {}
+        workflow_metadata = billing_workflow_metadata(metadata)
 
         data = await self._request(
             "POST",
@@ -327,6 +354,7 @@ class InteractBillingClient:
                     "openWebuiMessageId": metadata.get("message_id"),
                     "openWebuiSessionId": metadata.get("session_id"),
                     **({"source": "channel", "channel": channel_metadata} if channel_metadata else {}),
+                    **({"workflow": workflow_metadata} if workflow_metadata else {}),
                 },
             },
         )
@@ -441,6 +469,7 @@ class InteractBillingClient:
         answer: Any = None,
     ) -> dict[str, Any]:
         channel_metadata = metadata.get("interact_channel") or {}
+        workflow_metadata = billing_workflow_metadata(metadata)
         question_text = current_user_question(form_data, metadata)
         answer_text = content_text(answer)
         logged_answer_text = (
@@ -474,7 +503,9 @@ class InteractBillingClient:
                 "model": form_data.get("model"),
                 "status": "completed",
                 "request_summary": (
-                    "Open WebUI channel chat completion"
+                    f"Workflow: {workflow_metadata.get('name') or workflow_metadata.get('id')}"
+                    if workflow_metadata
+                    else "Open WebUI channel chat completion"
                     if channel_metadata
                     else "Open WebUI chat completion"
                 ),
@@ -503,6 +534,7 @@ class InteractBillingClient:
                         "answer": logged_answer_text,
                     },
                     **({"source": "channel", "channel": channel_metadata} if channel_metadata else {}),
+                    **({"workflow": workflow_metadata} if workflow_metadata else {}),
                 },
             },
         )

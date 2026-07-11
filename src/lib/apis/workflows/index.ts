@@ -55,6 +55,33 @@ export type WorkflowValidateResponse = {
 	warnings: string[];
 };
 
+export type WorkflowSelectorItem = {
+	id: string;
+	name: string;
+	description: string | null;
+	visibility: string;
+	default_version_id: string | null;
+	score: number;
+	confidence: number;
+	threshold: number;
+	priority: number;
+	ambiguity_margin: number;
+	matched_keywords: string[];
+	matched_required_keywords: string[];
+	matched_examples: { example: string; similarity: number }[];
+	reason: string;
+};
+
+export type WorkflowSelectorResponse = {
+	decision: 'selected' | 'ambiguous' | 'none';
+	action: 'execute_workflow' | 'ask_user' | 'continue_chat';
+	selected_workflow_id: string | null;
+	selected_version_id: string | null;
+	needs_confirmation: boolean;
+	reason: string;
+	items: WorkflowSelectorItem[];
+};
+
 const parseResponse = async (res: Response) => {
 	if (!res.ok) {
 		const err = await res.json().catch(() => ({ detail: res.statusText }));
@@ -119,12 +146,26 @@ export const updateWorkflowById = async (
 export const validateWorkflowById = async (
 	token: string,
 	id: string,
-	graph?: WorkflowGraph
+	form?: Pick<WorkflowForm, 'graph' | 'meta' | 'visibility'>
 ): Promise<WorkflowValidateResponse> => {
 	return fetch(`${WEBUI_API_BASE_URL}/workflows/${id}/validate`, {
 		method: 'POST',
 		headers: headers(token),
-		body: JSON.stringify(graph ? { graph } : {})
+		body: JSON.stringify(form ?? {})
+	}).then(parseResponse);
+};
+
+export const selectAgentWorkflows = async (
+	token: string,
+	message: string,
+	channelId?: string,
+	modelId?: string,
+	maxItems = 5
+): Promise<WorkflowSelectorResponse> => {
+	return fetch(`${WEBUI_API_BASE_URL}/workflows/agent/select`, {
+		method: 'POST',
+		headers: headers(token),
+		body: JSON.stringify({ message, channelId, modelId, maxItems })
 	}).then(parseResponse);
 };
 
@@ -142,12 +183,14 @@ export const runWorkflowById = async (
 	token: string,
 	id: string,
 	input: Record<string, any> = {},
-	trigger_type = 'manual'
+	trigger_type = 'manual',
+	model_id?: string,
+	workflow_version_id?: string
 ): Promise<WorkflowRunResponse> => {
 	return fetch(`${WEBUI_API_BASE_URL}/workflows/${id}/run`, {
 		method: 'POST',
 		headers: headers(token),
-		body: JSON.stringify({ input, trigger_type })
+		body: JSON.stringify({ input, trigger_type, model_id, workflow_version_id })
 	}).then(parseResponse);
 };
 

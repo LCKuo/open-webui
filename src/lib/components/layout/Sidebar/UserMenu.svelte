@@ -527,7 +527,7 @@
 								/>
 							</svg>
 						</div>
-						<div class="self-center truncate">{$i18n.t('Workflows')}</div>
+						<div class="self-center truncate">企業工作流中心</div>
 					</a>
 					{#if shiftKey}
 						<Tooltip
