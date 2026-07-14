@@ -61,6 +61,8 @@ from open_webui.tools.builtin import (
     grep_knowledge_files,
     interact_database_query,
     interact_database_schema,
+    interact_semantic_catalog,
+    interact_semantic_query,
     kb_exec,
     list_automations,
     list_knowledge,
@@ -637,7 +639,14 @@ async def get_builtin_tools(
     # Interact Vision data connectors are security-sensitive, so they are
     # opt-in only and must be explicitly enabled per model.
     if model.get('info', {}).get('meta', {}).get('builtinTools', {}).get('interact_database') is True:
-        builtin_functions.extend([interact_database_schema, interact_database_query])
+        builtin_functions.extend(
+            [
+                interact_semantic_catalog,
+                interact_semantic_query,
+                interact_database_schema,
+                interact_database_query,
+            ]
+        )
 
     # Skills tools - view_skill allows model to load full skill instructions on demand
     if extra_params.get('__skill_ids__'):

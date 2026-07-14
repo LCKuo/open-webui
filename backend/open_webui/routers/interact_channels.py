@@ -14,12 +14,12 @@ import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, suppress
 from types import SimpleNamespace
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlparse
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import aiohttp
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from open_webui.models.auths import Auths
 from open_webui.models.chats import ChatForm, Chats
 from open_webui.models.config import Config
@@ -28,6 +28,7 @@ from open_webui.models.interact_channels import (
     InteractChannels,
 )
 from open_webui.models.interact_data_connectors import InteractDataConnectors
+from open_webui.models.interact_sso import InteractSsoTickets
 from open_webui.tools.interact_database import scan_data_connector_schema
 from open_webui.models.users import Users
 from open_webui.utils.auth import get_password_hash, get_verified_user
@@ -412,6 +413,34 @@ def _masked_email(value: str) -> str:
     return f'{local[:2]}***@{domain}'
 
 
+def _safe_sso_target(value: str) -> str | None:
+    if not value.startswith('/') or value.startswith('//') or '\\' in value:
+        return None
+    path = value.split('?', 1)[0]
+    if path == '/workspace/data-connectors' or path.startswith('/workspace/data-connectors/'):
+        return value
+    if path == '/workflows' or path.startswith('/workflows/'):
+        return value
+    return None
+
+
+def _safe_sso_return_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password:
+        return None
+    configured = {
+        item.strip().lower()
+        for item in (os.environ.get('INTERACT_SSO_RETURN_HOSTS') or '').split(',')
+        if item.strip()
+    }
+    allowed = {'interact-vision.com.tw', 'www.interact-vision.com.tw', 'localhost', '127.0.0.1'} | configured
+    if parsed.hostname.lower() not in allowed:
+        return None
+    return value
+
+
 class ChannelChatRequest(BaseModel):
     companyEmail: str = Field(..., min_length=3)
     channelType: Literal['line', 'wechat', 'telegram']
@@ -436,6 +465,13 @@ class ProvisionAccountRequest(BaseModel):
     companyMemberId: str | None = Field(default=None, max_length=200)
     companyMemberRole: str | None = Field(default=None, max_length=40)
     accountType: Literal['owner', 'member'] = 'owner'
+
+
+class SsoTicketRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    companyUserId: str = Field(..., min_length=1, max_length=200)
+    targetPath: str = Field(..., min_length=1, max_length=1000)
+    returnUrl: str | None = Field(default=None, max_length=1000)
 
 
 class ChannelHealthRequest(BaseModel):
@@ -493,7 +529,9 @@ class DataConnectorSyncRequest(BaseModel):
     max_rows: int = Field(default=100, ge=1, le=10000)
     query_timeout_seconds: int = Field(default=15, ge=1, le=300)
     allow_write: bool = False
-    access_mode: Literal['company_admins', 'selected_members', 'all_company_members'] = 'company_admins'
+    access_mode: Literal[
+        'company_admins', 'selected_members', 'all_company_members', 'selected_channels'
+    ] = 'company_admins'
     allowed_member_ids: list[str] = Field(default_factory=list, max_length=300)
     allowed_group_ids: list[str] = Field(default_factory=list, max_length=300)
     allowed_model_ids: list[str] = Field(default_factory=list, max_length=300)
@@ -1709,6 +1747,8 @@ async def channel_chat(  # noqa: C901
             'channelType': payload.channelType,
             'channelId': (payload.metadata or {}).get('channelId'),
             'modelId': model_id,
+            'externalUserId': payload.externalUserId,
+            'conversationId': payload.conversationId or payload.externalUserId,
         },
     }
     if payload.maxTokens:
@@ -2491,6 +2531,69 @@ async def channel_health(
         'expectedWorkerCount': _channel_worker_expected,
         'queue': queue,
     }
+
+
+@router.post('/sso/tickets')
+async def issue_sso_ticket(
+    payload: SsoTicketRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    target_path = _safe_sso_target(payload.targetPath)
+    return_url = _safe_sso_return_url(payload.returnUrl)
+    if not target_path:
+        raise HTTPException(status_code=400, detail='Unsupported SSO target path.')
+    if payload.returnUrl and not return_url:
+        raise HTTPException(status_code=400, detail='Unsupported SSO return URL.')
+
+    user = await Users.get_user_by_email(payload.email.strip().lower())
+    company_marker = f'Company user id: {payload.companyUserId}'
+    if not user or company_marker not in str(user.bio or ''):
+        raise HTTPException(status_code=404, detail='Bound Interact Web Ai account was not found.')
+    if user.role == 'pending':
+        raise HTTPException(status_code=403, detail='Interact Web Ai account is not active.')
+
+    ticket = await InteractSsoTickets.issue(
+        user.id,
+        payload.companyUserId,
+        target_path,
+        return_url,
+    )
+    return {
+        'ok': True,
+        'launchPath': f'/api/v1/interact/sso/consume?ticket={quote(ticket, safe="")}',
+        'expiresIn': 90,
+    }
+
+
+@router.get('/sso/consume')
+async def consume_sso_ticket(request: Request, ticket: str = Query(..., min_length=20, max_length=200)):
+    claimed = await InteractSsoTickets.consume(ticket)
+    if not claimed:
+        raise HTTPException(status_code=410, detail='SSO link is invalid, expired, or already used.')
+    user = await Users.get_user_by_id(claimed['user_id'])
+    if not user or user.role == 'pending':
+        raise HTTPException(status_code=403, detail='Interact Web Ai account is not active.')
+
+    target_path = claimed['target_path']
+    if claimed.get('return_url'):
+        separator = '&' if '?' in target_path else '?'
+        target_path = f'{target_path}{separator}{urlencode({"interact_return_to": claimed["return_url"]})}'
+    response = RedirectResponse(target_path, status_code=303)
+    from open_webui.routers.auths import create_session_response
+    from open_webui.internal.db import get_async_db_context
+
+    async with get_async_db_context() as db:
+        await create_session_response(
+            request,
+            user,
+            db,
+            response=response,
+            set_cookie=True,
+            source='interact_sso',
+        )
+    return response
 
 
 @router.post('/accounts/provision')

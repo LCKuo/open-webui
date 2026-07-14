@@ -28,6 +28,7 @@ SENSITIVE_NODE_TYPES = {
     'code_interpreter',
     'crm_tool',
     'database_query',
+    'semantic_query',
     'http_request',
     'mcp_tools',
     'ticket_tool',
@@ -490,6 +491,12 @@ def validate_workflow_graph(graph: dict[str, Any]) -> dict[str, list[str] | bool
                 errors.append(f'Database query node {node_id} requires an allowed table name.')
             if _clean_str(config.get('operation') or 'select').lower() not in {'select', 'count'}:
                 errors.append(f'Database query node {node_id} only supports select or count.')
+        if _node_type(node) == 'semantic_query':
+            data = node.get('data') if isinstance(node.get('data'), dict) else {}
+            config = data.get('config') if isinstance(data.get('config'), dict) else {}
+            plan = config.get('plan') if isinstance(config.get('plan'), dict) else {}
+            if not _clean_str(config.get('dataset_id') or plan.get('datasetId')):
+                errors.append(f'Semantic query node {node_id} requires a published dataset id.')
 
     for node_id in sorted(duplicate_ids):
         errors.append(f'Duplicate node id: {node_id}.')

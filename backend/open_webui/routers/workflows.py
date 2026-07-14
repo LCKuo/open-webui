@@ -9,6 +9,8 @@ from open_webui.constants import ERROR_MESSAGES
 from open_webui.internal.db import get_async_session
 from open_webui.models.config import Config
 from open_webui.models.groups import Groups
+from open_webui.models.interact_data_connectors import InteractDataConnectors
+from open_webui.models.interact_semantic import InteractSemantic
 from open_webui.models.users import Users
 from open_webui.models.workflows import (
     WorkflowForm,
@@ -21,11 +23,23 @@ from open_webui.models.workflows import (
     WorkflowValidateResponse,
     WorkflowVersionModel,
 )
+from open_webui.semantic_query.contracts import QueryRuntimeContext
+from open_webui.semantic_query.errors import SemanticQueryError
+from open_webui.semantic_query.service import execute_query as execute_semantic_query
 from open_webui.tools.interact_database import interact_database_query
 from open_webui.utils.access_control import has_permission
 from open_webui.utils.auth import get_verified_user
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
+from open_webui.utils.workflow_runtime import (
+    RUNTIME_MODEL_TYPES,
+    WorkflowRuntimeError,
+    execute_workflow_graph,
+    node_semantic_type,
+    runtime_unsupported_node_types,
+    workflow_outputs_text,
+    workflow_outputs_to_response_items,
+)
 from open_webui.utils.workflows import (
     WorkflowAccessContext,
     decide_workflow_candidates,
@@ -35,15 +49,6 @@ from open_webui.utils.workflows import (
     validate_workflow_visibility,
     workflow_acl_allows,
     workflow_agent_candidate,
-)
-from open_webui.utils.workflow_runtime import (
-    RUNTIME_MODEL_TYPES,
-    WorkflowRuntimeError,
-    execute_workflow_graph,
-    node_semantic_type,
-    runtime_unsupported_node_types,
-    workflow_outputs_text,
-    workflow_outputs_to_response_items,
 )
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -270,6 +275,35 @@ def _validate_workflow_configuration(
     return {'ok': len(errors) == 0, 'errors': errors, 'warnings': warnings}
 
 
+async def _validate_semantic_nodes_for_publish(
+    workflow: WorkflowModel,
+    company_user_id: str | None,
+) -> list[str]:
+    errors: list[str] = []
+    nodes = workflow.graph.get('nodes') if isinstance(workflow.graph, dict) else []
+    for node in nodes or []:
+        if not isinstance(node, dict) or node_semantic_type(node) != 'semantic_query':
+            continue
+        node_id = str(node.get('id') or 'unknown')
+        data = node.get('data') if isinstance(node.get('data'), dict) else {}
+        config = data.get('config') if isinstance(data.get('config'), dict) else {}
+        plan = config.get('plan') if isinstance(config.get('plan'), dict) else {}
+        dataset_id = str(config.get('dataset_id') or plan.get('datasetId') or '').strip()
+        dataset = await InteractSemantic.get_dataset(dataset_id) if dataset_id else None
+        if not dataset or dataset.get('company_user_id') != company_user_id:
+            errors.append(f'Semantic query node {node_id} cannot access dataset {dataset_id or "(missing)"}.')
+            continue
+        if dataset.get('status') != 'published' or not dataset.get('current_version_id'):
+            errors.append(f'Semantic query node {node_id} requires a published dataset version.')
+        allowed_workflows = dataset.get('allowed_workflow_ids') or []
+        if allowed_workflows and workflow.id not in allowed_workflows:
+            errors.append(f'Semantic query node {node_id} dataset does not allow workflow {workflow.id}.')
+        connector = await InteractDataConnectors.get_by_id(dataset['connector_id'])
+        if not connector or not connector.enabled or connector.company_user_id != company_user_id:
+            errors.append(f'Semantic query node {node_id} connector is disabled or belongs to another company.')
+    return errors
+
+
 def _response_data(response: Any) -> dict[str, Any]:
     if isinstance(response, dict):
         return response
@@ -353,7 +387,7 @@ async def _execute_workflow(
         incoming: Any,
         workflow_input: dict[str, Any],
     ) -> Any:
-        if node_type != 'database_query':
+        if node_type not in {'database_query', 'semantic_query'}:
             raise WorkflowRuntimeError(f'No secure runtime is registered for {node_type}.')
         access_context = await _workflow_context_for_user(
             user,
@@ -361,6 +395,42 @@ async def _execute_workflow(
             channel_id=form_data.channel_id,
             model_id=form_data.model_id,
         )
+        if node_type == 'semantic_query':
+            configured_plan = config.get('plan') if isinstance(config.get('plan'), dict) else {}
+            incoming_plan: dict[str, Any] = {}
+            if config.get('use_incoming_plan'):
+                if isinstance(incoming, dict):
+                    incoming_plan = incoming.get('plan') if isinstance(incoming.get('plan'), dict) else incoming
+                elif isinstance(incoming, str):
+                    try:
+                        decoded = json.loads(incoming)
+                        incoming_plan = decoded if isinstance(decoded, dict) else {}
+                    except json.JSONDecodeError:
+                        incoming_plan = {}
+            plan = {**configured_plan, **incoming_plan}
+            if config.get('dataset_id'):
+                plan['datasetId'] = str(config['dataset_id'])
+            plan.setdefault('version', '1')
+            try:
+                return await execute_semantic_query(
+                    plan,
+                    QueryRuntimeContext(
+                        user_id=user.id,
+                        user_role=user.role,
+                        company_user_id=str(access_context.company_user_id or ''),
+                        company_member_id=access_context.company_member_id,
+                        company_member_role=access_context.company_member_role,
+                        group_ids=list(access_context.group_ids),
+                        model_id=form_data.model_id,
+                        channel_id=form_data.channel_id,
+                        channel_source='channel' if form_data.channel_id else 'workflow',
+                        workflow_id=workflow.id,
+                    ),
+                )
+            except SemanticQueryError as error:
+                raise WorkflowRuntimeError(
+                    f'{error.public()["message"]}（錯誤代碼：{error.code}）'
+                ) from error
         raw_result = await interact_database_query(
             connector_id=str(config.get('connector_id') or 'webui_local'),
             table=str(config.get('table') or ''),
@@ -382,6 +452,7 @@ async def _execute_workflow(
                 'model_id': form_data.model_id,
                 'channel_id': form_data.channel_id,
                 'source': 'channel' if form_data.channel_id else 'workflow',
+                'group_ids': list(access_context.group_ids),
             },
         )
         try:
@@ -651,6 +722,13 @@ async def service_publish_workflow(
         workflow.meta,
         for_publish=True,
     )
+    validation['errors'].extend(
+        await _validate_semantic_nodes_for_publish(
+            workflow,
+            _workflow_context_for_service_user(service_user, form_data).company_user_id,
+        )
+    )
+    validation['ok'] = len(validation['errors']) == 0
     if not validation['ok']:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=validation['errors'])
 
@@ -863,6 +941,11 @@ async def publish_workflow_by_id(
         workflow.meta,
         for_publish=True,
     )
+    publish_context = await _workflow_context_for_user(user, db)
+    validation['errors'].extend(
+        await _validate_semantic_nodes_for_publish(workflow, publish_context.company_user_id)
+    )
+    validation['ok'] = len(validation['errors']) == 0
     if not validation['ok']:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=validation['errors'])
 

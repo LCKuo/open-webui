@@ -298,6 +298,15 @@ class InteractBillingClient:
         )
         return data["wallet"]
 
+    async def semantic_entitlements(self, company_user_id: str) -> dict[str, Any]:
+        clean_company_user_id = str(company_user_id or '').strip()
+        if not clean_company_user_id:
+            raise HTTPException(status_code=400, detail='Company account is required.')
+        return await self._request(
+            'GET',
+            f'/api/integrations/open-webui/companies/{clean_company_user_id}/semantic-entitlements',
+        )
+
     async def authorize(self, user: Any, form_data: dict[str, Any], metadata: dict[str, Any]) -> BillingAuthorization:
         input_tokens, max_output_tokens, reserved_tokens = estimate_reserved_tokens(form_data)
         identity = await self.resolve_identity(user)

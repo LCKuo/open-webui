@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { toast } from 'svelte-sonner';
 
 	import {
@@ -110,7 +111,11 @@
 		scanning = true;
 		lastScanSummary = '';
 		try {
-			const response = await scanInteractDataConnectorSchemaLocal(localStorage.token, selected.id, 200);
+			const response = await scanInteractDataConnectorSchemaLocal(
+				localStorage.token,
+				selected.id,
+				200
+			);
 			const tables = Array.isArray((response.schema as { tables?: unknown[] } | undefined)?.tables)
 				? ((response.schema as { tables?: unknown[] }).tables ?? [])
 				: [];
@@ -179,53 +184,71 @@
 	<div
 		class="rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900 dark:border-sky-900/60 dark:bg-sky-950/30 dark:text-sky-100"
 	>
-		主站台負責建立 connector、模型授權與查詢邊界；此頁只保存貴公司在本 Interact Web Ai 節點上的資料庫密碼或 connection string。
-		密碼不會回傳主站台，留空儲存會保留既有密碼。
+		主站台負責建立 connector、模型授權與查詢邊界；此頁只保存貴公司在本 Interact Web Ai
+		節點上的資料庫密碼或 connection string。 密碼不會回傳主站台，留空儲存會保留既有密碼。
 	</div>
 
 	{#if loading}
-		<div class="rounded-xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900">
+		<div
+			class="rounded-xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900"
+		>
 			正在載入資料連線...
 		</div>
 	{:else if connectors.length === 0}
-		<div class="rounded-xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900">
+		<div
+			class="rounded-xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500 dark:border-gray-800 dark:bg-gray-900"
+		>
 			尚未同步任何資料連線。請先到主站台建立 connector，並同步到此 Interact Web Ai 節點。
 		</div>
 	{:else}
 		<div class="grid min-w-0 gap-5 lg:grid-cols-[minmax(260px,360px)_1fr]">
 			<div class="min-w-0 space-y-3">
 				{#each connectors as connector}
-					<button
-						type="button"
+					<div
 						class="w-full rounded-xl border bg-white p-4 text-left transition hover:border-sky-300 hover:shadow-sm dark:bg-gray-900 {selectedId ===
 						connector.id
 							? 'border-sky-400 ring-2 ring-sky-100 dark:ring-sky-900'
 							: 'border-gray-200 dark:border-gray-800'}"
-						on:click={() => selectConnector(connector)}
 					>
-						<div class="flex min-w-0 items-start justify-between gap-3">
-							<div class="min-w-0">
-								<p class="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">
-									{connector.name}
-								</p>
-								<p class="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
-									{connector.connectorType.toUpperCase()} · {connector.storageMode}
-								</p>
+						<button
+							type="button"
+							class="w-full text-left"
+							on:click={() => selectConnector(connector)}
+						>
+							<div class="flex min-w-0 items-start justify-between gap-3">
+								<div class="min-w-0">
+									<p class="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">
+										{connector.name}
+									</p>
+									<p class="mt-1 truncate text-xs text-gray-500 dark:text-gray-400">
+										{connector.connectorType.toUpperCase()} · {connector.storageMode}
+									</p>
+								</div>
+								<span
+									class="shrink-0 rounded-full px-2 py-0.5 text-xs font-medium {connector.enabled
+										? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200'
+										: 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'}"
+								>
+									{connector.enabled ? '啟用' : '停用'}
+								</span>
 							</div>
-							<span
-								class="shrink-0 rounded-full px-2 py-0.5 text-xs font-medium {connector.enabled
-									? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200'
-									: 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'}"
+							<div class="mt-3 grid min-w-0 gap-1 text-xs text-gray-500 dark:text-gray-400">
+								<div class="truncate" title={connector.id}>ID: {connector.id}</div>
+								<div class="truncate">DB: {connector.databaseName || '-'}</div>
+								<div class="truncate">Host: {connector.host || '-'}</div>
+							</div>
+						</button>
+						<div class="mt-3 border-t border-gray-100 pt-3 dark:border-gray-800">
+							<button
+								type="button"
+								class="text-sm font-medium text-sky-700 hover:text-sky-600 dark:text-sky-300"
+								on:click={() =>
+									goto(`/workspace/data-connectors/${encodeURIComponent(connector.id)}`)}
 							>
-								{connector.enabled ? '啟用' : '停用'}
-							</span>
+								開啟資料模型控制台 →
+							</button>
 						</div>
-						<div class="mt-3 grid min-w-0 gap-1 text-xs text-gray-500 dark:text-gray-400">
-							<div class="truncate" title={connector.id}>ID: {connector.id}</div>
-							<div class="truncate">DB: {connector.databaseName || '-'}</div>
-							<div class="truncate">Host: {connector.host || '-'}</div>
-						</div>
-					</button>
+					</div>
 				{/each}
 			</div>
 
@@ -234,7 +257,9 @@
 				on:submit|preventDefault={save}
 			>
 				{#if selected}
-					<div class="flex flex-col gap-3 border-b border-gray-100 pb-4 dark:border-gray-800 md:flex-row md:items-start md:justify-between">
+					<div
+						class="flex flex-col gap-3 border-b border-gray-100 pb-4 dark:border-gray-800 md:flex-row md:items-start md:justify-between"
+					>
 						<div class="min-w-0">
 							<h2 class="truncate text-lg font-semibold text-gray-900 dark:text-gray-100">
 								{selected.name}
@@ -271,7 +296,8 @@
 						</label>
 
 						<label class="min-w-0 space-y-1.5">
-							<span class="text-sm font-medium text-gray-700 dark:text-gray-200">Database name</span>
+							<span class="text-sm font-medium text-gray-700 dark:text-gray-200">Database name</span
+							>
 							<input
 								class="h-10 w-full rounded-lg border border-gray-200 bg-transparent px-3 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-gray-700 dark:focus:ring-sky-900"
 								bind:value={databaseName}
@@ -315,7 +341,9 @@
 					</div>
 
 					<label class="mt-4 block min-w-0 space-y-1.5">
-						<span class="text-sm font-medium text-gray-700 dark:text-gray-200">Connection string</span>
+						<span class="text-sm font-medium text-gray-700 dark:text-gray-200"
+							>Connection string</span
+						>
 						<textarea
 							class="min-h-24 w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-gray-700 dark:focus:ring-sky-900"
 							bind:value={connectionString}
@@ -325,14 +353,19 @@
 								: 'postgresql://user:password@host:5432/database'}
 						></textarea>
 						<p class="text-xs text-gray-500 dark:text-gray-400">
-							Connection string 可選；填寫後，資料庫工具會優先使用它，而不是 Host / Port / Database 欄位。
+							Connection string 可選；填寫後，資料庫工具會優先使用它，而不是 Host / Port / Database
+							欄位。
 						</p>
 						{#if lastScanSummary}
-							<p class="text-xs font-medium text-emerald-700 dark:text-emerald-300">{lastScanSummary}</p>
+							<p class="text-xs font-medium text-emerald-700 dark:text-emerald-300">
+								{lastScanSummary}
+							</p>
 						{/if}
 					</label>
 
-					<div class="mt-6 flex flex-col-reverse gap-2 border-t border-gray-100 pt-4 dark:border-gray-800 sm:flex-row sm:justify-end">
+					<div
+						class="mt-6 flex flex-col-reverse gap-2 border-t border-gray-100 pt-4 dark:border-gray-800 sm:flex-row sm:justify-end"
+					>
 						<button
 							type="button"
 							class="h-10 rounded-full border border-red-200 px-5 text-sm font-medium text-red-600 transition hover:bg-red-50 disabled:opacity-60 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950/40"

@@ -91,7 +91,8 @@
 		'calculator',
 		'transform_json',
 		'extract_fields',
-		'database_query'
+		'database_query',
+		'semantic_query'
 	]);
 
 	const NODE_DEFINITIONS: WorkflowNodeDefinition[] = [
@@ -253,9 +254,15 @@
 		},
 		{
 			type: 'database_query',
-			label: '資料庫查詢',
+			label: '單表資料庫查詢（舊版）',
 			category: 'rag',
-			description: '查詢 SQL 或商務資料連接器。'
+			description: '以白名單讀取單一資料表；跨表統計請使用企業語意查詢。'
+		},
+		{
+			type: 'semantic_query',
+			label: '企業語意查詢',
+			category: 'rag',
+			description: '使用已發布資料集執行跨表聚合、排名與期間分析，並強制套用企業 ACL。'
 		},
 		{
 			type: 'split_text',
@@ -539,7 +546,7 @@
 		fontWeight: 700
 	};
 
-	$: workflowId = $page.params.id;
+	$: workflowId = $page.params.id ?? '';
 	$: canEdit = Boolean(workflow && ($user?.role === 'admin' || workflow.user_id === $user?.id));
 	$: filteredNodeDefinitions = NODE_DEFINITIONS.filter((node) => {
 		const term = nodeSearch.trim().toLowerCase();
@@ -898,6 +905,22 @@
 			} satisfies WorkflowNodeDefinition);
 		const next = get(nodes).length + 1;
 		const id = `${kind}-${Date.now()}`;
+		const defaultConfig =
+			kind === 'semantic_query'
+				? {
+						dataset_id: '',
+						use_incoming_plan: false,
+						plan: {
+							version: '1',
+							datasetId: '',
+							dimensions: [],
+							measures: [],
+							metrics: [],
+							orderBy: [],
+							limit: 20
+						}
+					}
+				: undefined;
 		nodes.update((items) => [
 			...items,
 			{
@@ -911,7 +934,8 @@
 					label: definition.label,
 					type: definition.type,
 					category: definition.category,
-					description: definition.description
+					description: definition.description,
+					...(defaultConfig ? { config: defaultConfig } : {})
 				}
 			}
 		]);

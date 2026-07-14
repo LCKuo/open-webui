@@ -83,18 +83,18 @@ from open_webui.env import (
     ENABLE_COMPRESSION_MIDDLEWARE,
     ENABLE_CUSTOM_MODEL_FALLBACK,
     ENABLE_EASTER_EGGS,
-    EXTERNAL_PWA_MANIFEST_URL,
     # OAuth Back-Channel Logout
     ENABLE_OAUTH_BACKCHANNEL_LOGOUT,
     ENABLE_OTEL,
     ENABLE_PUBLIC_ACTIVE_USERS_COUNT,
+    ENABLE_PYODIDE_FILE_PERSISTENCE,
     # SCIM
     ENABLE_SCIM,
     ENABLE_SIGNUP_PASSWORD_CONFIRMATION,
     ENABLE_STAR_SESSIONS_MIDDLEWARE,
-    ENABLE_PYODIDE_FILE_PERSISTENCE,
     ENABLE_VERSION_UPDATE_CHECK,
     ENABLE_WEBSOCKET_SUPPORT,
+    EXTERNAL_PWA_MANIFEST_URL,
     GLOBAL_LOG_LEVEL,
     INSTANCE_ID,
     LICENSE_KEY,
@@ -120,11 +120,13 @@ from open_webui.env import (
 from open_webui.events import (
     EVENTS,
     delete_event_webhook,
-    get_event_catalog as get_event_catalog_items,
     get_event_webhooks,
     migrate_legacy_webhook_config,
     publish_event,
     upsert_event_webhook,
+)
+from open_webui.events import (
+    get_event_catalog as get_event_catalog_items,
 )
 from open_webui.internal.db import engine, get_async_session
 from open_webui.models.access_grants import AccessGrants
@@ -152,6 +154,7 @@ from open_webui.routers import (
     groups,
     images,
     interact_channels,
+    interact_semantic,
     knowledge,
     memories,
     models,
@@ -222,6 +225,7 @@ from open_webui.utils.chat import (
     generate_chat_completion as chat_completion_handler,
 )
 from open_webui.utils.embeddings import generate_embeddings
+from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
 from open_webui.utils.logger import start_logger
 from open_webui.utils.middleware import (
     background_tasks_handler,
@@ -229,7 +233,6 @@ from open_webui.utils.middleware import (
     process_chat_payload,
     process_chat_response,
 )
-from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
 from open_webui.utils.models import (
     check_model_access,
     get_all_base_models,
@@ -356,6 +359,10 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(scheduler_worker_loop(app))
 
+    from open_webui.semantic_query.schema import semantic_schema_scheduler_loop
+
+    app.state.semantic_schema_scheduler_task = asyncio.create_task(semantic_schema_scheduler_loop())
+
     if await Config.get('models.base_models_cache'):
         try:
             await get_all_models(
@@ -421,6 +428,10 @@ async def lifespan(app: FastAPI):
 
     await publish_event(app, EVENTS.SYSTEM_SHUTDOWN_STARTED, source='system')
     await interact_channels.stop_channel_job_workers()
+
+    if hasattr(app.state, 'semantic_schema_scheduler_task'):
+        app.state.semantic_schema_scheduler_task.cancel()
+        await asyncio.gather(app.state.semantic_schema_scheduler_task, return_exceptions=True)
 
     # Shutdown: clean up shared resources
     from open_webui.utils.session_pool import close_session
@@ -777,6 +788,7 @@ app.include_router(automations.router, prefix='/api/v1/automations', tags=['auto
 app.include_router(workflows.router, prefix='/api/v1/workflows', tags=['workflows'])
 app.include_router(billing.router, prefix='/api/v1/billing', tags=['billing'])
 app.include_router(interact_channels.router, prefix='/api/v1/interact', tags=['interact'])
+app.include_router(interact_semantic.router, prefix='/api/v1/interact', tags=['interact-semantic'])
 app.include_router(calendar.router, prefix='/api/v1/calendars', tags=['calendars'])
 
 # SCIM 2.0 API for identity management

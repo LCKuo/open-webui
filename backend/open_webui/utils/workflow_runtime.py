@@ -54,7 +54,15 @@ SUPPORTED_RUNTIME_NODE_TYPES = (
     | RUNTIME_MODEL_TYPES
     | RUNTIME_OUTPUT_TYPES
     | RUNTIME_PASSTHROUGH_TYPES
-    | {'system_prompt', 'prompt_template', 'calculator', 'transform_json', 'extract_fields', 'database_query'}
+    | {
+        'system_prompt',
+        'prompt_template',
+        'calculator',
+        'transform_json',
+        'extract_fields',
+        'database_query',
+        'semantic_query',
+    }
 )
 
 MEDIA_TYPES = {'image', 'audio', 'video', 'file'}
@@ -321,7 +329,7 @@ async def execute_workflow_graph(
             fields = config.get('fields') if isinstance(config.get('fields'), list) else []
             value = {field: None for field in fields}
             value['_text'] = text
-        elif node_type == 'database_query':
+        elif node_type in {'database_query', 'semantic_query'}:
             if node_runner is None:
                 raise WorkflowRuntimeError(f'Node {node_id} requires a database runtime.')
             value = await node_runner(node_type, config, incoming, workflow_input)

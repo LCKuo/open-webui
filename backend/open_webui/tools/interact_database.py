@@ -14,7 +14,8 @@ from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
 
 from fastapi import Request
 
-from open_webui.env import DATABASE_URL, DATA_DIR
+from open_webui.env import DATA_DIR, DATABASE_URL
+from open_webui.models.groups import Groups
 from open_webui.models.interact_data_connectors import (
     InteractDataConnectorModel,
     InteractDataConnectors,
@@ -34,6 +35,7 @@ class QueryContext:
     company_user_id: str | None
     company_member_id: str | None
     company_member_role: str | None
+    group_ids: list[str]
 
 
 def _json_result(payload: dict[str, Any]) -> str:
@@ -99,7 +101,18 @@ def _context(__user__: dict | None, __metadata__: dict | None) -> QueryContext:
             or _string_value(interact_company.get('company_member_role'))
             or _string_value(_metadata_value(metadata, 'companyMemberRole', 'company_member_role'))
         ),
+        group_ids=[
+            str(item)
+            for item in (_metadata_value(metadata, 'groupIds', 'group_ids') or [])
+            if str(item).strip()
+        ],
     )
+
+
+async def _resolve_context_groups(ctx: QueryContext) -> None:
+    if ctx.group_ids or not ctx.user_id:
+        return
+    ctx.group_ids = [group.id for group in await Groups.get_groups_by_member_id(ctx.user_id)]
 
 
 def _is_admin(ctx: QueryContext) -> bool:
@@ -441,11 +454,20 @@ def _connector_context_allowed(connector: InteractDataConnectorModel, ctx: Query
         return bool(
             ctx.company_user_id
             and ctx.company_user_id == connector.company_user_id
-            and ctx.company_member_id
-            and ctx.company_member_id in connector.allowed_member_ids
+            and (
+                (ctx.company_member_id and ctx.company_member_id in connector.allowed_member_ids)
+                or set(ctx.group_ids).intersection(connector.allowed_group_ids)
+            )
         )
     if connector.access_mode == 'all_company_members':
         return bool(ctx.company_user_id and ctx.company_user_id == connector.company_user_id)
+    if connector.access_mode == 'selected_channels':
+        return bool(
+            ctx.company_user_id == connector.company_user_id
+            and _is_channel_request(ctx)
+            and ctx.channel_id
+            and ctx.channel_id in connector.allowed_channel_ids
+        )
     return False
 
 
@@ -472,15 +494,29 @@ def _connector_denial_reason(connector: InteractDataConnectorModel, ctx: QueryCo
     if connector.access_mode == 'selected_members' and not (
         ctx.company_user_id
         and ctx.company_user_id == connector.company_user_id
-        and ctx.company_member_id
-        and ctx.company_member_id in connector.allowed_member_ids
+        and (
+            (ctx.company_member_id and ctx.company_member_id in connector.allowed_member_ids)
+            or set(ctx.group_ids).intersection(connector.allowed_group_ids)
+        )
     ):
-        return f'member {ctx.company_member_id or "unknown"} is not assigned for company {connector.company_user_id}'
+        return (
+            f'member {ctx.company_member_id or "unknown"} and groups {ctx.group_ids} '
+            f'are not assigned for company {connector.company_user_id}'
+        )
     if connector.access_mode == 'all_company_members' and not (
         ctx.company_user_id and ctx.company_user_id == connector.company_user_id
     ):
         return 'user belongs to another company'
-    if connector.access_mode not in {'company_admins', 'selected_members', 'all_company_members'}:
+    if connector.access_mode == 'selected_channels' and not (
+        ctx.company_user_id == connector.company_user_id
+        and _is_channel_request(ctx)
+        and ctx.channel_id
+        and ctx.channel_id in connector.allowed_channel_ids
+    ):
+        return f'channel {ctx.channel_id or "unknown"} is not assigned for this company'
+    if connector.access_mode not in {
+        'company_admins', 'selected_members', 'all_company_members', 'selected_channels'
+    }:
         return f'unsupported access mode {connector.access_mode}'
     return None
 
@@ -937,14 +973,23 @@ def _pg_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -> d
 
             cursor.execute(
                 """
-                SELECT kcu.table_schema, kcu.table_name, kcu.column_name, tc.constraint_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    AND tc.table_schema = kcu.table_schema
-                    AND tc.table_name = kcu.table_name
-                WHERE tc.constraint_type = 'PRIMARY KEY'
-                ORDER BY kcu.table_schema, kcu.table_name, kcu.ordinal_position
+                SELECT
+                    source_namespace.nspname,
+                    source_table.relname,
+                    source_column.attname,
+                    constraint_row.conname
+                FROM pg_catalog.pg_constraint constraint_row
+                JOIN pg_catalog.pg_class source_table
+                    ON source_table.oid = constraint_row.conrelid
+                JOIN pg_catalog.pg_namespace source_namespace
+                    ON source_namespace.oid = source_table.relnamespace
+                JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY
+                    AS source_key(attnum, position) ON TRUE
+                JOIN pg_catalog.pg_attribute source_column
+                    ON source_column.attrelid = source_table.oid
+                    AND source_column.attnum = source_key.attnum
+                WHERE constraint_row.contype = 'p'
+                ORDER BY source_namespace.nspname, source_table.relname, source_key.position
                 """
             )
             primary_by_table: dict[tuple[str, str], list[str]] = {}
@@ -955,23 +1000,34 @@ def _pg_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -> d
             cursor.execute(
                 """
                 SELECT
-                    tc.constraint_name,
-                    kcu.table_schema,
-                    kcu.table_name,
-                    kcu.column_name,
-                    ccu.table_schema AS foreign_table_schema,
-                    ccu.table_name AS foreign_table_name,
-                    ccu.column_name AS foreign_column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    AND tc.table_schema = kcu.table_schema
-                    AND tc.table_name = kcu.table_name
-                JOIN information_schema.constraint_column_usage ccu
-                    ON ccu.constraint_name = tc.constraint_name
-                    AND ccu.constraint_schema = tc.constraint_schema
-                WHERE tc.constraint_type = 'FOREIGN KEY'
-                ORDER BY kcu.table_schema, kcu.table_name, kcu.ordinal_position
+                    constraint_row.conname,
+                    source_namespace.nspname,
+                    source_table.relname,
+                    source_column.attname,
+                    target_namespace.nspname,
+                    target_table.relname,
+                    target_column.attname
+                FROM pg_catalog.pg_constraint constraint_row
+                JOIN pg_catalog.pg_class source_table
+                    ON source_table.oid = constraint_row.conrelid
+                JOIN pg_catalog.pg_namespace source_namespace
+                    ON source_namespace.oid = source_table.relnamespace
+                JOIN pg_catalog.pg_class target_table
+                    ON target_table.oid = constraint_row.confrelid
+                JOIN pg_catalog.pg_namespace target_namespace
+                    ON target_namespace.oid = target_table.relnamespace
+                JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY
+                    AS source_key(attnum, position) ON TRUE
+                JOIN LATERAL unnest(constraint_row.confkey) WITH ORDINALITY
+                    AS target_key(attnum, position) ON target_key.position = source_key.position
+                JOIN pg_catalog.pg_attribute source_column
+                    ON source_column.attrelid = source_table.oid
+                    AND source_column.attnum = source_key.attnum
+                JOIN pg_catalog.pg_attribute target_column
+                    ON target_column.attrelid = target_table.oid
+                    AND target_column.attnum = target_key.attnum
+                WHERE constraint_row.contype = 'f'
+                ORDER BY source_namespace.nspname, source_table.relname, source_key.position
                 """
             )
             foreign_by_table: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -1924,6 +1980,7 @@ async def interact_database_schema(
     """
     ctx = _context(__user__, __metadata__)
     try:
+        await _resolve_context_groups(ctx)
         connector = await _load_connector(connector_id, ctx)
         if not _connector_context_allowed(connector, ctx):
             raise PermissionError('This user/model/channel is not allowed to use the data connector.')
@@ -1970,6 +2027,7 @@ async def interact_database_query(
     ctx = _context(__user__, __metadata__)
     row_count = 0
     try:
+        await _resolve_context_groups(ctx)
         operation = (operation or 'select').strip().lower()
         if operation not in {'select', 'count'}:
             raise ValueError('Unsupported operation. Use "select" or "count".')

@@ -1,13 +1,13 @@
-import pytest
 from types import SimpleNamespace
 
+import pytest
 from open_webui.routers.interact_channels import (
     ChannelHealthRequest,
     ProvisionAccountRequest,
     _line_result_messages,
     _wechat_media_response,
-    provision_account,
     channel_health,
+    provision_account,
 )
 from open_webui.utils.interact_billing import estimate_reserved_tokens
 from open_webui.utils.workflow_runtime import (
@@ -140,6 +140,39 @@ async def test_database_node_uses_registered_acl_runtime():
     assert captured['node_type'] == 'database_query'
     assert captured['config']['table'] == 'crm.customers'
     assert result['outputs'] == [{'type': 'json', 'value': {'ok': True, 'rows': [{'id': 1}]}}]
+
+
+@pytest.mark.asyncio
+async def test_semantic_query_node_uses_the_registered_runtime():
+    captured = {}
+
+    async def node_runner(node_type, config, incoming, workflow_input):
+        captured.update(node_type=node_type, config=config)
+        return {'ok': True, 'rows': [{'salesperson': 'Amy', 'revenue': 1200}]}
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'chat_input'}},
+            {
+                'id': 'query',
+                'data': {
+                    'type': 'semantic_query',
+                    'config': {'dataset_id': 'sales', 'plan': {'datasetId': 'sales'}},
+                },
+            },
+            {'id': 'output', 'data': {'type': 'chat_output'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'query'},
+            {'source': 'query', 'target': 'output'},
+        ],
+    }
+
+    result = await execute_workflow_graph(graph, {'message': 'sales ranking'}, node_runner=node_runner)
+
+    assert captured['node_type'] == 'semantic_query'
+    assert captured['config']['dataset_id'] == 'sales'
+    assert result['outputs'][0]['value']['rows'][0]['salesperson'] == 'Amy'
 
 
 def test_line_adapter_uses_native_image_and_falls_back_for_files():
