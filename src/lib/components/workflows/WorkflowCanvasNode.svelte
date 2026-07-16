@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Handle, Position } from '@xyflow/svelte';
+	import { Handle, Position, type NodeProps } from '@xyflow/svelte';
 	import Bolt from '$lib/components/icons/Bolt.svelte';
 	import ChatBubble from '$lib/components/icons/ChatBubble.svelte';
 	import Database from '$lib/components/icons/Database.svelte';
@@ -7,8 +7,10 @@
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
 	import Wrench from '$lib/components/icons/Wrench.svelte';
 
-	export let data: Record<string, any> = {};
-	export let selected = false;
+	type WorkflowNodeData = Record<string, any>;
+	type $$Props = Omit<NodeProps, 'data'> & { data: WorkflowNodeData };
+	export let data: WorkflowNodeData = {};
+	export let selected: $$Props['selected'] = false;
 
 	const typeLabel = (value: string) =>
 		({

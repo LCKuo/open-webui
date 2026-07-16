@@ -4,6 +4,8 @@
 	import { toast } from 'svelte-sonner';
 	import { WEBUI_NAME, showSidebar, user } from '$lib/stores';
 	import {
+		activateWorkflowById,
+		archiveWorkflowById,
 		createWorkflow,
 		deleteWorkflowById,
 		getWorkflowItems,
@@ -13,6 +15,7 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Pagination from '$lib/components/common/Pagination.svelte';
 	import WorkflowOverviewDrawer from '$lib/components/workflows/WorkflowOverviewDrawer.svelte';
+	import WorkflowActionsMenu from '$lib/components/workflows/WorkflowActionsMenu.svelte';
 	import { buildWorkflowTemplateGraph } from '$lib/components/workflows/workflowNodeCatalog';
 	import {
 		workflowLaunchLabel,
@@ -26,8 +29,12 @@
 	let total = 0;
 	let showDeleteConfirm = false;
 	let deleteTarget: WorkflowResponse | null = null;
+	let showArchiveConfirm = false;
+	let archiveTarget: WorkflowResponse | null = null;
+	let lifecycleWorkflowId: string | null = null;
 	let query = '';
 	let visibility = 'all';
+	let workflowStatus = 'active';
 	let page = 1;
 	let searchTimer: ReturnType<typeof setTimeout>;
 	let selectedWorkflow: WorkflowResponse | null = null;
@@ -55,6 +62,13 @@
 			description: '登入工作區的使用者可見的可重用範本，不適合公司內部自動化。'
 		}
 	];
+	const STATUS_OPTIONS = [
+		{ value: 'active', label: '未停用' },
+		{ value: 'published', label: '已發布' },
+		{ value: 'draft', label: '草稿' },
+		{ value: 'archived', label: '已停用' },
+		{ value: 'all', label: '全部狀態' }
+	];
 
 	const visibilityLabel = (value: string) =>
 		VISIBILITY_OPTIONS.find((option) => option.value === value)?.label ?? value;
@@ -62,8 +76,16 @@
 		({
 			draft: '草稿',
 			published: '已發布',
-			archived: '已封存'
+			archived: '已停用'
 		})[value] ?? value;
+	const errorMessage = (error: unknown) => {
+		if (Array.isArray(error)) return error.join('；');
+		if (typeof error === 'string') return error;
+		if (error && typeof error === 'object' && 'message' in error) {
+			return String((error as { message: unknown }).message);
+		}
+		return '操作失敗，請稍後再試。';
+	};
 	const canManageWorkflow = (workflow: WorkflowResponse) =>
 		$user?.role === 'admin' || workflow.user_id === $user?.id;
 	$: visibleWorkflows = workflows.filter((workflow) => {
@@ -85,11 +107,17 @@
 	const loadWorkflows = async () => {
 		loading = true;
 		try {
-			const res = await getWorkflowItems(localStorage.token, query, visibility, page);
+			const res = await getWorkflowItems(
+				localStorage.token,
+				query,
+				visibility,
+				workflowStatus,
+				page
+			);
 			workflows = res.items;
 			total = res.total;
 		} catch (err) {
-			toast.error(`${err}`);
+			toast.error(errorMessage(err));
 		} finally {
 			loading = false;
 		}
@@ -120,7 +148,7 @@
 			});
 			goto(`/workflows/${workflow.id}/edit`);
 		} catch (err) {
-			toast.error(`${err}`);
+			toast.error(errorMessage(err));
 		} finally {
 			creating = false;
 		}
@@ -129,11 +157,49 @@
 	const deleteWorkflow = async (workflow: WorkflowResponse) => {
 		try {
 			await deleteWorkflowById(localStorage.token, workflow.id);
-			toast.success('工作流已刪除');
+			toast.success('工作流及其版本與執行紀錄已永久刪除');
 			deleteTarget = null;
 			loadWorkflows();
 		} catch (err) {
-			toast.error(`${err}`);
+			toast.error(errorMessage(err));
+		}
+	};
+
+	const confirmPermanentDelete = (event: CustomEvent<string>) => {
+		if (!deleteTarget) return;
+		if (event.detail.trim() !== deleteTarget.name.trim()) {
+			toast.error('工作流名稱不一致，未執行刪除。');
+			return;
+		}
+		deleteWorkflow(deleteTarget);
+	};
+
+	const archiveWorkflow = async (workflow: WorkflowResponse) => {
+		lifecycleWorkflowId = workflow.id;
+		try {
+			await archiveWorkflowById(localStorage.token, workflow.id);
+			toast.success('工作流已停用；發布版本與執行紀錄均已保留');
+			archiveTarget = null;
+			if (selectedWorkflow?.id === workflow.id) selectedWorkflow = null;
+			await loadWorkflows();
+		} catch (err) {
+			toast.error(errorMessage(err));
+		} finally {
+			lifecycleWorkflowId = null;
+		}
+	};
+
+	const activateWorkflow = async (workflow: WorkflowResponse) => {
+		lifecycleWorkflowId = workflow.id;
+		try {
+			await activateWorkflowById(localStorage.token, workflow.id);
+			toast.success('工作流已重新啟用，將使用最後一個發布版本');
+			if (selectedWorkflow?.id === workflow.id) selectedWorkflow = null;
+			await loadWorkflows();
+		} catch (err) {
+			toast.error(errorMessage(err));
+		} finally {
+			lifecycleWorkflowId = null;
 		}
 	};
 
@@ -152,14 +218,32 @@
 
 <DeleteConfirmDialog
 	bind:show={showDeleteConfirm}
-	title="刪除工作流？"
-	confirmLabel="刪除"
+	title="永久刪除工作流？"
+	confirmLabel="永久刪除"
+	message={`你即將永久刪除 **${deleteTarget?.name ?? ''}**。\n\n發布版本、執行紀錄及相關設定會一併刪除，而且無法復原。若只是暫時停止使用，請改用「停用」。\n\n請在下方輸入完整工作流名稱後再確認。`}
+	input
+	inputPlaceholder="輸入完整工作流名稱以確認"
+	on:confirm={confirmPermanentDelete}
+/>
+
+<DeleteConfirmDialog
+	bind:show={showArchiveConfirm}
+	title="停用工作流？"
+	confirmLabel="停用"
 	on:confirm={() => {
-		if (deleteTarget) deleteWorkflow(deleteTarget);
+		if (archiveTarget) archiveWorkflow(archiveTarget);
 	}}
 >
-	<div class="truncate text-sm text-gray-500">
-		這會刪除 <span class="font-medium">{deleteTarget?.name}</span>。
+	<div class="space-y-3 text-sm leading-6 text-gray-600 dark:text-gray-300">
+		<p>
+			停用 <span class="font-semibold text-gray-900 dark:text-white">{archiveTarget?.name}</span>
+			後，Agent、聊天、API 與外部渠道將不能再啟動它。
+		</p>
+		<div
+			class="rounded-lg border border-blue-200 bg-blue-50 p-3 text-blue-700 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300"
+		>
+			發布版本、設定與既有執行紀錄都會保留，之後可從「已停用」清單重新啟用。
+		</div>
 	</div>
 </DeleteConfirmDialog>
 
@@ -169,6 +253,12 @@
 	onClose={() => (selectedWorkflow = null)}
 	onUse={useWorkflowInChat}
 	onEdit={(workflow) => goto(`/workflows/${workflow.id}/edit`)}
+	onArchive={(workflow) => {
+		archiveTarget = workflow;
+		showArchiveConfirm = true;
+	}}
+	onActivate={activateWorkflow}
+	lifecycleBusy={selectedWorkflow ? lifecycleWorkflowId === selectedWorkflow.id : false}
 />
 
 <div
@@ -220,6 +310,19 @@
 						<option value={option.value}>{option.label}</option>
 					{/each}
 				</select>
+				<select
+					class="rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+					bind:value={workflowStatus}
+					on:change={() => {
+						if (page !== 1) page = 1;
+						else loadWorkflows();
+					}}
+					aria-label="依工作流狀態篩選"
+				>
+					{#each STATUS_OPTIONS as option}
+						<option value={option.value}>{option.label}</option>
+					{/each}
+				</select>
 			</div>
 
 			<div class="flex gap-2 overflow-x-auto border-b border-gray-200 dark:border-gray-800">
@@ -241,16 +344,22 @@
 				<div
 					class="rounded-lg border border-dashed border-gray-300 bg-white p-10 text-center dark:border-gray-800 dark:bg-gray-950"
 				>
-					<div class="text-base font-medium text-gray-900 dark:text-gray-100">目前沒有工作流</div>
+					<div class="text-base font-medium text-gray-900 dark:text-gray-100">
+						{workflowStatus === 'archived' ? '目前沒有已停用的工作流' : '找不到符合條件的工作流'}
+					</div>
 					<p class="mt-2 text-sm text-gray-500">
-						先建立工作流，設定節點與存取政策，再進行結構驗證。
+						{workflowStatus === 'archived'
+							? '停用的工作流會保留發布版本與執行紀錄，並集中顯示在這裡。'
+							: '請調整搜尋或篩選條件，或建立新的工作流。'}
 					</p>
-					<button
-						class="mt-5 rounded-lg bg-gray-900 px-4 py-2.5 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
-						on:click={createBlankWorkflow}
-					>
-						建立第一個工作流
-					</button>
+					{#if workflowStatus !== 'archived'}
+						<button
+							class="mt-5 rounded-lg bg-gray-900 px-4 py-2.5 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
+							on:click={createBlankWorkflow}
+						>
+							新增工作流
+						</button>
+					{/if}
 				</div>
 			{:else}
 				<div class="grid gap-3">
@@ -295,11 +404,14 @@
 									class="rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
 									on:click={() => (selectedWorkflow = workflow)}>概覽</button
 								>
-								<button
-									class="rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-white dark:text-gray-900"
-									disabled={!workflow.default_version_id || workflow.status !== 'published'}
-									on:click={() => useWorkflowInChat(workflow)}>{workflowLaunchLabel(workflow)}</button
-								>
+								{#if workflow.status === 'published'}
+									<button
+										class="rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-white dark:text-gray-900"
+										disabled={!workflow.default_version_id}
+										on:click={() => useWorkflowInChat(workflow)}
+										>{workflowLaunchLabel(workflow)}</button
+									>
+								{/if}
 								<button
 									class="rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
 									on:click={() => goto(`/workflows/${workflow.id}/edit`)}
@@ -307,15 +419,31 @@
 									{canManageWorkflow(workflow) ? '編輯' : '檢視'}
 								</button>
 								{#if canManageWorkflow(workflow)}
-									<button
-										class="rounded-lg border border-red-200 px-3 py-2 text-sm text-red-600 hover:bg-red-50 dark:border-red-900 dark:hover:bg-red-950"
-										on:click={() => {
+									{#if workflow.status === 'published'}
+										<button
+											class="rounded-lg border border-amber-300 px-3 py-2 text-sm font-medium text-amber-700 transition hover:bg-amber-50 disabled:opacity-50 dark:border-amber-800 dark:text-amber-300 dark:hover:bg-amber-950/40"
+											disabled={lifecycleWorkflowId === workflow.id}
+											on:click={() => {
+												archiveTarget = workflow;
+												showArchiveConfirm = true;
+											}}>停用</button
+										>
+									{:else if workflow.status === 'archived'}
+										<button
+											class="rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-gray-800 disabled:opacity-50 dark:bg-white dark:text-gray-900"
+											disabled={lifecycleWorkflowId === workflow.id}
+											on:click={() => activateWorkflow(workflow)}
+										>
+											{lifecycleWorkflowId === workflow.id ? '啟用中...' : '重新啟用'}
+										</button>
+									{/if}
+									<WorkflowActionsMenu
+										disabled={lifecycleWorkflowId === workflow.id}
+										onDelete={() => {
 											deleteTarget = workflow;
 											showDeleteConfirm = true;
 										}}
-									>
-										刪除
-									</button>
+									/>
 								{/if}
 							</div>
 						</div>

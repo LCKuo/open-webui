@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.internal.db import get_async_session
@@ -166,10 +166,18 @@ class ServiceCompanyRequest(WorkflowRunForm):
     modelId: Optional[str] = None
 
 
+class ServiceCompanyLifecycleRequest(BaseModel):
+    companyEmail: str
+    companyUserId: Optional[str] = None
+    companyMemberId: Optional[str] = None
+    companyMemberRole: Optional[str] = None
+
+
 class ServiceCompanyListRequest(WorkflowRunForm):
     companyEmail: str
     query: Optional[str] = None
     visibility: Optional[str] = None
+    status: Optional[Literal['all', 'active', 'draft', 'published', 'archived']] = None
     page: Optional[int] = 1
     companyUserId: Optional[str] = None
     companyMemberId: Optional[str] = None
@@ -374,6 +382,59 @@ async def _validate_semantic_nodes_for_publish(
 
 def _launch_check(code: str, check_status: str, message: str) -> WorkflowLaunchCheck:
     return WorkflowLaunchCheck(code=code, status=check_status, message=message)
+
+
+async def _archive_workflow(workflow: WorkflowModel, db: AsyncSession) -> WorkflowModel:
+    if workflow.status == 'archived':
+        return workflow
+    if workflow.status != 'published':
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='只有已發布工作流可以停用。')
+
+    try:
+        archived = await Workflows.archive(workflow.id, db=db)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if not archived:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    return archived
+
+
+async def _activate_workflow(
+    workflow: WorkflowModel,
+    company_user_id: str | None,
+    db: AsyncSession,
+) -> WorkflowModel:
+    if workflow.status == 'published':
+        return workflow
+    if workflow.status != 'archived':
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='只有已停用工作流可以重新啟用。')
+    if not workflow.default_version_id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='找不到可重新啟用的發布版本。')
+
+    version = await Workflows.get_version_by_id(workflow.default_version_id, db=db)
+    if not version or version.workflow_id != workflow.id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='最後發布版本不存在，無法重新啟用。')
+
+    published_workflow = workflow.model_copy(update={'graph': version.graph, 'meta': version.meta})
+    validation = _validate_workflow_configuration(
+        published_workflow.graph,
+        published_workflow.visibility,
+        published_workflow.meta,
+        for_publish=True,
+    )
+    validation['errors'].extend(
+        await _validate_semantic_nodes_for_publish(published_workflow, company_user_id)
+    )
+    if validation['errors']:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=validation['errors'])
+
+    try:
+        activated = await Workflows.activate_default_version(workflow.id, db=db)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if not activated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    return activated
 
 
 def _effective_workflow_model_id(graph: dict[str, Any], requested_model_id: str | None) -> str | None:
@@ -1098,6 +1159,7 @@ async def service_get_workflow_items(
         user_id=service_user.id,
         query=form_data.query,
         visibility=form_data.visibility,
+        workflow_status=form_data.status,
         skip=0,
         limit=0,
         include_public_templates=True,
@@ -1233,6 +1295,39 @@ async def service_publish_workflow(
     return version
 
 
+@router.post('/service/{id}/archive', response_model=WorkflowModel)
+async def service_archive_workflow(
+    request: Request,
+    id: str,
+    form_data: ServiceCompanyLifecycleRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_async_session),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    service_user = await _resolve_service_user(form_data.companyEmail, db)
+    workflow = await Workflows.get_by_id(id, db=db)
+    check_workflow_owner(workflow, service_user)
+    return await _archive_workflow(workflow, db)
+
+
+@router.post('/service/{id}/activate', response_model=WorkflowModel)
+async def service_activate_workflow(
+    request: Request,
+    id: str,
+    form_data: ServiceCompanyLifecycleRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_async_session),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    service_user = await _resolve_service_user(form_data.companyEmail, db)
+    workflow = await Workflows.get_by_id(id, db=db)
+    check_workflow_owner(workflow, service_user)
+    context = _workflow_context_for_service_user(service_user, form_data)
+    return await _activate_workflow(workflow, context.company_user_id, db)
+
+
 @router.post('/service/{id}/run', response_model=WorkflowRunModel)
 async def service_run_workflow(
     request: Request,
@@ -1278,6 +1373,10 @@ async def get_workflow_items(
     request: Request,
     query: Optional[str] = None,
     visibility: Optional[str] = None,
+    workflow_status: Optional[Literal['all', 'active', 'draft', 'published', 'archived']] = Query(
+        default=None,
+        alias='status',
+    ),
     page: Optional[int] = 1,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
@@ -1291,6 +1390,7 @@ async def get_workflow_items(
         user_id=user.id,
         query=query,
         visibility=visibility,
+        workflow_status=workflow_status,
         skip=0,
         limit=0,
         include_public_templates=True,
@@ -1467,6 +1567,33 @@ async def publish_workflow_by_id(
     if not version:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
     return version
+
+
+@router.post('/{id}/archive', response_model=WorkflowModel)
+async def archive_workflow_by_id(
+    request: Request,
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    await check_workflows_permission(user)
+    workflow = await Workflows.get_by_id(id, db=db)
+    check_workflow_owner(workflow, user)
+    return await _archive_workflow(workflow, db)
+
+
+@router.post('/{id}/activate', response_model=WorkflowModel)
+async def activate_workflow_by_id(
+    request: Request,
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    await check_workflows_permission(user)
+    workflow = await Workflows.get_by_id(id, db=db)
+    check_workflow_owner(workflow, user)
+    context = await _workflow_context_for_user(user, db)
+    return await _activate_workflow(workflow, context.company_user_id, db)
 
 
 @router.get('/{id}/versions', response_model=list[WorkflowVersionModel])

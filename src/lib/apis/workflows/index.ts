@@ -117,11 +117,13 @@ export const getWorkflowItems = async (
 	token: string,
 	query: string | null = null,
 	visibility: string | null = null,
+	status: string | null = null,
 	page = 1
 ): Promise<{ items: WorkflowResponse[]; total: number }> => {
 	const searchParams = new URLSearchParams();
 	if (query) searchParams.append('query', query);
 	if (visibility && visibility !== 'all') searchParams.append('visibility', visibility);
+	if (status && status !== 'all') searchParams.append('status', status);
 	if (page) searchParams.append('page', page.toString());
 
 	return fetch(`${WEBUI_API_BASE_URL}/workflows/list?${searchParams.toString()}`, {
@@ -191,6 +193,23 @@ export const publishWorkflowById = async (
 	id: string
 ): Promise<WorkflowVersionResponse> => {
 	return fetch(`${WEBUI_API_BASE_URL}/workflows/${id}/publish`, {
+		method: 'POST',
+		headers: headers(token)
+	}).then(parseResponse);
+};
+
+export const archiveWorkflowById = async (token: string, id: string): Promise<WorkflowResponse> => {
+	return fetch(`${WEBUI_API_BASE_URL}/workflows/${id}/archive`, {
+		method: 'POST',
+		headers: headers(token)
+	}).then(parseResponse);
+};
+
+export const activateWorkflowById = async (
+	token: string,
+	id: string
+): Promise<WorkflowResponse> => {
+	return fetch(`${WEBUI_API_BASE_URL}/workflows/${id}/activate`, {
 		method: 'POST',
 		headers: headers(token)
 	}).then(parseResponse);

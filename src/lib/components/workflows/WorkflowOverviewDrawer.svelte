@@ -11,6 +11,9 @@
 	export let onClose: () => void = () => {};
 	export let onUse: (workflow: WorkflowResponse) => void = () => {};
 	export let onEdit: (workflow: WorkflowResponse) => void = () => {};
+	export let onArchive: (workflow: WorkflowResponse) => void = () => {};
+	export let onActivate: (workflow: WorkflowResponse) => void = () => {};
+	export let lifecycleBusy = false;
 	let dialogElement: HTMLDivElement | null = null;
 
 	$: if (workflow) {
@@ -117,7 +120,7 @@
 							{workflow.status === 'published'
 								? '已發布'
 								: workflow.status === 'archived'
-									? '已封存'
+									? '已停用'
 									: '草稿'}
 						</div>
 					</div>
@@ -211,16 +214,31 @@
 						class="rounded-lg border border-gray-200 px-4 py-2 text-sm dark:border-gray-800"
 						on:click={() => onEdit(workflow)}>編輯</button
 					>{/if}
-				<button
-					class="flex-1 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 dark:bg-white dark:text-gray-900"
-					disabled={workflow.status !== 'published' ||
-						!workflow.default_version_id ||
-						workflow.visibility === 'public_template'}
-					title={workflow.visibility === 'public_template'
-						? '公開範本需先複製到企業空間才能執行'
-						: undefined}
-					on:click={() => onUse(workflow)}>{launch?.buttonLabel ?? '在聊天中使用'}</button
-				>
+				{#if workflow.status === 'published'}
+					{#if canManage}
+						<button
+							class="rounded-lg border border-amber-300 px-4 py-2 text-sm font-medium text-amber-700 disabled:opacity-50 dark:border-amber-800 dark:text-amber-300"
+							disabled={lifecycleBusy}
+							on:click={() => onArchive(workflow)}>停用</button
+						>
+					{/if}
+					<button
+						class="flex-1 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 dark:bg-white dark:text-gray-900"
+						disabled={!workflow.default_version_id || workflow.visibility === 'public_template'}
+						title={workflow.visibility === 'public_template'
+							? '公開範本需先複製到企業空間才能執行'
+							: undefined}
+						on:click={() => onUse(workflow)}>{launch?.buttonLabel ?? '在聊天中使用'}</button
+					>
+				{:else if workflow.status === 'archived' && canManage}
+					<button
+						class="flex-1 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-white dark:text-gray-900"
+						disabled={lifecycleBusy}
+						on:click={() => onActivate(workflow)}
+					>
+						{lifecycleBusy ? '啟用中...' : '重新啟用'}
+					</button>
+				{/if}
 			</footer>
 		</div>
 	</div>

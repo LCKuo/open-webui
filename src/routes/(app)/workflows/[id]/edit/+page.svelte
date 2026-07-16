@@ -821,7 +821,7 @@
 						{workflow.status === 'published'
 							? '已發布'
 							: workflow.status === 'archived'
-								? '已封存'
+								? '已停用'
 								: '草稿'} · {workflow.default_version_id ? '已有發布版本' : '僅草稿'}
 						{#if isDirty}
 							<span class="ml-2 text-amber-600">尚未儲存</span>
@@ -965,7 +965,7 @@
 						elementsSelectable={canEdit}
 						deleteKey={canEdit ? ['Backspace', 'Delete'] : null}
 						connectionRadius={28}
-						onnodeclick={() => {
+						on:nodeclick={() => {
 							inspectorTab = 'node';
 							compactPanel = 'inspector';
 						}}
@@ -1025,20 +1025,20 @@
 									<div class="mb-3 text-sm font-semibold text-gray-900 dark:text-gray-100">
 										分享與存取
 									</div>
-								<select
-									class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-									bind:value={visibility}
-									on:change={handleVisibilityChange}
-								>
-									{#each VISIBILITY_OPTIONS as option}
-										<option value={option.value}>{option.label}</option>
-									{/each}
-								</select>
-								<div
-									class="rounded-lg bg-gray-50 px-3 py-2 text-xs leading-5 text-gray-600 dark:bg-gray-900 dark:text-gray-300"
-								>
-									{visibilityDescription}
-								</div>
+									<select
+										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+										bind:value={visibility}
+										on:change={handleVisibilityChange}
+									>
+										{#each VISIBILITY_OPTIONS as option}
+											<option value={option.value}>{option.label}</option>
+										{/each}
+									</select>
+									<div
+										class="rounded-lg bg-gray-50 px-3 py-2 text-xs leading-5 text-gray-600 dark:bg-gray-900 dark:text-gray-300"
+									>
+										{visibilityDescription}
+									</div>
 								</div>
 								<div class="space-y-2 rounded-lg border border-gray-200 p-3 dark:border-gray-800">
 									<div class="text-xs font-semibold text-gray-500">存取政策</div>

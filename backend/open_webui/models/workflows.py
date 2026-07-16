@@ -206,6 +206,7 @@ class WorkflowTable:
         user_id: str,
         query: Optional[str] = None,
         visibility: Optional[str] = None,
+        workflow_status: Optional[str] = None,
         skip: int = 0,
         limit: int = 30,
         include_public_templates: bool = True,
@@ -228,6 +229,11 @@ class WorkflowTable:
 
             if visibility and visibility != 'all':
                 stmt = stmt.filter(Workflow.visibility == visibility)
+
+            if workflow_status == 'active':
+                stmt = stmt.filter(Workflow.status != 'archived')
+            elif workflow_status and workflow_status != 'all':
+                stmt = stmt.filter(Workflow.status == workflow_status)
 
             stmt = stmt.order_by(Workflow.updated_at.desc())
             count_result = await db.execute(select(func.count()).select_from(stmt.subquery()))
@@ -314,6 +320,57 @@ class WorkflowTable:
             await db.commit()
             await db.refresh(version)
             return WorkflowVersionModel.model_validate(version)
+
+    async def archive(
+        self,
+        workflow_id: str,
+        db: Optional[AsyncSession] = None,
+    ) -> Optional[WorkflowModel]:
+        await self.ensure_tables()
+        lifecycle_lock = _publish_locks.setdefault(workflow_id, asyncio.Lock())
+        async with lifecycle_lock:
+            async with get_async_db_context(db) as db:
+                workflow = await db.get(Workflow, workflow_id)
+                if not workflow:
+                    return None
+                if workflow.status != 'published':
+                    raise ValueError('Only a published workflow can be disabled.')
+
+                workflow.status = 'archived'
+                workflow.updated_at = int(time.time_ns())
+                await db.commit()
+                await db.refresh(workflow)
+                return WorkflowModel.model_validate(workflow)
+
+    async def activate_default_version(
+        self,
+        workflow_id: str,
+        db: Optional[AsyncSession] = None,
+    ) -> Optional[WorkflowModel]:
+        await self.ensure_tables()
+        lifecycle_lock = _publish_locks.setdefault(workflow_id, asyncio.Lock())
+        async with lifecycle_lock:
+            async with get_async_db_context(db) as db:
+                workflow = await db.get(Workflow, workflow_id)
+                if not workflow:
+                    return None
+                if workflow.status != 'archived':
+                    raise ValueError('Only a disabled workflow can be re-enabled.')
+                if not workflow.default_version_id:
+                    raise ValueError('The workflow has no published version to re-enable.')
+
+                version = await db.get(WorkflowVersion, workflow.default_version_id)
+                if not version or version.workflow_id != workflow.id:
+                    raise ValueError('The published workflow version no longer exists.')
+
+                # Restore the immutable published contract, never an unreviewed draft graph.
+                workflow.graph = version.graph
+                workflow.meta = version.meta
+                workflow.status = 'published'
+                workflow.updated_at = int(time.time_ns())
+                await db.commit()
+                await db.refresh(workflow)
+                return WorkflowModel.model_validate(workflow)
 
     async def get_versions(
         self,
