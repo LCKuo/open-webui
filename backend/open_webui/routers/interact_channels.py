@@ -18,8 +18,10 @@ from urllib.parse import quote, urlencode, urlparse
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import aiohttp
+from bs4 import BeautifulSoup, NavigableString
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
+from markdown import markdown as render_markdown
 from open_webui.models.auths import Auths
 from open_webui.models.chats import ChatForm, Chats
 from open_webui.models.config import Config
@@ -62,6 +64,16 @@ MAX_CHANNEL_HISTORY_MESSAGES = 40
 DEFAULT_CONTEXT_SUMMARY_TRIGGER_TOKENS = 12_000
 DEFAULT_CONTEXT_SUMMARY_RECENT_MESSAGES = 12
 DEFAULT_CONTEXT_SUMMARY_MAX_OUTPUT_TOKENS = 1_200
+LINE_WORKFLOW_MENU_COMMANDS = {
+    'menu',
+    'workflow',
+    'workflows',
+    '快速操作',
+    '工作流',
+    '工作流選單',
+    '選單',
+}
+LINE_WORKFLOW_MENU_LIMIT = 6
 _context_summary_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 _channel_worker_tasks: set[asyncio.Task] = set()
 _channel_worker_stop: asyncio.Event | None = None
@@ -115,16 +127,34 @@ async def _process_channel_job(app, worker_id: str, job, lease_seconds: int, max
         payload = job.payload
         result = job.result
         if result is None:
-            result = await _complete_claimed_result(
-                _channel_worker_request(app),
-                channel,
-                SimpleNamespace(event_id=job.event_id),
-                job.external_user_id,
-                str(payload.get('platformEventId') or job.event_id),
-                str(payload.get('message') or ''),
-                payload.get('parts') if isinstance(payload.get('parts'), list) else [],
-                str(payload.get('recipientId') or job.external_user_id),
-            )
+            if payload.get('workflowMenu'):
+                result = {
+                    'ok': True,
+                    'content': '',
+                    'outputs': [],
+                    'lineWorkflowMenu': True,
+                }
+                await InteractChannels.set_response(
+                    job.event_id,
+                    '快速工作流選單',
+                    0,
+                    None,
+                )
+            else:
+                result = await _complete_claimed_result(
+                    _channel_worker_request(app),
+                    channel,
+                    SimpleNamespace(event_id=job.event_id),
+                    job.external_user_id,
+                    str(payload.get('platformEventId') or job.event_id),
+                    str(payload.get('message') or ''),
+                    payload.get('parts') if isinstance(payload.get('parts'), list) else [],
+                    str(payload.get('recipientId') or job.external_user_id),
+                    str(payload.get('workflowId') or '') or None,
+                    str(payload.get('workflowVersionId') or '') or None,
+                    str(payload.get('workflowTrigger') or '') or None,
+                    payload.get('workflowData') if isinstance(payload.get('workflowData'), dict) else {},
+                )
             await InteractChannels.save_job_result(job.id, result, lease_seconds)
 
         if job.platform == 'line':
@@ -285,6 +315,7 @@ def _public_channel_content(content: str | None) -> str:
 
 
 CHANNEL_RUNTIME_ERROR_MESSAGES = {
+    'WORKFLOW-QUICK-ACTION-UNAVAILABLE': '這個快速工作流已停用、更新或不再允許此渠道使用，請從最新按鈕重新選擇。',
     'AI-MODEL-NOT-CONFIGURED': '此渠道尚未設定 AI 模型。',
     'AI-MODEL-NOT-FOUND': '此渠道設定的 AI 模型不存在或已停用。',
     'AI-ACCOUNT-NOT-FOUND': '此渠道綁定的 WebUI 帳號不存在。',
@@ -295,7 +326,9 @@ CHANNEL_RUNTIME_ERROR_MESSAGES = {
 
 def _channel_runtime_failure(detail: str) -> tuple[str, str]:
     lowered = detail.lower()
-    if 'configured open webui model was not found' in lowered:
+    if 'workflow-quick-action-unavailable' in lowered:
+        code = 'WORKFLOW-QUICK-ACTION-UNAVAILABLE'
+    elif 'configured open webui model was not found' in lowered:
         code = 'AI-MODEL-NOT-FOUND'
     elif 'interact web ai user not found' in lowered:
         code = 'AI-ACCOUNT-NOT-FOUND'
@@ -455,6 +488,10 @@ class ChannelChatRequest(BaseModel):
     fallbackModelId: str | None = None
     metadata: dict[str, Any] | None = None
     maxTokens: int | None = Field(default=None, ge=1, le=32768)
+    workflowId: str | None = Field(default=None, min_length=1, max_length=128)
+    workflowVersionId: str | None = Field(default=None, min_length=1, max_length=128)
+    workflowTrigger: str | None = Field(default=None, min_length=1, max_length=80)
+    workflowData: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProvisionAccountRequest(BaseModel):
@@ -1188,6 +1225,10 @@ async def _run_channel_message(
     message: str,
     parts: list[dict[str, Any]] | None = None,
     conversation_id: str | None = None,
+    workflow_id: str | None = None,
+    workflow_version_id: str | None = None,
+    workflow_trigger: str | None = None,
+    workflow_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if channel.reply_mode != 'ai':
         return {'ok': True, 'content': _fallback_text(channel), 'usage': {}}
@@ -1221,6 +1262,10 @@ async def _run_channel_message(
                     'channelEventId': channel_event_id,
                     'dailyBotTokenLimit': channel.daily_bot_token_limit,
                 },
+                workflowId=workflow_id,
+                workflowVersionId=workflow_version_id,
+                workflowTrigger=workflow_trigger,
+                workflowData=workflow_data or {},
             ),
             x_interact_service_token=_service_token(),
         )
@@ -1326,6 +1371,10 @@ async def _complete_claimed_result(
     message: str,
     parts: list[dict[str, Any]] | None = None,
     conversation_id: str | None = None,
+    workflow_id: str | None = None,
+    workflow_version_id: str | None = None,
+    workflow_trigger: str | None = None,
+    workflow_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reserved_tokens = _estimated_reservation_tokens(message) if channel.reply_mode == 'ai' else 0
     result = await _run_channel_message(
@@ -1337,6 +1386,10 @@ async def _complete_claimed_result(
         message,
         parts,
         conversation_id,
+        workflow_id,
+        workflow_version_id,
+        workflow_trigger,
+        workflow_data,
     )
     content = str(result.get('content') or _fallback_text(channel)).strip()
     usage = result.get('usage') if isinstance(result.get('usage'), dict) else {}
@@ -1419,14 +1472,358 @@ async def _read_webhook_body(request: Request) -> bytes:
     return body
 
 
+def _line_workflow_menu_requested(message: str) -> bool:
+    normalized = re.sub(r'[\s！？!。．,.，、]+', '', str(message or '')).casefold()
+    return normalized in LINE_WORKFLOW_MENU_COMMANDS
+
+
+def _line_table_text(table) -> str:
+    header_cells = table.find_all('th')
+    headers = [cell.get_text(' ', strip=True) for cell in header_cells]
+    rows = table.find_all('tr')
+    if not headers and rows:
+        headers = [cell.get_text(' ', strip=True) for cell in rows[0].find_all(['td', 'th'])]
+        rows = rows[1:]
+    else:
+        rows = [row for row in rows if row.find_all('td')]
+    if not headers:
+        return table.get_text('\n', strip=True)
+
+    normalized_headers = [re.sub(r'\s+', '', header).casefold() for header in headers]
+    rank_index = next(
+        (index for index, header in enumerate(normalized_headers) if header in {'排名', '名次', 'rank'}),
+        None,
+    )
+    name_index = next(
+        (
+            index
+            for index, header in enumerate(normalized_headers)
+            if any(keyword in header for keyword in ('姓名', '名稱', 'name', 'title'))
+        ),
+        None,
+    )
+    if name_index is None:
+        identifier_terms = ('id', 'no', 'number', '代碼', '編號')
+        name_index = next(
+            (
+                index
+                for index, header in enumerate(normalized_headers)
+                if index != rank_index and not any(term in header for term in identifier_terms)
+            ),
+            next((index for index in range(len(headers)) if index != rank_index), 0),
+        )
+
+    rendered_rows: list[str] = []
+    for position, row in enumerate(rows, start=1):
+        values = [cell.get_text(' ', strip=True) or '—' for cell in row.find_all('td')]
+        if not values:
+            continue
+        values.extend(['—'] * max(0, len(headers) - len(values)))
+        rank = values[rank_index] if rank_index is not None and rank_index < len(values) else str(position)
+        primary = values[name_index] if name_index < len(values) else values[0]
+        lines = [f'{rank}. {primary}']
+        for index, header in enumerate(headers):
+            if index in {rank_index, name_index} or index >= len(values):
+                continue
+            lines.append(f'   {header or f"欄位 {index + 1}"}：{values[index]}')
+        rendered_rows.append('\n'.join(lines))
+    return '\n\n'.join(rendered_rows) or table.get_text('\n', strip=True)
+
+
+def _line_mobile_text(text: str) -> str:
+    source = str(text or '').strip()
+    has_markdown = '|' in source or bool(
+        re.search(
+            r'(^|\n)\s{0,3}(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```)|\*\*|__|`|!?\[[^\]]+\]\(',
+            source,
+        )
+    )
+    if not source or not has_markdown:
+        return source
+    soup = BeautifulSoup(
+        render_markdown(source, extensions=['tables', 'fenced_code']),
+        'html.parser',
+    )
+    for table in soup.find_all('table'):
+        table.replace_with(NavigableString(f'\n{_line_table_text(table)}\n'))
+    for image in soup.find_all('img'):
+        alt = str(image.get('alt') or '圖片').strip()
+        src = str(image.get('src') or '').strip()
+        image.replace_with(NavigableString(f'{alt}：{src}' if src else alt))
+    for link in soup.find_all('a'):
+        label = link.get_text(' ', strip=True)
+        href = str(link.get('href') or '').strip()
+        link.replace_with(NavigableString(f'{label} ({href})' if href and href != label else label))
+    for line_break in soup.find_all('br'):
+        line_break.replace_with(NavigableString('\n'))
+    for ordered_list in soup.find_all('ol'):
+        for index, item in enumerate(ordered_list.find_all('li', recursive=False), start=1):
+            item.insert(0, NavigableString(f'{index}. '))
+    for unordered_list in soup.find_all('ul'):
+        for item in unordered_list.find_all('li', recursive=False):
+            item.insert(0, NavigableString('- '))
+    for block in soup.find_all(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'pre', 'blockquote']):
+        block.insert_before(NavigableString('\n'))
+        block.insert_after(NavigableString('\n'))
+
+    plain = soup.get_text()
+    lines = [line.strip() for line in plain.splitlines()]
+    compact: list[str] = []
+    for line in lines:
+        if line or (compact and compact[-1]):
+            compact.append(line)
+    return '\n'.join(compact).strip()
+
+
 def _line_text_messages(text: str) -> list[dict[str, str]]:
-    clean = (text or '').strip() or ' '
+    clean = _line_mobile_text(text) or ' '
     max_length = 4800
     chunks = [clean[index : index + max_length] for index in range(0, len(clean), max_length)] or [' ']
     if len(chunks) > 5:
         chunks = chunks[:5]
         chunks[-1] = chunks[-1][: max_length - 18].rstrip() + '\n\n[內容過長，已截斷]'
     return [{'type': 'text', 'text': chunk} for chunk in chunks]
+
+
+def _line_workflow_icon_url() -> str | None:
+    value = (
+        os.environ.get('INTERACT_LINE_QUICK_REPLY_ICON_URL')
+        or 'https://ai.interact-vision.com.tw/static/favicon-96x96.png'
+    ).strip()
+    parsed = urlparse(value)
+    if parsed.scheme != 'https' or not parsed.netloc:
+        return None
+    return value
+
+
+def _line_workflow_postback_data(option: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            'a': 'workflow.run.v1',
+            'w': option['id'],
+            'v': option['versionId'],
+        },
+        separators=(',', ':'),
+    )
+
+
+def _line_workflow_postback(event: dict[str, Any]) -> tuple[str, str] | None:
+    postback = event.get('postback') if isinstance(event.get('postback'), dict) else {}
+    raw_data = str(postback.get('data') or '')
+    if not raw_data or len(raw_data) > 300:
+        return None
+    try:
+        data = json.loads(raw_data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or data.get('a') != 'workflow.run.v1':
+        return None
+    workflow_id = str(data.get('w') or '')
+    version_id = str(data.get('v') or '')
+    valid_id = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
+    if not valid_id.fullmatch(workflow_id) or not valid_id.fullmatch(version_id):
+        return None
+    return workflow_id, version_id
+
+
+async def _line_workflow_options(
+    channel: InteractChannelModel,
+) -> list[dict[str, Any]]:
+    if channel.channel_type != 'line' or not channel.enabled or channel.reply_mode != 'ai':
+        return []
+    try:
+        user = await Users.get_user_by_email(channel.company_email)
+        if not user or user.role == 'pending':
+            return []
+        from open_webui.routers import workflows as workflow_routes
+
+        options = await workflow_routes.list_instant_workflows_for_user_context(
+            user,
+            channel_id=channel.id,
+            model_id=channel.model_id,
+            limit=13,
+        )
+    except Exception:
+        log.exception('Failed to load LINE workflow options for channel=%s', channel.id)
+        return []
+    return options
+
+
+async def _line_selected_workflow_request(
+    channel: InteractChannelModel,
+    message: str,
+) -> tuple[str, str] | None:
+    """Run the deterministic selector before deciding whether LINE needs an acknowledgement."""
+    if not channel.enabled or channel.reply_mode != 'ai' or not channel.model_id:
+        return None
+    try:
+        user = await Users.get_user_by_email(channel.company_email)
+        if not user or user.role == 'pending':
+            return None
+        from open_webui.routers import workflows as workflow_routes
+
+        selection = await workflow_routes.select_workflow_for_user_context(
+            user,
+            message,
+            channel_id=channel.id,
+            model_id=channel.model_id,
+        )
+        if (
+            selection.decision == 'selected'
+            and selection.selected_workflow_id
+            and selection.selected_version_id
+        ):
+            return selection.selected_workflow_id, selection.selected_version_id
+    except Exception:
+        # Selection is advisory here; channel_chat can still retry it during execution.
+        log.exception('Failed to preselect LINE workflow for channel=%s', channel.id)
+    return None
+
+
+def _line_workflow_menu_bubble(
+    options: list[dict[str, Any]],
+    *,
+    page: int,
+    page_count: int,
+    total: int,
+) -> dict[str, Any]:
+    icon_url = _line_workflow_icon_url()
+    subtitle = f'{total} 個已發布且可在此渠道使用的工作流'
+    if page_count > 1:
+        subtitle = f'{subtitle} · 第 {page}/{page_count} 頁'
+    contents: list[dict[str, Any]] = [
+        {
+            'type': 'text',
+            'text': '快速工作流',
+            'weight': 'bold',
+            'size': 'xl',
+            'color': '#0F172A',
+        },
+        {
+            'type': 'text',
+            'text': subtitle,
+            'size': 'sm',
+            'color': '#64748B',
+            'margin': 'sm',
+            'wrap': True,
+        },
+        {'type': 'separator', 'margin': 'lg', 'color': '#E2E8F0'},
+    ]
+    for index, option in enumerate(options):
+        name = ' '.join(str(option.get('name') or '未命名工作流').split())[:80]
+        description = ' '.join(str(option.get('description') or '點擊後立即執行').split())[:120]
+        row_contents: list[dict[str, Any]] = []
+        if icon_url:
+            row_contents.append(
+                {
+                    'type': 'image',
+                    'url': icon_url,
+                    'size': 'xxs',
+                    'aspectMode': 'fit',
+                    'flex': 0,
+                }
+            )
+        row_contents.extend(
+            [
+                {
+                    'type': 'box',
+                    'layout': 'vertical',
+                    'flex': 4,
+                    'contents': [
+                        {
+                            'type': 'text',
+                            'text': name,
+                            'weight': 'bold',
+                            'size': 'sm',
+                            'color': '#0F172A',
+                            'wrap': True,
+                            'maxLines': 2,
+                        },
+                        {
+                            'type': 'text',
+                            'text': description,
+                            'size': 'xs',
+                            'color': '#64748B',
+                            'margin': 'xs',
+                            'wrap': True,
+                            'maxLines': 2,
+                        },
+                    ],
+                },
+                {
+                    'type': 'button',
+                    'style': 'primary',
+                    'color': '#2563EB',
+                    'height': 'sm',
+                    'flex': 2,
+                    'action': {
+                        'type': 'postback',
+                        'label': '執行',
+                        'data': _line_workflow_postback_data(option),
+                        'displayText': f'執行：{name}'[:300],
+                    },
+                },
+            ]
+        )
+        contents.append(
+            {
+                'type': 'box',
+                'layout': 'horizontal',
+                'spacing': 'md',
+                'margin': 'lg',
+                'alignItems': 'center',
+                'contents': row_contents,
+            }
+        )
+        if index < len(options) - 1:
+            contents.append({'type': 'separator', 'margin': 'lg', 'color': '#F1F5F9'})
+    contents.append(
+        {
+            'type': 'text',
+            'text': '僅顯示此公司、模型與 LINE 渠道有權使用的已發布工作流。',
+            'size': 'xxs',
+            'color': '#94A3B8',
+            'margin': 'lg',
+            'wrap': True,
+        }
+    )
+    return {
+        'type': 'bubble',
+        'size': 'mega',
+        'body': {
+            'type': 'box',
+            'layout': 'vertical',
+            'paddingAll': '20px',
+            'contents': contents,
+        },
+    }
+
+
+def _line_workflow_menu_message(options: list[dict[str, Any]]) -> dict[str, Any]:
+    if not options:
+        return {
+            'type': 'text',
+            'text': '目前沒有可在此 LINE 渠道執行的已發布瞬發工作流。',
+        }
+
+    pages = [
+        options[index : index + LINE_WORKFLOW_MENU_LIMIT]
+        for index in range(0, len(options), LINE_WORKFLOW_MENU_LIMIT)
+    ]
+    bubbles = [
+        _line_workflow_menu_bubble(
+            page_options,
+            page=index,
+            page_count=len(pages),
+            total=len(options),
+        )
+        for index, page_options in enumerate(pages, start=1)
+    ]
+    return {
+        'type': 'flex',
+        'altText': '快速工作流選單',
+        'contents': bubbles[0] if len(bubbles) == 1 else {'type': 'carousel', 'contents': bubbles},
+    }
 
 
 def _channel_output_text(output: dict[str, Any]) -> str:
@@ -1469,6 +1866,15 @@ def _line_result_messages(result: dict[str, Any]) -> list[dict[str, Any]]:
     return messages[:5] or _line_text_messages(' ')
 
 
+async def _line_delivery_messages(
+    channel: InteractChannelModel,
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if result.get('lineWorkflowMenu'):
+        return [_line_workflow_menu_message(await _line_workflow_options(channel))]
+    return _line_result_messages(result)
+
+
 async def _send_line_reply(
     channel: InteractChannelModel,
     reply_token: str | None,
@@ -1499,7 +1905,10 @@ async def _send_line_reply_result(
         raise RuntimeError('LINE access token or reply token is missing.')
     await _http_post_json(
         'https://api.line.me/v2/bot/message/reply',
-        {'replyToken': reply_token, 'messages': _line_result_messages(result)},
+        {
+            'replyToken': reply_token,
+            'messages': await _line_delivery_messages(channel, result),
+        },
         {
             'Authorization': f'Bearer {channel.channel_access_token}',
             'Content-Type': 'application/json',
@@ -1541,7 +1950,10 @@ async def _send_line_push_result(
         raise RuntimeError('LINE access token or recipient ID is missing.')
     await _http_post_json(
         'https://api.line.me/v2/bot/message/push',
-        {'to': to, 'messages': _line_result_messages(result)},
+        {
+            'to': to,
+            'messages': await _line_delivery_messages(channel, result),
+        },
         {
             'Authorization': f'Bearer {channel.channel_access_token}',
             'Content-Type': 'application/json',
@@ -1770,19 +2182,47 @@ async def channel_chat(  # noqa: C901
     # WebUI chat. Ambiguous requests remain normal chat instead of guessing.
     from open_webui.routers import workflows as workflow_routes
 
-    selection = await workflow_routes.select_workflow_for_user_context(
-        user,
-        payload.message or ' '.join(str(part.get('type') or '') for part in payload.parts),
-        channel_id=(payload.metadata or {}).get('channelId'),
-        model_id=model_id,
-    )
-    if selection.decision == 'selected' and selection.selected_workflow_id:
+    channel_id = str((payload.metadata or {}).get('channelId') or '').strip()
+    if payload.workflowId:
+        if not payload.workflowVersionId or not channel_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='WORKFLOW-QUICK-ACTION-UNAVAILABLE',
+            )
+        workflow_option = await workflow_routes.resolve_instant_workflow_for_user_context(
+            user,
+            payload.workflowId,
+            payload.workflowVersionId,
+            channel_id=channel_id,
+            model_id=model_id,
+        )
+        if not workflow_option:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='WORKFLOW-QUICK-ACTION-UNAVAILABLE',
+            )
         form_data['workflow'] = {
-            'id': selection.selected_workflow_id,
-            'versionId': selection.selected_version_id,
-            'trigger': f'{payload.channelType}.message',
+            'id': payload.workflowId,
+            'versionId': payload.workflowVersionId,
+            'trigger': payload.workflowTrigger or f'{payload.channelType}.quick_action',
             'parts': payload.parts,
+            'data': payload.workflowData,
+            'confirmed': True,
         }
+    else:
+        selection = await workflow_routes.select_workflow_for_user_context(
+            user,
+            payload.message or ' '.join(str(part.get('type') or '') for part in payload.parts),
+            channel_id=channel_id or None,
+            model_id=model_id,
+        )
+        if selection.decision == 'selected' and selection.selected_workflow_id:
+            form_data['workflow'] = {
+                'id': selection.selected_workflow_id,
+                'versionId': selection.selected_version_id,
+                'trigger': f'{payload.channelType}.message',
+                'parts': payload.parts,
+            }
 
     try:
         response = await request.app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
@@ -2255,20 +2695,22 @@ async def platform_webhook(  # noqa: C901
             raise HTTPException(status_code=400, detail='Invalid LINE payload.')
         results = []
         for index, event in enumerate(payload.get('events') or []):
+            event_type = str(event.get('type') or '')
             message = event.get('message') or {}
             message_type = str(message.get('type') or '')
-            if (channel.enabled and channel.reply_mode == 'silent') or message_type not in {
-                'text',
-                'image',
-                'video',
-                'audio',
-                'file',
-            }:
+            workflow_postback = _line_workflow_postback(event) if event_type == 'postback' else None
+            supported_message = event_type == 'message' and message_type in {
+                'text', 'image', 'video', 'audio', 'file'
+            }
+            if (
+                (channel.enabled and channel.reply_mode == 'silent')
+                or (not supported_message and workflow_postback is None)
+            ):
                 results.append({'ok': True, 'skipped': True})
                 continue
             parts = (
                 []
-                if message_type == 'text'
+                if message_type == 'text' or workflow_postback
                 else [
                     {
                         'type': message_type,
@@ -2279,7 +2721,16 @@ async def platform_webhook(  # noqa: C901
                     }
                 ]
             )
-            message_text = message.get('text') or f'[LINE {message_type}]'
+            message_text = (
+                '執行 LINE 快速工作流'
+                if workflow_postback
+                else message.get('text') or f'[LINE {message_type}]'
+            )
+            workflow_menu_requested = (
+                supported_message
+                and message_type == 'text'
+                and _line_workflow_menu_requested(message_text)
+            )
             source = event.get('source') or {}
             line_recipient_id = source.get('groupId') or source.get('roomId') or source.get('userId')
             external_user_id = source.get('userId') or line_recipient_id or 'unknown'
@@ -2299,6 +2750,17 @@ async def platform_webhook(  # noqa: C901
                 if should_process:
                     if not line_recipient_id:
                         raise RuntimeError('LINE recipient ID is missing.')
+                    selected_workflow = workflow_postback
+                    workflow_trigger = f'{channel_type}.quick_action' if workflow_postback else None
+                    if (
+                        selected_workflow is None
+                        and supported_message
+                        and message_type == 'text'
+                        and not workflow_menu_requested
+                    ):
+                        selected_workflow = await _line_selected_workflow_request(channel, message_text)
+                        if selected_workflow:
+                            workflow_trigger = f'{channel_type}.message'
                     await InteractChannels.enqueue_job(
                         event_id=claim.event_id,
                         channel_id=channel.id,
@@ -2310,10 +2772,22 @@ async def platform_webhook(  # noqa: C901
                             'recipientId': line_recipient_id,
                             'message': message_text,
                             'parts': parts,
+                            **({'workflowMenu': True} if workflow_menu_requested else {}),
+                            **(
+                                {
+                                    'workflowId': selected_workflow[0],
+                                    'workflowVersionId': selected_workflow[1],
+                                    'workflowTrigger': workflow_trigger,
+                                    'workflowData': {},
+                                }
+                                if selected_workflow
+                                else {}
+                            ),
                         },
                     )
                     wake_channel_job_workers()
-                    await _send_line_reply(channel, event.get('replyToken'), _line_progress_text(channel))
+                    if selected_workflow:
+                        await _send_line_reply(channel, event.get('replyToken'), _line_progress_text(channel))
                 else:
                     await _send_line_reply(channel, event.get('replyToken'), content or '')
                     await _mark_delivery(claim)

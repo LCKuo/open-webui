@@ -8,6 +8,7 @@ from open_webui.utils.workflows import (
     validate_workflow_graph,
     workflow_acl_allows,
     workflow_agent_candidate,
+    workflow_channel_acl_allows,
 )
 
 
@@ -56,6 +57,36 @@ def test_company_acl_blocks_another_company_before_intent_matching():
     assert workflow_acl_allows(workflow, _context('company-a'))
     assert not workflow_acl_allows(workflow, _context('company-b'))
     assert workflow_agent_candidate(workflow, _context('company-b'), '查發票') is None
+
+
+def test_channel_acl_applies_to_owner_during_external_execution():
+    workflow = _workflow(
+        meta={
+            'acl': {
+                **_workflow().meta['acl'],
+                'allowed_channel_ids': ['line-a'],
+                'allowed_model_ids': ['model-a'],
+            }
+        }
+    )
+
+    allowed = WorkflowAccessContext(
+        user_id='owner-a',
+        role='user',
+        company_user_id='company-a',
+        channel_id='line-a',
+        model_id='model-a',
+    )
+    wrong_channel = WorkflowAccessContext(
+        user_id='owner-a',
+        role='user',
+        company_user_id='company-a',
+        channel_id='line-b',
+        model_id='model-a',
+    )
+
+    assert workflow_channel_acl_allows(workflow, allowed)
+    assert not workflow_channel_acl_allows(workflow, wrong_channel)
 
 
 def test_workflow_metadata_cannot_match_its_own_keywords():

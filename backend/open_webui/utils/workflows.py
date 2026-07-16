@@ -272,6 +272,26 @@ def workflow_acl_allows(
     return scope in ACL_COMPANY_SCOPES
 
 
+def workflow_channel_acl_allows(
+    workflow: Any,
+    context: WorkflowAccessContext,
+) -> bool:
+    """Apply channel/model restrictions even when the caller owns the workflow."""
+    if not workflow_acl_allows(workflow, context, allow_public_template=False):
+        return False
+
+    acl = workflow_acl(workflow)
+    allowed_channels = _as_set(acl.get('allowed_channel_ids'))
+    if allowed_channels and (not context.channel_id or context.channel_id not in allowed_channels):
+        return False
+
+    allowed_models = _as_set(acl.get('allowed_model_ids'))
+    if allowed_models and (not context.model_id or context.model_id not in allowed_models):
+        return False
+
+    return True
+
+
 def workflow_agent_candidate(
     workflow: Any,
     context: WorkflowAccessContext,

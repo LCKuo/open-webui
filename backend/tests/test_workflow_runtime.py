@@ -4,6 +4,7 @@ import pytest
 from open_webui.routers.interact_channels import (
     ChannelHealthRequest,
     ProvisionAccountRequest,
+    _line_mobile_text,
     _line_result_messages,
     _wechat_media_response,
     channel_health,
@@ -278,6 +279,25 @@ def test_line_adapter_uses_native_image_and_falls_back_for_files():
         'type': 'text',
         'text': 'report.pdf: https://example.test/report.pdf',
     }
+
+
+def test_line_adapter_converts_generic_markdown_table_to_mobile_list():
+    converted = _line_mobile_text(
+        '''| 排名 | 員工編號 | 員工姓名 | 跟進事件數 |
+|:---:|:---|:---|---:|
+| 1 | EMP002 | 林雅婷 | 5 |
+| 2 | EMP003 | 陳俊宇 | 5 |
+
+**說明：**
+- 所有員工目前皆為 5 次。'''
+    )
+
+    assert '|' not in converted
+    assert '1. 林雅婷' in converted
+    assert '員工編號：EMP002' in converted
+    assert '跟進事件數：5' in converted
+    assert '- 所有員工目前皆為 5 次。' in converted
+    assert _line_mobile_text('**查詢完成**') == '查詢完成'
 
 
 def test_workflow_billing_reservation_scales_with_model_steps():

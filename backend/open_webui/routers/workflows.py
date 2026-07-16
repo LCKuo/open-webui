@@ -68,8 +68,10 @@ from open_webui.utils.workflows import (
     validate_workflow_agent_policy,
     validate_workflow_graph,
     validate_workflow_visibility,
+    workflow_acl,
     workflow_acl_allows,
     workflow_agent_candidate,
+    workflow_channel_acl_allows,
 )
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -928,7 +930,11 @@ async def execute_chat_workflow(
         channel_id=channel_id,
         model_id=model_id,
     )
-    check_workflow_access(workflow, user, context, allow_public_template=False)
+    if channel_id:
+        if not workflow_channel_acl_allows(workflow, context):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.UNAUTHORIZED)
+    else:
+        check_workflow_access(workflow, user, context, allow_public_template=False)
     if workflow.status != 'published' or not workflow.default_version_id:
         raise HTTPException(status_code=409, detail='Publish this workflow before using it in chat.')
 
@@ -1013,9 +1019,16 @@ def _selector_response(
     message: str,
     max_items: int,
 ) -> WorkflowAgentSelectorResponse:
-    candidates = [
-        candidate for workflow in workflows if (candidate := workflow_agent_candidate(workflow, context, message))
-    ]
+    candidates: list[dict[str, Any]] = []
+    requested_model_id = context.model_id
+    for workflow in workflows:
+        context.model_id = _effective_workflow_model_id(workflow.graph, requested_model_id)
+        if context.channel_id and not workflow_channel_acl_allows(workflow, context):
+            continue
+        candidate = workflow_agent_candidate(workflow, context, message)
+        if candidate:
+            candidates.append(candidate)
+    context.model_id = requested_model_id
     decision = decide_workflow_candidates(candidates, max_items)
     return WorkflowAgentSelectorResponse(**decision)
 
@@ -1044,6 +1057,93 @@ async def select_workflow_for_user_context(
         include_shared=True,
     )
     return _selector_response(result.items, context, message, max_items)
+
+
+async def list_instant_workflows_for_user_context(
+    user,
+    *,
+    channel_id: str,
+    model_id: str | None = None,
+    limit: int = 13,
+) -> list[dict[str, Any]]:
+    """Return immutable, executable instant workflows for an external channel."""
+    context = await _workflow_context_for_user(
+        user,
+        None,
+        channel_id=channel_id,
+        model_id=model_id,
+    )
+    result = await Workflows.search(
+        user_id=user.id,
+        visibility='all',
+        workflow_status='published',
+        skip=0,
+        limit=0,
+        include_public_templates=False,
+        include_shared=True,
+    )
+    options: list[dict[str, Any]] = []
+    for workflow in result.items:
+        if workflow.status != 'published' or not workflow.default_version_id:
+            continue
+        version = await Workflows.get_version_by_id(workflow.default_version_id)
+        if not version or version.workflow_id != workflow.id:
+            continue
+        context.model_id = _effective_workflow_model_id(version.graph, model_id)
+        if not workflow_channel_acl_allows(workflow, context):
+            continue
+        if runtime_unsupported_node_types(version.graph):
+            continue
+        launch = normalize_launch_contract(version.meta, version.graph)
+        if launch.get('mode') != 'instant':
+            continue
+        acl = workflow_acl(workflow)
+        try:
+            priority = max(-100, min(100, int(acl.get('agent_selection_priority') or 0)))
+        except (TypeError, ValueError):
+            priority = 0
+        options.append(
+            {
+                'id': workflow.id,
+                'versionId': version.id,
+                'name': workflow.name,
+                'description': workflow.description,
+                'buttonLabel': str(launch.get('buttonLabel') or workflow.name).strip() or workflow.name,
+                'priority': priority,
+                'updatedAt': workflow.updated_at,
+            }
+        )
+
+    options.sort(
+        key=lambda item: (item['priority'], item['updatedAt'], item['name']),
+        reverse=True,
+    )
+    return options[:limit] if limit > 0 else options
+
+
+async def resolve_instant_workflow_for_user_context(
+    user,
+    workflow_id: str,
+    version_id: str,
+    *,
+    channel_id: str,
+    model_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a LINE postback only when its published version is still current."""
+    options = await list_instant_workflows_for_user_context(
+        user,
+        channel_id=channel_id,
+        model_id=model_id,
+        limit=0,
+    )
+    return next(
+        (
+            option
+            for option in options
+            if option['id'] == workflow_id and option['versionId'] == version_id
+        ),
+        None,
+    )
 
 
 async def _preflight_workflow_launch(
@@ -1077,7 +1177,12 @@ async def _preflight_workflow_launch(
 
     effective_model_id = _effective_workflow_model_id(version.graph, form_data.model_id)
     context.model_id = effective_model_id
-    if not workflow_acl_allows(workflow, context, allow_public_template=False):
+    access_allowed = (
+        workflow_channel_acl_allows(workflow, context)
+        if context.channel_id
+        else workflow_acl_allows(workflow, context, allow_public_template=False)
+    )
+    if not access_allowed:
         launch = normalize_launch_contract(version.meta, version.graph)
         return WorkflowLaunchPreflightResponse(
             ok=False,
