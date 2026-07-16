@@ -39,6 +39,19 @@ def _schema_index(schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def _scoped_schema_descriptions(scanned: dict[str, Any], tables: list[dict[str, Any]]) -> dict[str, str]:
+    visible_schemas = {
+        str(item.get('schema') or '').strip() or str(item.get('name') or item.get('table') or '').partition('.')[0]
+        for item in tables
+    }
+    visible_schemas.discard('')
+    return {
+        str(schema): str(description)
+        for schema, description in (scanned.get('schema_descriptions') or {}).items()
+        if schema in visible_schemas and description
+    }
+
+
 def snapshot_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
     left, right = _schema_index(before), _schema_index(after)
     added = sorted(set(right) - set(left))
@@ -81,9 +94,11 @@ async def scan_connector_snapshot(
     started = time.monotonic()
     try:
         scanned = await scan_data_connector_schema(connector.id, max_tables)
+        filtered_tables = _filter_schema_scan_for_policy(connector, scanned, None)
         schema = {
             **scanned,
-            'tables': _filter_schema_scan_for_policy(connector, scanned, None),
+            'schema_descriptions': _scoped_schema_descriptions(scanned, filtered_tables),
+            'tables': filtered_tables,
         }
         snapshot, created = await InteractSemantic.create_snapshot(
             connector.id,

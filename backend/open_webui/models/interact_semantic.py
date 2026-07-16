@@ -282,6 +282,19 @@ def canonical_schema_fingerprint(schema: dict[str, Any]) -> str:
     return canonical_fingerprint(normalized)
 
 
+def _synced_description(
+    previous_catalog_value: str | None,
+    previous_scan_value: str | None,
+    current_scan_value: str | None,
+) -> str | None:
+    previous_catalog = str(previous_catalog_value or '').strip()
+    previous_scan = str(previous_scan_value or '').strip()
+    current_scan = str(current_scan_value or '').strip()
+    if previous_catalog and previous_catalog != previous_scan:
+        return previous_catalog
+    return current_scan or previous_catalog or None
+
+
 def row_dict(row: Any, *, omit: set[str] | None = None) -> dict[str, Any]:
     if row is None:
         return {}
@@ -342,7 +355,7 @@ class InteractSemanticStore:
                 version=version + 1,
                 status='ready',
                 fingerprint=fingerprint,
-                scanner_version='semantic-v1',
+                scanner_version='semantic-v2',
                 database_product=str(schema.get('connector_type') or schema.get('database', {}).get('product') or ''),
                 database_version=(schema.get('database') or {}).get('version'),
                 schema_json=schema,
@@ -428,9 +441,9 @@ class InteractSemanticStore:
         schema = snapshot.schema_json or {}
         objects = schema.get('objects') or schema.get('tables') or []
         now = int(time.time())
-        previous_snapshot_id = (
+        previous_snapshot = (
             await db.execute(
-                select(InteractSchemaSnapshot.id)
+                select(InteractSchemaSnapshot)
                 .where(
                     InteractSchemaSnapshot.connector_id == snapshot.connector_id,
                     InteractSchemaSnapshot.company_user_id == snapshot.company_user_id,
@@ -439,7 +452,17 @@ class InteractSemanticStore:
                 .order_by(InteractSchemaSnapshot.version.desc())
                 .limit(1)
             )
-        ).scalar()
+        ).scalar_one_or_none()
+        previous_snapshot_id = previous_snapshot.id if previous_snapshot else None
+        previous_schema_objects = {
+            str(item.get('physicalName') or item.get('name') or item.get('table') or ''): item
+            for item in (
+                (previous_snapshot.schema_json or {}).get('objects')
+                or (previous_snapshot.schema_json or {}).get('tables')
+                or []
+            )
+            if str(item.get('physicalName') or item.get('name') or item.get('table') or '')
+        }
         previous_objects = (
             (
                 await db.execute(
@@ -516,6 +539,8 @@ class InteractSemanticStore:
             if not physical:
                 continue
             previous_object = previous_object_by_physical.get(physical)
+            scanned_description = str(item.get('description') or '').strip() or None
+            previous_scanned_object = previous_schema_objects.get(physical) or {}
             obj = InteractCatalogObject(
                 id=str(uuid4()),
                 company_user_id=snapshot.company_user_id,
@@ -524,7 +549,11 @@ class InteractSemanticStore:
                 physical_name=physical,
                 object_type='view' if 'view' in str(item.get('type') or '').lower() else 'table',
                 display_name=previous_object.display_name if previous_object else physical.split('.')[-1],
-                description=previous_object.description if previous_object else None,
+                description=_synced_description(
+                    previous_object.description if previous_object else None,
+                    previous_scanned_object.get('description'),
+                    scanned_description,
+                ),
                 synonyms=list(previous_object.synonyms or []) if previous_object else [],
                 business_domain=previous_object.business_domain if previous_object else None,
                 sensitivity=previous_object.sensitivity if previous_object else 'internal',
@@ -543,6 +572,15 @@ class InteractSemanticStore:
                 physical_type = str(column.get('type') or column.get('data_type') or 'text')
                 semantic_type = self._infer_semantic_type(name, physical_type)
                 previous_field = previous_field_by_physical.get((physical, name))
+                scanned_field_description = str(column.get('description') or '').strip() or None
+                previous_scanned_field = next(
+                    (
+                        previous_column
+                        for previous_column in previous_scanned_object.get('columns') or []
+                        if str(previous_column.get('name') or previous_column.get('physicalName') or '') == name
+                    ),
+                    {},
+                )
                 field_id = str(uuid4())
                 field_ids[(physical, name)] = field_id
                 db.add(
@@ -551,7 +589,11 @@ class InteractSemanticStore:
                         catalog_object_id=obj.id,
                         physical_name=name,
                         display_name=previous_field.display_name if previous_field else name,
-                        description=previous_field.description if previous_field else None,
+                        description=_synced_description(
+                            previous_field.description if previous_field else None,
+                            previous_scanned_field.get('description'),
+                            scanned_field_description,
+                        ),
                         synonyms=list(previous_field.synonyms or []) if previous_field else [],
                         physical_type=physical_type,
                         semantic_type=previous_field.semantic_type if previous_field else semantic_type,
@@ -1627,6 +1669,9 @@ class InteractSemanticStore:
                 )
                 db.add(row)
             else:
+                definition_changed = (
+                    'definition' in data and (data.get('definition') or {}) != (row.draft_definition or {})
+                )
                 for key in (
                     'slug',
                     'name',
@@ -1643,7 +1688,7 @@ class InteractSemanticStore:
                     source_key = 'definition' if key == 'draft_definition' else key
                     if source_key in data:
                         setattr(row, key, data[source_key])
-                if row.status in {'published', 'degraded', 'blocked'}:
+                if definition_changed and row.status in {'published', 'degraded', 'blocked'}:
                     row.status = 'draft'
                 row.updated_at = now
             await db.commit()

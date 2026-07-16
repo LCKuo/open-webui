@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from open_webui.models.interact_semantic import InteractSemantic, _business_day_start
+from open_webui.models.interact_semantic import InteractSemantic, _business_day_start, _synced_description
 from open_webui.routers import interact_semantic as semantic_router
 from open_webui.routers.interact_channels import _safe_sso_return_url, _safe_sso_target
 from open_webui.routers.interact_semantic import (
@@ -13,6 +13,7 @@ from open_webui.routers.interact_semantic import (
 )
 from open_webui.semantic_query import entitlements
 from open_webui.semantic_query.errors import SemanticQueryError
+from open_webui.semantic_query.schema import _scoped_schema_descriptions
 
 
 def test_business_day_uses_taipei_midnight_by_default(monkeypatch):
@@ -21,6 +22,28 @@ def test_business_day_uses_taipei_midnight_by_default(monkeypatch):
     day_start = _business_day_start(now)
     assert (day_start + 8 * 3600) % 86400 == 0
     assert 0 <= now - day_start < 86400
+
+
+def test_schema_comments_refresh_without_overwriting_catalog_override():
+    assert _synced_description('Old database comment', 'Old database comment', 'New database comment') == (
+        'New database comment'
+    )
+    assert _synced_description('Administrator definition', 'Old database comment', 'New database comment') == (
+        'Administrator definition'
+    )
+    assert _synced_description(None, None, 'Initial database comment') == 'Initial database comment'
+
+
+def test_schema_descriptions_are_limited_to_connector_visible_tables():
+    scanned = {
+        'schema_descriptions': {
+            'sales': 'Sales records.',
+            'payroll': 'Restricted payroll records.',
+        }
+    }
+    tables = [{'name': 'sales.orders', 'schema': 'sales'}]
+
+    assert _scoped_schema_descriptions(scanned, tables) == {'sales': 'Sales records.'}
 
 
 def test_sso_navigation_allowlists_targets_and_return_hosts():

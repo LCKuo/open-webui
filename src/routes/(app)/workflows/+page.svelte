@@ -13,6 +13,11 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Pagination from '$lib/components/common/Pagination.svelte';
 	import WorkflowOverviewDrawer from '$lib/components/workflows/WorkflowOverviewDrawer.svelte';
+	import { buildWorkflowTemplateGraph } from '$lib/components/workflows/workflowNodeCatalog';
+	import {
+		workflowLaunchLabel,
+		workflowLaunchSummary
+	} from '$lib/components/workflows/workflowLaunch';
 
 	let loaded = false;
 	let loading = false;
@@ -71,27 +76,11 @@
 	const useWorkflowInChat = (workflow: WorkflowResponse) => {
 		if (!workflow.default_version_id) return;
 		goto(
-			`/?workflow=${encodeURIComponent(workflow.id)}&version=${encodeURIComponent(workflow.default_version_id)}`
+			`/?workflow=${encodeURIComponent(workflow.id)}&version=${encodeURIComponent(workflow.default_version_id)}&launch=1`
 		);
 	};
 
-	const defaultGraph = () => ({
-		nodes: [
-			{
-				id: 'input',
-				type: 'input',
-				position: { x: 80, y: 120 },
-				data: { label: '聊天 / 頻道輸入', type: 'channel_input' }
-			},
-			{
-				id: 'reply',
-				type: 'output',
-				position: { x: 420, y: 120 },
-				data: { label: '回覆使用者', type: 'channel_reply' }
-			}
-		],
-		edges: [{ id: 'input-reply', source: 'input', target: 'reply' }]
-	});
+	const defaultGraph = () => buildWorkflowTemplateGraph('channel-assistant');
 
 	const loadWorkflows = async () => {
 		loading = true;
@@ -201,7 +190,7 @@
 				</div>
 
 				<button
-					class="rounded-xl bg-gray-900 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-white dark:text-gray-900"
+					class="rounded-lg bg-gray-900 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-white dark:text-gray-900"
 					disabled={creating}
 					on:click={createBlankWorkflow}
 				>
@@ -210,7 +199,7 @@
 			</div>
 
 			<div
-				class="flex flex-col gap-3 rounded-xl border border-gray-200 bg-white p-3 dark:border-gray-800 dark:bg-gray-950 md:flex-row"
+				class="flex flex-col gap-3 rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-800 dark:bg-gray-950 md:flex-row"
 			>
 				<input
 					class="min-w-0 flex-1 rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none focus:border-gray-400 dark:border-gray-800 dark:focus:border-gray-600"
@@ -250,14 +239,14 @@
 				</div>
 			{:else if visibleWorkflows.length === 0}
 				<div
-					class="rounded-xl border border-dashed border-gray-300 bg-white p-10 text-center dark:border-gray-800 dark:bg-gray-950"
+					class="rounded-lg border border-dashed border-gray-300 bg-white p-10 text-center dark:border-gray-800 dark:bg-gray-950"
 				>
 					<div class="text-base font-medium text-gray-900 dark:text-gray-100">目前沒有工作流</div>
 					<p class="mt-2 text-sm text-gray-500">
 						先建立工作流，設定節點與存取政策，再進行結構驗證。
 					</p>
 					<button
-						class="mt-5 rounded-xl bg-gray-900 px-4 py-2.5 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
+						class="mt-5 rounded-lg bg-gray-900 px-4 py-2.5 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
 						on:click={createBlankWorkflow}
 					>
 						建立第一個工作流
@@ -267,7 +256,7 @@
 				<div class="grid gap-3">
 					{#each visibleWorkflows as workflow}
 						<div
-							class="flex flex-col gap-4 rounded-xl border border-gray-200 bg-white p-4 transition hover:border-gray-300 dark:border-gray-800 dark:bg-gray-950 md:flex-row md:items-center md:justify-between"
+							class="flex flex-col gap-4 rounded-lg border border-gray-200 bg-white p-4 transition hover:border-gray-300 dark:border-gray-800 dark:bg-gray-950 md:flex-row md:items-center md:justify-between"
 						>
 							<button
 								class="min-w-0 flex-1 text-left"
@@ -287,6 +276,11 @@
 									>
 										{visibilityLabel(workflow.visibility)}
 									</span>
+									<span
+										class="rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700 dark:bg-blue-950 dark:text-blue-200"
+									>
+										{workflowLaunchSummary(workflow)}
+									</span>
 								</div>
 								<div class="mt-1 line-clamp-2 text-sm text-gray-500">
 									{workflow.description || '沒有描述'}
@@ -296,7 +290,7 @@
 								</div>
 							</button>
 
-							<div class="flex shrink-0 items-center gap-2">
+							<div class="flex w-full flex-wrap items-center gap-2 md:w-auto md:flex-nowrap">
 								<button
 									class="rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
 									on:click={() => (selectedWorkflow = workflow)}>概覽</button
@@ -304,7 +298,7 @@
 								<button
 									class="rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-white dark:text-gray-900"
 									disabled={!workflow.default_version_id || workflow.status !== 'published'}
-									on:click={() => useWorkflowInChat(workflow)}>在聊天中使用</button
+									on:click={() => useWorkflowInChat(workflow)}>{workflowLaunchLabel(workflow)}</button
 								>
 								<button
 									class="rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"

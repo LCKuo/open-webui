@@ -60,6 +60,7 @@ SUPPORTED_RUNTIME_NODE_TYPES = (
         'calculator',
         'transform_json',
         'extract_fields',
+        'knowledge_query',
         'database_query',
         'semantic_query',
     }
@@ -176,7 +177,8 @@ def _render_template(template: str, workflow_input: dict[str, Any], incoming: An
 
     def replace(match: re.Match[str]) -> str:
         key = match.group(1).strip()
-        return str(values.get(key, match.group(0)))
+        value = values.get(key, match.group(0))
+        return _value_text(value) if isinstance(value, (dict, list)) else str(value)
 
     return re.sub(r'\{\{\s*([^{}]+?)\s*\}\}', replace, template)
 
@@ -329,9 +331,9 @@ async def execute_workflow_graph(
             fields = config.get('fields') if isinstance(config.get('fields'), list) else []
             value = {field: None for field in fields}
             value['_text'] = text
-        elif node_type in {'database_query', 'semantic_query'}:
+        elif node_type in {'knowledge_query', 'database_query', 'semantic_query'}:
             if node_runner is None:
-                raise WorkflowRuntimeError(f'Node {node_id} requires a database runtime.')
+                raise WorkflowRuntimeError(f'Node {node_id} requires a secure tool runtime.')
             value = await node_runner(node_type, config, incoming, workflow_input)
         elif node_type in RUNTIME_PASSTHROUGH_TYPES:
             value = incoming

@@ -30,6 +30,9 @@ async def interact_semantic_catalog(
     channel, and workflow. Candidates are ranked by selectorScore. Compare whenToUse,
     notFor, grain, and examples; if the top candidates describe different business meanings
     or all scores are low, ask one short clarification question instead of guessing.
+    If no dataset is returned, do not bypass the result with interact_database_query. Explain
+    that no authorized semantic dataset is available, or ask an administrator to publish or
+    grant one.
 
     :param query: Short business intent, for example "monthly sales ranking by salesperson".
     :return: JSON containing authorized semantic dataset manifests.
@@ -37,7 +40,19 @@ async def interact_semantic_catalog(
     try:
         context = await runtime_context(__user__, __metadata__)
         datasets = await accessible_dataset_manifests(context, query)
-        return _result({'ok': True, 'datasets': datasets})
+        return _result(
+            {
+                'ok': True,
+                'datasets': datasets,
+                'selectionPolicy': {
+                    'rawDatabaseFallbackAllowed': False,
+                    'whenEmpty': (
+                        'No authorized semantic dataset is available. Do not query raw tables; '
+                        'explain the authorization or publication requirement.'
+                    ),
+                },
+            }
+        )
     except SemanticQueryError as error:
         return _result({'ok': False, 'error': error.public()})
     except Exception as error:

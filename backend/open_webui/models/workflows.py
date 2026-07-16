@@ -93,6 +93,7 @@ class WorkflowRunForm(BaseModel):
     workflow_version_id: Optional[str] = None
     model_id: Optional[str] = None
     channel_id: Optional[str] = None
+    confirmed: bool = False
 
 
 class WorkflowModel(BaseModel):

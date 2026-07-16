@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from open_webui.utils.workflow_runtime import runtime_unsupported_node_types
+from open_webui.utils.workflow_launch import normalize_launch_contract, normalize_launch_meta
 
 INPUT_TYPES = {
     'input',
@@ -29,6 +30,7 @@ SENSITIVE_NODE_TYPES = {
     'crm_tool',
     'database_query',
     'semantic_query',
+    'knowledge_query',
     'http_request',
     'mcp_tools',
     'ticket_tool',
@@ -163,8 +165,9 @@ def normalize_workflow_meta(
     owner_user_id: str,
     company_user_id: str | None = None,
     visibility: str | None = None,
+    graph: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    normalized = dict(meta) if isinstance(meta, dict) else {}
+    normalized = normalize_launch_meta(meta, graph)
     acl = dict(normalized.get('acl')) if isinstance(normalized.get('acl'), dict) else {}
 
     scope = _clean_str(acl.get('scope'))
@@ -280,6 +283,10 @@ def workflow_agent_candidate(
         return None
     graph = getattr(workflow, 'graph', None)
     if not isinstance(graph, dict) or runtime_unsupported_node_types(graph):
+        return None
+
+    launch = normalize_launch_contract(_workflow_meta(workflow), graph)
+    if launch['mode'] in {'form_input', 'file_input'}:
         return None
 
     meta = _workflow_meta(workflow)

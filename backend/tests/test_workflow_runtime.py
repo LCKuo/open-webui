@@ -106,6 +106,49 @@ async def test_system_prompt_is_forwarded_without_replacing_user_input():
 
 
 @pytest.mark.asyncio
+async def test_prompt_template_serializes_structured_chat_context_as_json():
+    captured = {}
+
+    async def model_runner(prompt, system_prompt, model_id, parts):
+        captured['prompt'] = prompt
+        return {'text': 'ok', 'model_id': model_id, 'usage': {}}
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'chat_input'}},
+            {
+                'id': 'prompt',
+                'data': {
+                    'type': 'prompt_template',
+                    'config': {'template': 'History: {{chat_history}}\nQuestion: {{message}}'},
+                },
+            },
+            {'id': 'model', 'data': {'type': 'chat_model', 'config': {'model_id': 'model-a'}}},
+            {'id': 'output', 'data': {'type': 'chat_output'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'prompt'},
+            {'source': 'prompt', 'target': 'model'},
+            {'source': 'model', 'target': 'output'},
+        ],
+    }
+
+    await execute_workflow_graph(
+        graph,
+        {
+            'message': 'current question',
+            'context': {'chat_history': [{'role': 'user', 'content': 'earlier question'}]},
+        },
+        model_runner=model_runner,
+    )
+
+    assert captured['prompt'] == (
+        'History: [{"role": "user", "content": "earlier question"}]\n'
+        'Question: current question'
+    )
+
+
+@pytest.mark.asyncio
 async def test_database_node_uses_registered_acl_runtime():
     captured = {}
 
@@ -173,6 +216,49 @@ async def test_semantic_query_node_uses_the_registered_runtime():
     assert captured['node_type'] == 'semantic_query'
     assert captured['config']['dataset_id'] == 'sales'
     assert result['outputs'][0]['value']['rows'][0]['salesperson'] == 'Amy'
+
+
+@pytest.mark.asyncio
+async def test_knowledge_query_node_uses_the_registered_acl_runtime():
+    captured = {}
+
+    async def node_runner(node_type, config, incoming, workflow_input):
+        captured.update(
+            node_type=node_type,
+            config=config,
+            incoming=incoming,
+            message=workflow_input['message'],
+        )
+        return [{'content': 'Refunds take three business days.', 'source': 'policy.pdf'}]
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'chat_input'}},
+            {
+                'id': 'knowledge',
+                'data': {
+                    'type': 'knowledge_query',
+                    'config': {'knowledge_ids': ['kb-policy'], 'count': 3},
+                },
+            },
+            {'id': 'output', 'data': {'type': 'chat_output'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'knowledge'},
+            {'source': 'knowledge', 'target': 'output'},
+        ],
+    }
+
+    result = await execute_workflow_graph(
+        graph,
+        {'message': 'How long do refunds take?'},
+        node_runner=node_runner,
+    )
+
+    assert captured['node_type'] == 'knowledge_query'
+    assert captured['config']['knowledge_ids'] == ['kb-policy']
+    assert captured['message'] == 'How long do refunds take?'
+    assert result['outputs'][0]['value']['source'] == 'policy.pdf'
 
 
 def test_line_adapter_uses_native_image_and_falls_back_for_files():

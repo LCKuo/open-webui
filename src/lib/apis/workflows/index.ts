@@ -55,6 +55,23 @@ export type WorkflowValidateResponse = {
 	warnings: string[];
 };
 
+export type WorkflowLaunchCheck = {
+	code: string;
+	status: 'pass' | 'warning' | 'fail';
+	message: string;
+};
+
+export type WorkflowLaunchPreflightResponse = {
+	ok: boolean;
+	workflow_id: string;
+	workflow_version_id: string | null;
+	launch: Record<string, any>;
+	effective_model_id: string | null;
+	missing_fields: string[];
+	requires_confirmation: boolean;
+	checks: WorkflowLaunchCheck[];
+};
+
 export type WorkflowSelectorItem = {
 	id: string;
 	name: string;
@@ -185,12 +202,32 @@ export const runWorkflowById = async (
 	input: Record<string, any> = {},
 	trigger_type = 'manual',
 	model_id?: string,
-	workflow_version_id?: string
+	workflow_version_id?: string,
+	confirmed = false
 ): Promise<WorkflowRunResponse> => {
 	return fetch(`${WEBUI_API_BASE_URL}/workflows/${id}/run`, {
 		method: 'POST',
 		headers: headers(token),
-		body: JSON.stringify({ input, trigger_type, model_id, workflow_version_id })
+		body: JSON.stringify({ input, trigger_type, model_id, workflow_version_id, confirmed })
+	}).then(parseResponse);
+};
+
+export const preflightWorkflowById = async (
+	token: string,
+	id: string,
+	input: Record<string, any> = {},
+	options: {
+		workflow_version_id?: string;
+		model_id?: string;
+		channel_id?: string;
+		surface?: 'webui_chat' | 'channel' | 'api';
+		confirmed?: boolean;
+	} = {}
+): Promise<WorkflowLaunchPreflightResponse> => {
+	return fetch(`${WEBUI_API_BASE_URL}/workflows/${id}/preflight`, {
+		method: 'POST',
+		headers: headers(token),
+		body: JSON.stringify({ input, ...options })
 	}).then(parseResponse);
 };
 

@@ -22,7 +22,7 @@ from open_webui.models.interact_data_connectors import (
 )
 
 IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-SAFE_FILTER_OPS = {'$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$contains'}
+SAFE_FILTER_OPS = {'$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$contains', '$in', '$nin'}
 
 
 @dataclass
@@ -102,9 +102,7 @@ def _context(__user__: dict | None, __metadata__: dict | None) -> QueryContext:
             or _string_value(_metadata_value(metadata, 'companyMemberRole', 'company_member_role'))
         ),
         group_ids=[
-            str(item)
-            for item in (_metadata_value(metadata, 'groupIds', 'group_ids') or [])
-            if str(item).strip()
+            str(item) for item in (_metadata_value(metadata, 'groupIds', 'group_ids') or []) if str(item).strip()
         ],
     )
 
@@ -169,12 +167,7 @@ def _is_restricted_saas_host(value: str | None) -> bool:
     except ValueError:
         return False
     return bool(
-        ip.is_loopback
-        or ip.is_link_local
-        or ip.is_private
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
+        ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_multicast or ip.is_reserved or ip.is_unspecified
     )
 
 
@@ -399,7 +392,12 @@ def _database_error_code(error: Exception) -> str:
         return 'DB-MODEL-NOT-ALLOWED'
     if 'channel ' in message and 'not assigned' in message:
         return 'DB-CHANNEL-NOT-ALLOWED'
-    if 'another company' in message or 'not company admin' in message or 'member ' in message and 'not assigned' in message:
+    if (
+        'another company' in message
+        or 'not company admin' in message
+        or 'member ' in message
+        and 'not assigned' in message
+    ):
         return 'DB-USER-NOT-ALLOWED'
     if 'user/model/channel is not allowed' in message or 'no enabled data connector is assigned' in message:
         return 'DB-USER-NOT-ALLOWED'
@@ -413,7 +411,11 @@ def _database_error_code(error: Exception) -> str:
         return 'DB-COLUMN-NOT-ALLOWED'
     if 'timeout' in message or 'timed out' in message or 'statement timeout' in message:
         return 'DB-TIMEOUT'
-    if 'authentication failed' in message or 'password authentication failed' in message or 'access denied for user' in message:
+    if (
+        'authentication failed' in message
+        or 'password authentication failed' in message
+        or 'access denied for user' in message
+    ):
         return 'DB-AUTHENTICATION-FAILED'
     if any(
         marker in message
@@ -514,9 +516,7 @@ def _connector_denial_reason(connector: InteractDataConnectorModel, ctx: QueryCo
         and ctx.channel_id in connector.allowed_channel_ids
     ):
         return f'channel {ctx.channel_id or "unknown"} is not assigned for this company'
-    if connector.access_mode not in {
-        'company_admins', 'selected_members', 'all_company_members', 'selected_channels'
-    }:
+    if connector.access_mode not in {'company_admins', 'selected_members', 'all_company_members', 'selected_channels'}:
         return f'unsupported access mode {connector.access_mode}'
     return None
 
@@ -639,7 +639,13 @@ def _build_where_sql(
         else:
             op, operand = '$eq', value
 
-        if op == '$contains':
+        if op in {'$in', '$nin'}:
+            if not isinstance(operand, list) or not operand or len(operand) > 100:
+                raise ValueError(f'{op} requires a list with 1 to 100 values.')
+            placeholders = ', '.join('?' for _item in operand)
+            clauses.append(f'{quoted} {"NOT IN" if op == "$nin" else "IN"} ({placeholders})')
+            values.extend(operand)
+        elif op == '$contains':
             clauses.append(f'{quoted} LIKE ?')
             values.append(f'%{operand}%')
         else:
@@ -669,7 +675,9 @@ def _sqlite_connect(connector: InteractDataConnectorModel) -> sqlite3.Connection
     path = _sqlite_path_from_url(connector.connection_string or '') or connector.host
     if not path:
         raise ValueError('SQLite connector requires a file path or sqlite connection string.')
-    connection = sqlite3.connect(f'file:{Path(path).resolve()}?mode=ro', uri=True, timeout=connector.query_timeout_seconds)
+    connection = sqlite3.connect(
+        f'file:{Path(path).resolve()}?mode=ro', uri=True, timeout=connector.query_timeout_seconds
+    )
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -692,11 +700,7 @@ def _sqlite_schema(connector: InteractDataConnectorModel, table: str | None) -> 
             schemas.append(
                 {
                     'table': table_name,
-                    'columns': [
-                        {'name': row['name'], 'type': row['type']}
-                        for row in rows
-                        if row['name'] in visible
-                    ],
+                    'columns': [{'name': row['name'], 'type': row['type']} for row in rows if row['name'] in visible],
                 }
             )
     return schemas
@@ -872,7 +876,9 @@ def _pg_connect(connector: InteractDataConnectorModel):
     dsn = _pg_dsn(connector)
     parsed = urlparse(dsn)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query['options'] = f'{query.get("options", "")} -c statement_timeout={connector.query_timeout_seconds * 1000}'.strip()
+    query['options'] = (
+        f'{query.get("options", "")} -c statement_timeout={connector.query_timeout_seconds * 1000}'.strip()
+    )
     safe_dsn = urlunparse(parsed._replace(query='&'.join(f'{quote(k)}={quote(v)}' for k, v in query.items())))
     return psycopg.connect(safe_dsn, autocommit=True)
 
@@ -916,17 +922,15 @@ def _pg_schema(connector: InteractDataConnectorModel, table: str | None) -> list
                 schemas.append(
                     {
                         'table': table_name,
-                        'columns': [
-                            {'name': row[0], 'type': row[1]}
-                            for row in rows
-                            if row[0] in visible
-                        ],
+                        'columns': [{'name': row[0], 'type': row[1]} for row in rows if row[0] in visible],
                     }
                 )
     return schemas
 
 
-def _pg_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -> dict[str, Any]:
+def _pg_scan_schema(  # noqa: C901
+    connector: InteractDataConnectorModel, max_tables: int
+) -> dict[str, Any]:
     max_tables = max(1, min(int(max_tables or 200), 500))
     allowed_schemas = set(connector.allowed_schemas or [])
     tables: list[dict[str, Any]] = []
@@ -934,32 +938,121 @@ def _pg_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -> d
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT table_schema, table_name, table_type
-                FROM information_schema.tables
-                WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-                ORDER BY table_schema, table_name
+                SELECT
+                    namespace_row.nspname,
+                    relation_row.relname,
+                    CASE relation_row.relkind
+                        WHEN 'v' THEN 'VIEW'
+                        WHEN 'm' THEN 'MATERIALIZED VIEW'
+                        WHEN 'p' THEN 'PARTITIONED TABLE'
+                        ELSE 'BASE TABLE'
+                    END,
+                    pg_catalog.obj_description(relation_row.oid, 'pg_class')
+                FROM pg_catalog.pg_class relation_row
+                JOIN pg_catalog.pg_namespace namespace_row
+                    ON namespace_row.oid = relation_row.relnamespace
+                WHERE namespace_row.nspname NOT IN ('pg_catalog', 'information_schema')
+                    AND relation_row.relkind IN ('r', 'v', 'm', 'p')
+                ORDER BY namespace_row.nspname, relation_row.relname
                 LIMIT %s
                 """,
                 (max_tables,),
             )
-            table_rows = [
-                row for row in cursor.fetchall()
-                if not allowed_schemas or row[0] in allowed_schemas
-            ][:max_tables]
+            table_rows = [row for row in cursor.fetchall() if not allowed_schemas or row[0] in allowed_schemas][
+                :max_tables
+            ]
             table_keys = {(row[0], row[1]) for row in table_rows}
 
             cursor.execute(
                 """
-                SELECT table_schema, table_name, column_name, data_type, is_nullable, column_default, ordinal_position
-                FROM information_schema.columns
-                WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-                ORDER BY table_schema, table_name, ordinal_position
+                SELECT
+                    namespace_row.nspname,
+                    type_row.typname,
+                    array_agg(enum_row.enumlabel ORDER BY enum_row.enumsortorder)
+                FROM pg_catalog.pg_type type_row
+                JOIN pg_catalog.pg_namespace namespace_row
+                    ON namespace_row.oid = type_row.typnamespace
+                JOIN pg_catalog.pg_enum enum_row
+                    ON enum_row.enumtypid = type_row.oid
+                GROUP BY namespace_row.nspname, type_row.typname
                 """
             )
+            enum_values = {(schema, type_name): list(values or []) for schema, type_name, values in cursor.fetchall()}
+
             columns_by_table: dict[tuple[str, str], list[dict[str, Any]]] = {}
-            for schema, table, column, data_type, nullable, default, ordinal in cursor.fetchall():
+            cursor.execute(
+                """
+                SELECT
+                    source_namespace.nspname,
+                    source_table.relname,
+                    constraint_row.conname,
+                    array_agg(source_column.attname ORDER BY source_key.position)
+                FROM pg_catalog.pg_constraint constraint_row
+                JOIN pg_catalog.pg_class source_table
+                    ON source_table.oid = constraint_row.conrelid
+                JOIN pg_catalog.pg_namespace source_namespace
+                    ON source_namespace.oid = source_table.relnamespace
+                JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY
+                    AS source_key(attnum, position) ON TRUE
+                JOIN pg_catalog.pg_attribute source_column
+                    ON source_column.attrelid = source_table.oid
+                    AND source_column.attnum = source_key.attnum
+                WHERE constraint_row.contype = 'u'
+                GROUP BY source_namespace.nspname, source_table.relname, constraint_row.conname
+                ORDER BY source_namespace.nspname, source_table.relname, constraint_row.conname
+                """
+            )
+            unique_by_table: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for schema, table, constraint, columns in cursor.fetchall():
+                if (schema, table) in table_keys:
+                    unique_by_table.setdefault((schema, table), []).append(
+                        {'name': constraint, 'columns': list(columns or [])}
+                    )
+
+            cursor.execute(
+                """
+                SELECT
+                    column_row.table_schema,
+                    column_row.table_name,
+                    column_row.column_name,
+                    column_row.data_type,
+                    column_row.is_nullable,
+                    column_row.column_default,
+                    column_row.ordinal_position,
+                    column_row.udt_schema,
+                    column_row.udt_name,
+                    pg_catalog.col_description(relation_row.oid, attribute_row.attnum)
+                FROM information_schema.columns column_row
+                JOIN pg_catalog.pg_namespace namespace_row
+                    ON namespace_row.nspname = column_row.table_schema
+                JOIN pg_catalog.pg_class relation_row
+                    ON relation_row.relnamespace = namespace_row.oid
+                    AND relation_row.relname = column_row.table_name
+                JOIN pg_catalog.pg_attribute attribute_row
+                    ON attribute_row.attrelid = relation_row.oid
+                    AND attribute_row.attname = column_row.column_name
+                    AND attribute_row.attnum > 0
+                    AND NOT attribute_row.attisdropped
+                WHERE column_row.table_schema NOT IN ('pg_catalog', 'information_schema')
+                ORDER BY column_row.table_schema, column_row.table_name, column_row.ordinal_position
+                """
+            )
+            for (
+                schema,
+                table,
+                column,
+                data_type,
+                nullable,
+                default,
+                ordinal,
+                udt_schema,
+                udt_name,
+                description,
+            ) in cursor.fetchall():
                 if (schema, table) not in table_keys:
                     continue
+                allowed_values = enum_values.get((udt_schema, udt_name), [])
+                unique_keys = unique_by_table.get((schema, table), [])
                 columns_by_table.setdefault((schema, table), []).append(
                     {
                         'name': column,
@@ -968,6 +1061,9 @@ def _pg_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -> d
                         'default': default,
                         'ordinal': ordinal,
                         'primary_key': False,
+                        'unique': any(item['columns'] == [column] for item in unique_keys),
+                        'description': description or '',
+                        **({'allowed_values': allowed_values} if allowed_values else {}),
                     }
                 )
 
@@ -1043,7 +1139,7 @@ def _pg_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -> d
                     }
                 )
 
-            for schema, table, table_type in table_rows:
+            for schema, table, table_type, description in table_rows:
                 key = (schema, table)
                 pk = primary_by_table.get(key, [])
                 columns = columns_by_table.get(key, [])
@@ -1055,15 +1151,42 @@ def _pg_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -> d
                         'schema': schema,
                         'table': table,
                         'type': table_type,
+                        'description': description or '',
                         'columns': columns,
                         'primary_key': pk,
+                        'unique_keys': unique_by_table.get(key, []),
                         'foreign_keys': foreign_by_table.get(key, []),
                     }
                 )
+            cursor.execute(
+                """
+                SELECT namespace_row.nspname, pg_catalog.obj_description(namespace_row.oid, 'pg_namespace')
+                FROM pg_catalog.pg_namespace namespace_row
+                WHERE namespace_row.nspname NOT IN ('pg_catalog', 'information_schema')
+                ORDER BY namespace_row.nspname
+                """
+            )
+            schema_descriptions = {
+                schema: description
+                for schema, description in cursor.fetchall()
+                if description and (not allowed_schemas or schema in allowed_schemas)
+            }
+            cursor.execute(
+                """
+                SELECT pg_catalog.shobj_description(database_row.oid, 'pg_database')
+                FROM pg_catalog.pg_database database_row
+                WHERE database_row.datname = current_database()
+                """
+            )
+            database_description_row = cursor.fetchone()
     return {
         'connector_id': connector.id,
         'connector_type': connector.connector_type,
         'scanned_at': datetime.now(timezone.utc).isoformat(),
+        'database': {
+            'description': (database_description_row or [None])[0] or '',
+        },
+        'schema_descriptions': schema_descriptions,
         'tables': tables,
     }
 
@@ -1262,11 +1385,7 @@ def _mysql_schema(connector: InteractDataConnectorModel, table: str | None) -> l
                 schemas.append(
                     {
                         'table': table_name,
-                        'columns': [
-                            {'name': row[0], 'type': row[1]}
-                            for row in rows
-                            if row[0] in visible
-                        ],
+                        'columns': [{'name': row[0], 'type': row[1]} for row in rows if row[0] in visible],
                     }
                 )
     return schemas
@@ -1561,11 +1680,7 @@ def _mssql_schema(connector: InteractDataConnectorModel, table: str | None) -> l
             schemas.append(
                 {
                     'table': table_name,
-                    'columns': [
-                        {'name': row[0], 'type': row[1]}
-                        for row in rows
-                        if row[0] in visible
-                    ],
+                    'columns': [{'name': row[0], 'type': row[1]} for row in rows if row[0] in visible],
                 }
             )
     return schemas
@@ -1585,10 +1700,7 @@ def _mssql_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -
             ORDER BY TABLE_SCHEMA, TABLE_NAME
             """
         )
-        table_rows = [
-            row for row in cursor.fetchall()
-            if not allowed_schemas or row[0] in allowed_schemas
-        ][:max_tables]
+        table_rows = [row for row in cursor.fetchall() if not allowed_schemas or row[0] in allowed_schemas][:max_tables]
         table_keys = {(row[0], row[1]) for row in table_rows}
 
         cursor.execute(
@@ -1860,9 +1972,7 @@ def _filter_schema_scan_for_policy(
 
         columns = [column for column in item.get('columns') or [] if isinstance(column, dict)]
         available_columns = [
-            str(column.get('name'))
-            for column in columns
-            if isinstance(column.get('name'), str) and column.get('name')
+            str(column.get('name')) for column in columns if isinstance(column.get('name'), str) and column.get('name')
         ]
         try:
             visible_columns = set(_allowed_output_columns(connector, table_name, None, available_columns))
@@ -1888,11 +1998,7 @@ def _filter_schema_scan_for_policy(
             except Exception:
                 continue
             reference_item = next(
-                (
-                    table_items.get(alias)
-                    for alias in _table_aliases(reference_table)
-                    if table_items.get(alias)
-                ),
+                (table_items.get(alias) for alias in _table_aliases(reference_table) if table_items.get(alias)),
                 None,
             )
             if not reference_item:
@@ -1900,15 +2006,11 @@ def _filter_schema_scan_for_policy(
             reference_columns = [
                 column
                 for column in reference_item.get('columns') or []
-                if isinstance(column, dict)
-                and isinstance(column.get('name'), str)
-                and column.get('name')
+                if isinstance(column, dict) and isinstance(column.get('name'), str) and column.get('name')
             ]
             reference_available = [str(column.get('name')) for column in reference_columns]
             try:
-                reference_visible = set(
-                    _allowed_output_columns(connector, reference_table, None, reference_available)
-                )
+                reference_visible = set(_allowed_output_columns(connector, reference_table, None, reference_available))
             except Exception:
                 continue
             if reference_column not in reference_visible:
@@ -1925,16 +2027,37 @@ def _filter_schema_scan_for_policy(
         schemas.append(
             {
                 'table': table_name,
+                'schema': item.get('schema'),
+                'name': item.get('name') or table_name,
+                'type': item.get('type') or 'BASE TABLE',
+                'description': item.get('description') or '',
                 'columns': [
                     {
                         'name': column.get('name'),
                         'type': column.get('type'),
                         'primary_key': bool(column.get('primary_key')),
+                        'nullable': bool(column.get('nullable', True)),
+                        'unique': bool(column.get('unique')),
+                        'description': column.get('description') or '',
+                        **({'default': column.get('default')} if column.get('default') is not None else {}),
+                        **(
+                            {'allowed_values': list(column.get('allowed_values') or [])}
+                            if column.get('allowed_values')
+                            else {}
+                        ),
                     }
                     for column in columns
                     if column.get('name') in visible_columns
                 ],
                 'primary_key': primary_key,
+                'unique_keys': [
+                    {
+                        'name': key.get('name'),
+                        'columns': [column for column in key.get('columns') or [] if column in visible_columns],
+                    }
+                    for key in item.get('unique_keys') or []
+                    if key.get('columns') and all(column in visible_columns for column in key.get('columns') or [])
+                ],
                 'foreign_keys': foreign_keys,
             }
         )
@@ -2008,7 +2131,11 @@ async def interact_database_query(
     """
     Query rows from an authorized Interact Vision data connector using a safe read-only builder.
     This tool does not accept raw SQL and does not have a sql parameter.
-    Use interact_database_schema first when unsure, then call this tool with table, operation, columns, filters, order_by, group_by, and limit.
+    Use interact_database_schema first when unsure, then call this tool with table, operation,
+    columns, filters, order_by, group_by, and limit.
+    For business metrics, rankings, or analytics, call interact_semantic_catalog first and use
+    interact_semantic_query when a dataset is returned. Never use this raw table tool to bypass
+    an empty or unauthorized semantic catalog result.
     Supported operations are "select" and "count". Use operation="count" for "how many", totals, and grouped counts.
     Example: table="crm.users", columns=["name","department","role","email"], filters={"active": true}, order_by=[{"column":"id","direction":"asc"}], limit=10.
     Count example: table="v_customer_summary", operation="count".
@@ -2018,7 +2145,7 @@ async def interact_database_query(
     :param table: Allowed table name to read.
     :param operation: "select" to return rows, or "count" to return COUNT(*) with optional group_by.
     :param columns: Optional list of columns to return. Connector policy is always enforced.
-    :param filters: Optional equality/range filters, e.g. {"email": {"$contains": "@example.com"}, "role": "user"}.
+    :param filters: Optional safe filters, for example email $contains, id $in, or direct equality values.
     :param order_by: Optional safe sort list, e.g. [{"column": "follow_up_at", "direction": "desc"}].
     :param group_by: Optional grouping columns for operation="count".
     :param limit: Maximum rows to return, capped by connector policy.
@@ -2026,12 +2153,14 @@ async def interact_database_query(
     """
     ctx = _context(__user__, __metadata__)
     row_count = 0
+    resolved_connector_id = connector_id
     try:
         await _resolve_context_groups(ctx)
         operation = (operation or 'select').strip().lower()
         if operation not in {'select', 'count'}:
             raise ValueError('Unsupported operation. Use "select" or "count".')
         connector = await _load_connector(connector_id, ctx)
+        resolved_connector_id = connector.id
         if not _connector_context_allowed(connector, ctx):
             raise PermissionError('This user/model/channel is not allowed to use the data connector.')
         if connector.allow_write:
@@ -2073,7 +2202,7 @@ async def interact_database_query(
         await _record_event(connector.id, ctx, table, 'success', row_count=row_count)
         return _json_result({'ok': True, **result})
     except Exception as error:
-        await _record_event(connector_id, ctx, table, 'error', row_count=row_count, error=str(error))
+        await _record_event(resolved_connector_id, ctx, table, 'error', row_count=row_count, error=str(error))
         return _json_result(_database_error_result(error))
 
 

@@ -1,7 +1,31 @@
 import json
 
-from open_webui.routers.interact_channels import _channel_runtime_failure, _rate_limit_text, _tool_failure_from_items
-from open_webui.tools.interact_database import _database_error_result
+import pytest
+from open_webui.routers.interact_channels import (
+    _channel_runtime_failure,
+    _rate_limit_text,
+    _tool_failure_from_items,
+)
+from open_webui.tools.interact_database import _build_where_sql, _database_error_result
+
+
+def test_database_filter_builder_supports_parameterized_in_and_not_in_lists():
+    where_sql, values = _build_where_sql(
+        lambda value: f'"{value}"',
+        {
+            'id': {'$in': [8, 14, 20]},
+            'status': {'$nin': ['disabled', 'deleted']},
+        },
+    )
+
+    assert where_sql == ' WHERE "id" IN (?, ?, ?) AND "status" NOT IN (?, ?)'
+    assert values == [8, 14, 20, 'disabled', 'deleted']
+
+
+@pytest.mark.parametrize('operand', [[], '1,2,3', list(range(101))])
+def test_database_filter_builder_rejects_unsafe_in_lists(operand):
+    with pytest.raises(ValueError):
+        _build_where_sql(lambda value: f'"{value}"', {'id': {'$in': operand}})
 
 
 def test_database_errors_have_stable_public_codes():

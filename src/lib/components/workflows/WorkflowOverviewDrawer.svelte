@@ -2,6 +2,9 @@
 	import { tick } from 'svelte';
 	import type { WorkflowResponse } from '$lib/apis/workflows';
 	import { models } from '$lib/stores';
+	import { normalizeWorkflowLaunch, workflowLaunchSummary } from './workflowLaunch';
+	import { WORKFLOW_NODE_BY_TYPE } from './workflowNodeCatalog';
+	import XMark from '$lib/components/icons/XMark.svelte';
 
 	export let workflow: WorkflowResponse | null = null;
 	export let canManage = false;
@@ -16,6 +19,7 @@
 
 	const modelLabel = (modelId: string) =>
 		$models?.find((model) => model.id === modelId)?.name || modelId;
+	const nodeLabel = (type: string) => WORKFLOW_NODE_BY_TYPE.get(type)?.label || type;
 
 	$: nodes = workflow?.graph?.nodes ?? [];
 	$: nodeTypes = [...new Set(nodes.map((node) => node?.data?.type).filter(Boolean))];
@@ -58,6 +62,7 @@
 			'file_output'
 		].includes(type)
 	);
+	$: launch = workflow ? normalizeWorkflowLaunch(workflow) : null;
 </script>
 
 <svelte:window on:keydown={(event) => event.key === 'Escape' && workflow && onClose()} />
@@ -90,8 +95,11 @@
 				<button
 					class="rounded-lg p-2 text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-900"
 					aria-label="關閉概覽"
-					on:click={onClose}>✕</button
+					title="關閉概覽"
+					on:click={onClose}
 				>
+					<XMark className="size-4" />
+				</button>
 			</header>
 
 			<div class="space-y-6 p-5">
@@ -149,15 +157,27 @@
 				</section>
 
 				<section class="space-y-2">
+					<h3 class="text-sm font-semibold text-gray-900 dark:text-gray-100">啟動方式</h3>
+					<div class="rounded-lg bg-blue-50 px-3 py-2 dark:bg-blue-950/40">
+						<div class="text-sm font-medium text-blue-800 dark:text-blue-100">
+							{workflowLaunchSummary(workflow)}
+						</div>
+						<div class="mt-1 text-xs leading-5 text-blue-700 dark:text-blue-200">
+							{launch?.instruction}
+						</div>
+					</div>
+				</section>
+
+				<section class="space-y-2">
 					<h3 class="text-sm font-semibold text-gray-900 dark:text-gray-100">互動能力</h3>
 					<div class="flex flex-wrap gap-2">
 						{#each inputTypes as type}<span
 								class="rounded-full bg-blue-50 px-2.5 py-1 text-xs text-blue-700 dark:bg-blue-950 dark:text-blue-200"
-								>輸入 · {type}</span
+								>輸入 · {nodeLabel(type)}</span
 							>{/each}
 						{#each outputTypes as type}<span
 								class="rounded-full bg-green-50 px-2.5 py-1 text-xs text-green-700 dark:bg-green-950 dark:text-green-200"
-								>輸出 · {type}</span
+								>輸出 · {nodeLabel(type)}</span
 							>{/each}
 					</div>
 					{#if channels.length}<div class="text-xs text-gray-500">
@@ -172,7 +192,7 @@
 							<li class="flex gap-3 text-sm">
 								<span class="text-gray-400">{index + 1}</span><span
 									><span class="font-medium"
-										>{node?.data?.label || node?.data?.type || node.id}</span
+										>{node?.data?.label || nodeLabel(node?.data?.type || '') || node.id}</span
 									>{#if node?.data?.description}<span
 											class="mt-0.5 block text-xs leading-5 text-gray-500"
 											>{node.data.description}</span
@@ -199,7 +219,7 @@
 					title={workflow.visibility === 'public_template'
 						? '公開範本需先複製到企業空間才能執行'
 						: undefined}
-					on:click={() => onUse(workflow)}>在聊天中使用</button
+					on:click={() => onUse(workflow)}>{launch?.buttonLabel ?? '在聊天中使用'}</button
 				>
 			</footer>
 		</div>

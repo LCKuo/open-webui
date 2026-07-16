@@ -36,7 +36,7 @@
 {#if change}
 	<dialog
 		bind:this={dialog}
-		class="w-[calc(100%_-_2rem)] max-w-lg rounded-lg border-0 bg-white p-5 text-gray-900 shadow-xl backdrop:bg-black/50 dark:bg-gray-900 dark:text-gray-100"
+		class="fixed left-1/2 top-1/2 m-0 max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 overflow-y-auto overscroll-contain rounded-lg border-0 bg-white p-5 text-gray-900 shadow-xl backdrop:bg-black/50 dark:bg-gray-900 dark:text-gray-100"
 		aria-labelledby="permission-review-title"
 		aria-describedby="permission-review-description"
 		on:cancel={onCancel}

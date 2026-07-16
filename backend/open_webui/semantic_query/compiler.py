@@ -125,8 +125,14 @@ class SemanticCompiler:
 
         filter_conditions = list(plan.filters.conditions if plan.filters else [])
         policy_conditions = [FilterCondition.model_validate(item) for item in row_filters or []]
+        internal_filter_conditions = [
+            FilterCondition.model_validate(condition)
+            for measure in [*selected_measures, *metric_measures]
+            for condition in measure.get('filters') or []
+        ]
         filter_fields = [self._semantic_field(item.fieldId, filterable=True) for item in filter_conditions]
         filter_fields.extend(self._policy_field(item.fieldId) for item in policy_conditions)
+        filter_fields.extend(self._field(item.fieldId, filterable=True) for item in internal_filter_conditions)
         required_objects = {
             field['object_id'] for field in [*dimension_fields, *filter_fields, *([time_field] if time_field else [])]
         }
@@ -162,7 +168,10 @@ class SemanticCompiler:
             internal_filters = measure.get('filters') or []
             if internal_filters:
                 predicate = self._conditions(
-                    [FilterCondition.model_validate(item) for item in internal_filters], aliases, 'and'
+                    [FilterCondition.model_validate(item) for item in internal_filters],
+                    aliases,
+                    'and',
+                    catalog=True,
                 )
                 if aggregation in {'sum', 'avg', 'min', 'max'}:
                     inner = column if aggregation != 'count' else '1'
@@ -262,6 +271,11 @@ class SemanticCompiler:
             raise SemanticQueryError('SEMANTIC-FIELD-NOT-ALLOWED', 'Field belongs to a disabled catalog object.')
         return field
 
+    def _relationship_field(self, field_id: str):
+        # Relationship keys are structural metadata. They may be used in a
+        # confirmed JOIN without making the key selectable by agents or users.
+        return self._field(field_id, readable=False)
+
     def _dimension(self, semantic_id: str):
         item = self.dimensions.get(semantic_id)
         if not item:
@@ -358,8 +372,8 @@ class SemanticCompiler:
                 if next_object not in joined:
                     conditions = []
                     for pair in relationship.get('join_pairs') or []:
-                        left = self._field(pair['leftFieldId'])
-                        right = self._field(pair['rightFieldId'])
+                        left = self._relationship_field(pair['leftFieldId'])
+                        right = self._relationship_field(pair['rightFieldId'])
                         conditions.append(f'{self._column(left, aliases)} = {self._column(right, aliases)}')
                     if not conditions:
                         raise SemanticQueryError('SEMANTIC-RELATIONSHIP-MISSING', 'Relationship has no join fields.')
@@ -397,14 +411,24 @@ class SemanticCompiler:
         operator: str,
         *,
         policy: bool = False,
+        catalog: bool = False,
     ):
-        sql = [self._condition(item, aliases, policy=policy) for item in conditions]
+        sql = [self._condition(item, aliases, policy=policy, catalog=catalog) for item in conditions]
         return '(' + f' {operator.upper()} '.join(sql) + ')'
 
-    def _condition(self, condition: FilterCondition, aliases: dict[str, str], *, policy: bool = False) -> str:
+    def _condition(
+        self,
+        condition: FilterCondition,
+        aliases: dict[str, str],
+        *,
+        policy: bool = False,
+        catalog: bool = False,
+    ) -> str:
         field = (
             self._policy_field(condition.fieldId)
             if policy
+            else self._field(condition.fieldId, filterable=True)
+            if catalog
             else self._semantic_field(condition.fieldId, filterable=True)
         )
         column = self._column(field, aliases)

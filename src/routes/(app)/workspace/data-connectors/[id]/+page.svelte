@@ -52,6 +52,7 @@
 		| 'overview'
 		| 'catalog'
 		| 'relationships'
+		| 'ai-import'
 		| 'datasets'
 		| 'policies'
 		| 'lab'
@@ -62,8 +63,9 @@
 		{ id: 'overview', label: '概覽' },
 		{ id: 'catalog', label: '資料目錄' },
 		{ id: 'relationships', label: '關聯' },
+		{ id: 'ai-import', label: 'AI 匯入' },
 		{ id: 'datasets', label: '語意資料集' },
-		{ id: 'policies', label: '資料列權限' },
+		{ id: 'policies', label: '可見資料範圍（選用）' },
 		{ id: 'lab', label: '查詢實驗室' },
 		{ id: 'activity', label: '活動紀錄' }
 	];
@@ -111,7 +113,6 @@
 	let datasetDefinition: SemanticDatasetDefinition = {};
 	let datasetFormInitialized = false;
 	let savedDatasetSignature = '';
-	let datasetImportOpen = false;
 	let datasetImportJson = '';
 	let datasetImportBusy = false;
 	let datasetImportErrors: SemanticDatasetImportIssue[] = [];
@@ -241,6 +242,15 @@
 	const fieldLabel = (field: CatalogField) => field.display_name || field.physical_name;
 	const objectName = (id: string) =>
 		catalog.objects.find((item) => item.id === id)?.display_name ?? id;
+	const datasetAccessLabel = (mode: string) => {
+		const labels: Record<string, string> = {
+			company_admins: '僅企業管理員',
+			all_company_members: '所有企業成員',
+			selected_members: '指定成員或群組',
+			selected_channels: '指定渠道'
+		};
+		return labels[mode] ?? mode;
+	};
 	const time = (value?: number | null) => (value ? new Date(value * 1000).toLocaleString() : '-');
 	const safeReturnUrl = (value: string | null) => {
 		if (!value) return '';
@@ -400,16 +410,19 @@
 		resetDatasetImportResult();
 		datasetImportStatus = `已載入 ${file.name}，請先檢查 JSON。`;
 	};
-	const downloadJson = (document: Record<string, unknown>, filename: string) => {
-		const blob = new Blob([JSON.stringify(document, null, 2)], {
+	const downloadJson = (payload: Record<string, unknown>, filename: string) => {
+		const blob = new Blob([JSON.stringify(payload, null, 2)], {
 			type: 'application/json'
 		});
 		const url = URL.createObjectURL(blob);
-		const link = document.createElement('a');
+		const link = window.document.createElement('a');
 		link.href = url;
 		link.download = filename;
+		link.style.display = 'none';
+		window.document.body.appendChild(link);
 		link.click();
-		URL.revokeObjectURL(url);
+		link.remove();
+		window.setTimeout(() => URL.revokeObjectURL(url), 0);
 	};
 	const downloadDatasetImportTemplate = () =>
 		downloadJson(portableDatasetTemplate, 'semantic-dataset-template.json');
@@ -561,34 +574,26 @@
 			toast.error(`無法重新載入權限狀態：${error}`);
 		}
 	};
-	const applyDatasetImport = () => {
+	const applyDatasetImport = async () => {
 		const payload = datasetImportCandidate;
 		if (!payload || !datasetImportCanApply || !confirmDiscardDatasetChanges()) return;
-		editingDatasetId = '';
-		datasetName = payload.name;
-		datasetSlug = payload.slug;
-		datasetDescription = payload.description;
-		datasetDomain = payload.business_domain ?? '';
-		datasetAccessMode = payload.access_mode;
-		datasetDefinition = structuredClone(payload.definition);
-		datasetWhenToUse = payload.definition.whenToUse ?? '';
-		datasetNotFor = (payload.definition.notFor ?? []).join(', ');
-		datasetExamples = (payload.definition.examples ?? []).join('\n');
-		datasetSynonyms = (payload.definition.synonyms ?? []).join(', ');
-		rootObjectId = payload.definition.rootObjectId ?? '';
-		dimensionFieldIds = payload.definition.dimensions?.map((item) => item.fieldId) ?? [];
-		measureFieldIds = payload.definition.measures?.map((item) => item.fieldId) ?? [];
-		relationshipIds = payload.definition.relationshipIds ?? [];
-		allowedMemberIds = payload.allowed_member_ids.join(', ');
-		allowedGroupIds = payload.allowed_group_ids.join(', ');
-		allowedModelIds = payload.allowed_model_ids.join(', ');
-		allowedChannelIds = payload.allowed_channel_ids.join(', ');
-		allowedWorkflowIds = payload.allowed_workflow_ids.join(', ');
-		datasetVersions = [];
-		datasetFormInitialized = true;
-		savedDatasetSignature = '__imported_new_draft__';
-		datasetImportOpen = false;
-		toast.success('JSON 已套用為新的資料集草稿，尚未儲存或發布。');
+		datasetImportBusy = true;
+		datasetImportStatus = '正在建立語意資料集草稿...';
+		try {
+			const result = await saveSemanticDataset(localStorage.token, payload);
+			await load();
+			editDataset(result.dataset);
+			datasetImportJson = '';
+			resetDatasetImportResult();
+			toast.success('JSON 已匯入並建立資料集草稿。');
+		} catch (error) {
+			const message = `${error}`;
+			datasetImportStatus = '資料集尚未建立，請修正下列問題後再試一次。';
+			datasetImportErrors = [{ code: 'IMPORT-CREATE-FAILED', path: 'dataset', message }];
+			toast.error(`無法建立資料集草稿：${message}`);
+		} finally {
+			datasetImportBusy = false;
+		}
 	};
 
 	const load = async () => {
@@ -1080,7 +1085,7 @@
 			});
 			policyName = '';
 			await loadPolicies();
-			toast.success('資料列權限已儲存');
+			toast.success('可見資料範圍規則已儲存');
 		} catch (error) {
 			toast.error(`${error}`);
 		} finally {
@@ -1499,6 +1504,157 @@
 						</div>{/each}
 				</div>{/if}
 		</section>
+	{:else if activeTab === 'ai-import'}
+		<section class="space-y-5" aria-labelledby="ai-import-heading">
+			<div
+				class="flex flex-col gap-4 border-b border-gray-200 pb-5 dark:border-gray-800 md:flex-row md:items-start md:justify-between"
+			>
+				<div class="max-w-2xl">
+					<h2 id="ai-import-heading" class="text-lg font-semibold">使用 AI 建立語意資料集</h2>
+					<p class="mt-1 text-sm text-gray-500">
+						匯出不含帳密與資料列的 Schema 交接包，自行交給選定的 AI，再回到這裡匯入並逐項審核權限。
+					</p>
+				</div>
+				<div class="flex shrink-0 flex-wrap gap-2">
+					<button
+						type="button"
+						class="h-9 rounded-lg bg-sky-600 px-3 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+						disabled={datasetHandoffBusy || !catalog.snapshotId}
+						on:click={downloadAiSchemaHandoff}
+						>{datasetHandoffBusy ? '匯出中...' : '匯出 AI Schema 交接包'}</button
+					>
+					<button
+						type="button"
+						class="h-9 rounded-lg border border-gray-200 px-3 text-sm font-medium hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-900"
+						on:click={downloadDatasetImportTemplate}>下載通用範本</button
+					>
+				</div>
+			</div>
+
+			{#if !catalog.snapshotId}
+				<div
+					class="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+				>
+					尚未建立 Schema snapshot。請先到「概覽」執行掃描，才能匯出與驗證資料集。
+				</div>
+			{/if}
+
+			<ol class="grid gap-3 text-sm sm:grid-cols-3">
+				<li class="rounded-lg border border-sky-200 p-4 dark:border-sky-900">
+					<strong class="block text-gray-900 dark:text-gray-100">1. 匯出資料庫結構</strong>
+					<p class="mt-1 text-xs text-gray-500">包含已／未授權物件、欄位、關聯與 AI 編寫規格。</p>
+				</li>
+				<li class="rounded-lg border border-gray-200 p-4 dark:border-gray-800">
+					<strong class="block text-gray-900 dark:text-gray-100">2. 自行交給 AI</strong>
+					<p class="mt-1 text-xs text-gray-500">
+						描述商業問題，請 AI 只回傳交接包規格指定的 JSON。
+					</p>
+				</li>
+				<li class="rounded-lg border border-gray-200 p-4 dark:border-gray-800">
+					<strong class="block text-gray-900 dark:text-gray-100">3. 匯入並審核</strong>
+					<p class="mt-1 text-xs text-gray-500">系統重新驗證，任何權限變更都會逐項徵求同意。</p>
+				</li>
+			</ol>
+
+			<div class="space-y-4 rounded-lg border border-gray-200 p-5 dark:border-gray-800">
+				<div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+					<div>
+						<h3 class="font-semibold">匯入 AI 建議 JSON</h3>
+						<p class="mt-1 text-xs text-gray-500">可選擇 JSON 檔案或直接貼上內容；上限 500 KB。</p>
+					</div>
+					<label
+						class="inline-flex h-9 cursor-pointer items-center justify-center rounded-lg border border-gray-200 px-3 text-sm font-medium hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-900"
+					>
+						選擇 JSON 檔
+						<input
+							type="file"
+							class="sr-only"
+							accept="application/json,.json"
+							on:change={readDatasetImportFile}
+						/>
+					</label>
+				</div>
+				<label class="block space-y-1">
+					<span class="text-xs font-medium">AI 建議的語意資料集 JSON</span>
+					<textarea
+						class="min-h-72 w-full rounded-lg border border-gray-200 bg-transparent p-3 font-mono text-xs dark:border-gray-700"
+						bind:value={datasetImportJson}
+						spellcheck="false"
+						placeholder="貼上 interact-semantic-dataset v1 JSON，或選擇檔案"
+						on:input={resetDatasetImportResult}
+					></textarea>
+				</label>
+				{#if datasetImportStatus}<p class="text-sm" aria-live="polite">
+						{datasetImportStatus}
+					</p>{/if}
+				{#if datasetImportErrors.length}
+					<div
+						class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200"
+						role="alert"
+					>
+						<p class="font-medium">需要修正 {datasetImportErrors.length} 個問題</p>
+						<ul class="mt-2 space-y-1 text-xs">
+							{#each datasetImportErrors.slice(0, 20) as issue}
+								<li><span class="font-mono">{issue.path}</span>：{issue.message}</li>
+							{/each}
+						</ul>
+					</div>
+				{/if}
+				{#if datasetImportWarnings.length}
+					<div
+						class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+					>
+						{#each datasetImportWarnings as issue}<p>{issue.path}：{issue.message}</p>{/each}
+					</div>
+				{/if}
+				{#if permissionReviewChanges.length}
+					<div
+						class="flex flex-col gap-3 rounded-lg border border-gray-200 p-3 text-sm dark:border-gray-700 sm:flex-row sm:items-center sm:justify-between"
+					>
+						<div>
+							<p class="font-medium">
+								權限審核：已處理 {permissionReviewChanges.filter(
+									(change) => permissionReviewDecisions[change.id]
+								).length} / {permissionReviewChanges.length}
+							</p>
+							<p class="mt-1 text-xs text-gray-500">
+								必要授權若略過，資料集不會匯入；AI 額外建議可安全略過。
+							</p>
+						</div>
+						{#if !permissionReviewComplete}
+							<button
+								type="button"
+								class="h-9 shrink-0 rounded-lg bg-gray-900 px-3 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
+								on:click={() => {
+									permissionReviewIndex = Math.max(
+										0,
+										permissionReviewChanges.findIndex(
+											(change) => !permissionReviewDecisions[change.id]
+										)
+									);
+									permissionReviewOpen = true;
+								}}>繼續逐項審核</button
+							>
+						{/if}
+					</div>
+				{/if}
+				<div class="flex flex-wrap justify-end gap-2">
+					<button
+						type="button"
+						class="h-9 rounded-lg border border-sky-600 px-3 text-sm font-medium text-sky-700 disabled:opacity-50 dark:text-sky-300"
+						disabled={datasetImportBusy || !datasetImportJson.trim() || !catalog.snapshotId}
+						on:click={inspectDatasetImport}>{datasetImportBusy ? '檢查中...' : '檢查 JSON'}</button
+					>
+					<button
+						type="button"
+						class="h-9 rounded-lg bg-sky-600 px-3 text-sm font-medium text-white disabled:opacity-50"
+						disabled={!datasetImportCanApply || datasetImportBusy}
+						on:click={applyDatasetImport}
+						>{datasetImportBusy ? '建立中...' : '建立資料集草稿'}</button
+					>
+				</div>
+			</div>
+		</section>
 	{:else if activeTab === 'datasets'}
 		<section class="grid min-w-0 gap-5 lg:grid-cols-[320px_1fr]">
 			<div class="space-y-2">
@@ -1559,14 +1715,6 @@
 						</p>
 					</div>
 					<div class="flex items-center gap-3">
-						<button
-							type="button"
-							class="text-sm font-medium text-sky-700 dark:text-sky-300"
-							on:click={() => {
-								datasetImportOpen = !datasetImportOpen;
-								if (!datasetImportOpen) resetDatasetImportResult();
-							}}>匯入 JSON</button
-						>
 						{#if editingDatasetId}<button
 								type="button"
 								class="text-sm text-red-600"
@@ -1576,149 +1724,6 @@
 							>{/if}
 					</div>
 				</div>
-				{#if datasetImportOpen}
-					<section
-						class="space-y-3 rounded-lg border border-sky-200 bg-sky-50/50 p-4 dark:border-sky-900 dark:bg-sky-950/20"
-						aria-labelledby="dataset-import-heading"
-					>
-						<div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-							<div>
-								<h3 id="dataset-import-heading" class="text-sm font-semibold">
-									讓 AI 協助建立語意資料集
-								</h3>
-								<p class="mt-1 text-xs text-gray-600 dark:text-gray-400">
-									Schema 由您自行交給選定的 AI；WebUI 不會將資料傳送給任何模型。
-								</p>
-							</div>
-							<div class="flex shrink-0 flex-wrap gap-2">
-								<button
-									type="button"
-									class="h-8 rounded-lg bg-sky-600 px-3 text-xs font-medium text-white disabled:opacity-50"
-									disabled={datasetHandoffBusy || !catalog.snapshotId}
-									on:click={downloadAiSchemaHandoff}
-									>{datasetHandoffBusy ? '匯出中...' : '匯出 AI Schema 交接包'}</button
-								>
-								<button
-									type="button"
-									class="h-8 rounded-lg border border-gray-200 bg-white px-3 text-xs font-medium dark:border-gray-700 dark:bg-gray-900"
-									on:click={downloadDatasetImportTemplate}>下載通用範本</button
-								>
-								<label
-									class="flex h-8 cursor-pointer items-center rounded-lg border border-gray-200 bg-white px-3 text-xs font-medium dark:border-gray-700 dark:bg-gray-900"
-								>
-									選擇 JSON 檔
-									<input
-										type="file"
-										class="sr-only"
-										accept="application/json,.json"
-										on:change={readDatasetImportFile}
-									/>
-								</label>
-							</div>
-						</div>
-						<ol class="grid gap-2 text-xs text-gray-600 dark:text-gray-300 sm:grid-cols-3">
-							<li class="border-l-2 border-sky-500 pl-2">
-								<strong class="block text-gray-900 dark:text-gray-100">1. 匯出結構</strong>
-								包含已／未授權物件、欄位、關聯與 AI 編寫規格，不包含帳密或資料列。
-							</li>
-							<li class="border-l-2 border-gray-300 pl-2 dark:border-gray-700">
-								<strong class="block text-gray-900 dark:text-gray-100">2. 自行交給 AI</strong>
-								描述想回答的商業問題，請 AI 只回傳規格指定的單一 JSON。
-							</li>
-							<li class="border-l-2 border-gray-300 pl-2 dark:border-gray-700">
-								<strong class="block text-gray-900 dark:text-gray-100">3. 匯入並審核</strong>
-								系統重新驗證並逐項詢問權限；未經同意不會開啟或關閉。
-							</li>
-						</ol>
-						<label class="block space-y-1">
-							<span class="text-xs font-medium">AI 建議的語意資料集 JSON</span>
-							<textarea
-								class="min-h-56 w-full rounded-lg border border-gray-200 bg-white p-3 font-mono text-xs dark:border-gray-700 dark:bg-gray-950"
-								bind:value={datasetImportJson}
-								spellcheck="false"
-								placeholder="貼上 interact-semantic-dataset v1 JSON，或選擇檔案"
-								on:input={resetDatasetImportResult}
-							></textarea>
-						</label>
-						{#if datasetImportStatus}
-							<p class="text-sm" aria-live="polite">{datasetImportStatus}</p>
-						{/if}
-						{#if datasetImportErrors.length}
-							<div
-								class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200"
-								role="alert"
-							>
-								<p class="font-medium">需要修正 {datasetImportErrors.length} 個問題</p>
-								<ul class="mt-2 space-y-1 text-xs">
-									{#each datasetImportErrors.slice(0, 20) as issue}
-										<li><span class="font-mono">{issue.path}</span>：{issue.message}</li>
-									{/each}
-								</ul>
-							</div>
-						{/if}
-						{#if datasetImportWarnings.length}
-							<div
-								class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
-							>
-								{#each datasetImportWarnings as issue}<p>{issue.path}：{issue.message}</p>{/each}
-							</div>
-						{/if}
-						{#if permissionReviewChanges.length}
-							<div
-								class="flex flex-col gap-3 rounded-lg border border-gray-200 bg-white p-3 text-sm dark:border-gray-700 dark:bg-gray-900 sm:flex-row sm:items-center sm:justify-between"
-							>
-								<div>
-									<p class="font-medium">
-										權限審核：已處理 {permissionReviewChanges.filter(
-											(change) => permissionReviewDecisions[change.id]
-										).length} / {permissionReviewChanges.length}
-									</p>
-									<p class="mt-1 text-xs text-gray-500">
-										必要授權若略過，資料集不會匯入；AI 額外建議可安全略過。
-									</p>
-								</div>
-								{#if !permissionReviewComplete}
-									<button
-										type="button"
-										class="h-9 shrink-0 rounded-lg bg-gray-900 px-3 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
-										on:click={() => {
-											permissionReviewIndex = Math.max(
-												0,
-												permissionReviewChanges.findIndex(
-													(change) => !permissionReviewDecisions[change.id]
-												)
-											);
-											permissionReviewOpen = true;
-										}}>繼續逐項審核</button
-									>
-								{/if}
-							</div>
-						{/if}
-						<div class="flex flex-wrap justify-end gap-2">
-							<button
-								type="button"
-								class="h-9 rounded-lg border border-gray-200 bg-white px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
-								on:click={() => {
-									datasetImportOpen = false;
-									resetDatasetImportResult();
-								}}>取消</button
-							>
-							<button
-								type="button"
-								class="h-9 rounded-lg border border-sky-600 px-3 text-sm font-medium text-sky-700 disabled:opacity-50 dark:text-sky-300"
-								disabled={datasetImportBusy || !datasetImportJson.trim()}
-								on:click={inspectDatasetImport}
-								>{datasetImportBusy ? '檢查中...' : '檢查 JSON'}</button
-							>
-							<button
-								type="button"
-								class="h-9 rounded-lg bg-sky-600 px-3 text-sm font-medium text-white disabled:opacity-50"
-								disabled={!datasetImportCanApply || datasetImportBusy}
-								on:click={applyDatasetImport}>套用為新草稿</button
-							>
-						</div>
-					</section>
-				{/if}
 				<div class="grid gap-4 sm:grid-cols-2">
 					<label class="space-y-1"
 						><span class="text-sm font-medium">名稱</span><input
@@ -1957,10 +1962,29 @@
 	{:else if activeTab === 'policies'}
 		<section class="space-y-5">
 			<div>
-				<h2 class="text-lg font-semibold">資料列權限</h2>
+				<h2 class="text-lg font-semibold">限制可見資料範圍（選用）</h2>
 				<p class="text-sm text-gray-500">
-					權限會在 SQL 編譯前強制加入；必要 context 缺失時預設拒絕，不會放寬查詢。
+					在同一個語意資料集內，限制不同成員、群組、渠道或模型可以查到哪些資料列。
 				</p>
+			</div>
+			<div
+				class="space-y-2 rounded-lg border border-sky-200 bg-sky-50 p-4 text-sm text-sky-950 dark:border-sky-900 dark:bg-sky-950/30 dark:text-sky-100"
+			>
+				<p class="font-medium">多數資料集不需要設定這裡</p>
+				<p>
+					沒有任何已啟用規則時，通過資料集存取設定的對象可以查詢全部資料列。只有在同公司內需要依員工、部門或渠道分隔資料時才新增規則。
+				</p>
+				<p>
+					開始啟用規則後，不符合任何規則的請求會被拒絕；規則使用的 context
+					若無法解析，也會安全拒絕，不會放寬查詢。
+				</p>
+				{#if selectedPolicyDataset}
+					<p class="border-t border-sky-200 pt-2 font-medium dark:border-sky-900">
+						目前「{selectedPolicyDataset.name}」的資料集存取範圍：{datasetAccessLabel(
+							selectedPolicyDataset.access_mode
+						)}。
+					</p>
+				{/if}
 			</div>
 			<label class="block max-w-md space-y-1"
 				><span class="text-sm font-medium">資料集</span><select
@@ -1976,7 +2000,7 @@
 						class="space-y-4 rounded-lg border border-gray-200 p-4 dark:border-gray-800"
 						on:submit|preventDefault={createPolicy}
 					>
-						<h3 class="font-semibold">新增權限</h3>
+						<h3 class="font-semibold">新增資料範圍規則</h3>
 						<label class="block space-y-1"
 							><span class="text-sm">名稱</span><input
 								class="h-10 w-full rounded-lg border border-gray-200 bg-transparent px-3 dark:border-gray-700"
@@ -2029,11 +2053,11 @@
 							>
 						</div>
 						<label class="flex items-center gap-2 text-sm"
-							><input type="checkbox" bind:checked={policyPublished} />立即啟用此權限</label
+							><input type="checkbox" bind:checked={policyPublished} />立即啟用此規則</label
 						><button
 							type="submit"
 							class="h-10 rounded-lg bg-gray-900 px-4 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
-							disabled={busy}>儲存權限</button
+							disabled={busy}>儲存規則</button
 						>
 					</form>
 					<div class="space-y-2">
@@ -2065,7 +2089,7 @@
 									type="button"
 									class="mt-2 text-xs text-red-600"
 									on:click={async () => {
-										if (confirm('確定刪除此資料列權限？')) {
+										if (confirm('確定刪除此可見資料範圍規則？')) {
 											await deleteRowPolicy(localStorage.token, selectedPolicyDatasetId, policy.id);
 											await loadPolicies();
 										}
@@ -2074,7 +2098,7 @@
 							</div>{/each}{#if !policies.length}<div
 								class="border border-dashed border-gray-300 p-6 text-center text-sm text-gray-500"
 							>
-								尚未設定資料列權限。
+								尚未設定規則。目前通過資料集存取設定的對象可以查詢全部資料列。
 							</div>{/if}
 					</div>
 				</div>{/if}

@@ -103,7 +103,9 @@
 	import { updateFolderById } from '$lib/apis/folders';
 	import {
 		getWorkflowById,
+		preflightWorkflowById,
 		selectAgentWorkflows,
+		type WorkflowLaunchPreflightResponse,
 		type WorkflowResponse
 	} from '$lib/apis/workflows';
 
@@ -122,7 +124,12 @@
 	import Tooltip from '../common/Tooltip.svelte';
 	import Sidebar from '../icons/Sidebar.svelte';
 	import Image from '../common/Image.svelte';
-	import SelectedWorkflowBar from '../workflows/SelectedWorkflowBar.svelte';
+	import WorkflowLaunchPanel from '../workflows/WorkflowLaunchPanel.svelte';
+	import {
+		buildWorkflowLaunchInput,
+		normalizeWorkflowLaunch,
+		type WorkflowLaunchConfig
+	} from '../workflows/workflowLaunch';
 
 	export let chatIdProp = '';
 
@@ -225,6 +232,13 @@
 	let selectedWorkflow: WorkflowResponse | null = null;
 	let selectedWorkflowVersionId: string | null = null;
 	let selectedWorkflowLoadingId: string | null = null;
+	let selectedWorkflowLaunch: WorkflowLaunchConfig | null = null;
+	let workflowLaunchValues: Record<string, unknown> = {};
+	let workflowLaunchPreflight: WorkflowLaunchPreflightResponse | null = null;
+	let workflowLaunchConfirmed = false;
+	let workflowLaunchRunning = false;
+	let workflowLaunchArmed = false;
+	let workflowLaunchAutoAttempted = false;
 
 	const loadSelectedWorkflow = async (workflowId: string, versionId: string | null) => {
 		if (!workflowId || selectedWorkflowLoadingId === workflowId) return;
@@ -236,9 +250,17 @@
 			}
 			selectedWorkflow = workflow;
 			selectedWorkflowVersionId = versionId || workflow.default_version_id;
+			selectedWorkflowLaunch = normalizeWorkflowLaunch(workflow);
+			workflowLaunchValues = { ...selectedWorkflowLaunch.defaultInput };
+			delete workflowLaunchValues.message;
+			workflowLaunchPreflight = null;
+			workflowLaunchConfirmed = false;
+			workflowLaunchArmed = false;
+			workflowLaunchAutoAttempted = false;
 		} catch (error) {
 			selectedWorkflow = null;
 			selectedWorkflowVersionId = null;
+			selectedWorkflowLaunch = null;
 			toast.error(`${error}`);
 		} finally {
 			selectedWorkflowLoadingId = null;
@@ -248,6 +270,13 @@
 	const clearSelectedWorkflow = () => {
 		selectedWorkflow = null;
 		selectedWorkflowVersionId = null;
+		selectedWorkflowLaunch = null;
+		workflowLaunchValues = {};
+		workflowLaunchPreflight = null;
+		workflowLaunchConfirmed = false;
+		workflowLaunchRunning = false;
+		workflowLaunchArmed = false;
+		workflowLaunchAutoAttempted = false;
 		const url = new URL(window.location.href);
 		url.searchParams.delete('workflow');
 		url.searchParams.delete('version');
@@ -258,16 +287,56 @@
 		);
 	};
 
-	$: selectedWorkflowModelLabel = (() => {
-		const configuredModels = [
-			...new Set(
-				(selectedWorkflow?.graph?.nodes ?? [])
-					.map((node) => node?.data?.config?.model_id)
-					.filter(Boolean)
-			)
-		];
-		return configuredModels.length ? configuredModels.join(', ') : '沿用目前聊天模型';
-	})();
+	const selectedWorkflowInput = (message: string, launchFiles: any[]) =>
+		selectedWorkflowLaunch
+			? buildWorkflowLaunchInput(
+					selectedWorkflowLaunch,
+					workflowLaunchValues,
+					message,
+					launchFiles
+				)
+			: { message, data: {}, files: launchFiles };
+
+	const preflightSelectedWorkflow = async (message: string, launchFiles: any[]) => {
+		if (!selectedWorkflow || !selectedWorkflowLaunch) return null;
+		const selectedModelId = atSelectedModel?.id || selectedModels[0] || undefined;
+		const result = await preflightWorkflowById(
+			localStorage.token,
+			selectedWorkflow.id,
+			selectedWorkflowInput(message, launchFiles),
+			{
+				workflow_version_id:
+					selectedWorkflowVersionId || selectedWorkflow.default_version_id || undefined,
+				model_id: selectedModelId,
+				surface: 'webui_chat',
+				confirmed: workflowLaunchConfirmed
+			}
+		);
+		workflowLaunchPreflight = result;
+		return result;
+	};
+
+	const workflowLaunchPrompt = () => {
+		if (!selectedWorkflow || !selectedWorkflowLaunch) return '';
+		if (selectedWorkflowLaunch.mode === 'instant') return selectedWorkflowLaunch.buttonLabel;
+		const properties = selectedWorkflowLaunch.inputSchema.properties;
+		const details = Object.entries(workflowLaunchValues)
+			.filter(([, value]) => value !== undefined && value !== '' && value !== null)
+			.map(([key, value]) => `${properties[key]?.title || key}：${String(value)}`)
+			.join('\n');
+		return details ? `${selectedWorkflowLaunch.buttonLabel}\n${details}` : selectedWorkflowLaunch.buttonLabel;
+	};
+
+	const executeSelectedWorkflowLaunch = async () => {
+		if (!selectedWorkflow || !selectedWorkflowLaunch || workflowLaunchRunning) return;
+		workflowLaunchArmed = true;
+		workflowLaunchRunning = true;
+		try {
+			await submitHandler(workflowLaunchPrompt());
+		} finally {
+			workflowLaunchRunning = false;
+		}
+	};
 
 	// Read-only when viewing someone else's chat (e.g. via shared folder access)
 	$: readOnly = chat != null && chat.user_id !== $user?.id;
@@ -1015,7 +1084,15 @@
 			}
 			if (p.url.pathname === '/') {
 				await tick();
-				initNewChat();
+				await initNewChat();
+				if (
+					p.url.searchParams.get('launch') === '1' &&
+					selectedWorkflowLaunch?.mode === 'instant' &&
+					!workflowLaunchAutoAttempted
+				) {
+					workflowLaunchAutoAttempted = true;
+					setTimeout(() => void executeSelectedWorkflowLaunch(), 0);
+				}
 			}
 
 			stopAudio();
@@ -2289,11 +2366,45 @@
 			).catch(() => null);
 			if (selection?.decision === 'selected' && selection.selected_workflow_id) {
 				await loadSelectedWorkflow(selection.selected_workflow_id, selection.selected_version_id);
-				if (selectedWorkflow) {
-					toast.info(`將使用工作流「${selectedWorkflow.name}」`);
+				const activeWorkflow = selectedWorkflow as WorkflowResponse | null;
+				if (activeWorkflow) {
+					workflowLaunchArmed = selectedWorkflowLaunch?.mode === 'instant';
+					toast.info(`將使用工作流「${activeWorkflow.name}」`);
 				}
 			} else if (selection?.decision === 'ambiguous') {
 				toast.info('找到多個相近工作流，本次維持一般聊天；可從企業工作流中心明確選擇。');
+			}
+		}
+
+		if (
+			selectedWorkflow &&
+			selectedWorkflowLaunch &&
+			['instant', 'form_input'].includes(selectedWorkflowLaunch.mode) &&
+			!workflowLaunchArmed
+		) {
+			toast.info('請使用工作流啟動面板檢查條件後執行。');
+			return;
+		}
+
+		if (selectedWorkflow && selectedWorkflowLaunch) {
+			workflowLaunchRunning = true;
+			try {
+				const preflight = await preflightSelectedWorkflow(userPrompt, files);
+				if (!preflight?.ok) {
+					workflowLaunchRunning = false;
+					if (preflight?.requires_confirmation && !workflowLaunchConfirmed) {
+						toast.info('請先確認工作流的外部動作，再開始執行。');
+					} else {
+						const reason = preflight?.checks.find((check) => check.status === 'fail')?.message;
+						toast.error(reason || '工作流執行前檢查未通過。');
+					}
+					return;
+				}
+				workflowLaunchArmed = true;
+			} catch (error) {
+				workflowLaunchRunning = false;
+				toast.error(`${error}`);
+				return;
 			}
 		}
 
@@ -2304,7 +2415,24 @@
 		files = [];
 		messageInput?.setText('');
 
-		await submitPrompt(userPrompt, _files);
+		const executedLaunch = selectedWorkflowLaunch;
+		try {
+			await submitPrompt(userPrompt, _files);
+		} finally {
+			workflowLaunchRunning = false;
+		}
+		const finalMessage: any = history.currentId ? history.messages[history.currentId] : null;
+		const executionSucceeded = !finalMessage?.error;
+		if (executedLaunch && executionSucceeded) {
+			if (executedLaunch.followUpMode === 'chat_about_result') {
+				clearSelectedWorkflow();
+				toast.success('工作流已完成，接下來可針對結果繼續提問。');
+			} else {
+				workflowLaunchArmed = false;
+				workflowLaunchConfirmed = false;
+				workflowLaunchPreflight = null;
+			}
+		}
 	};
 
 	const sendMessage = async (
@@ -2676,7 +2804,13 @@
 					? {
 							id: selectedWorkflow.id,
 							versionId: selectedWorkflowVersionId || selectedWorkflow.default_version_id,
-							trigger: 'webui_chat.manual',
+							trigger: `webui_chat.${selectedWorkflowLaunch?.mode ?? 'manual'}`,
+							data: {
+								...(selectedWorkflowLaunch?.defaultInput ?? {}),
+								...workflowLaunchValues,
+								message: undefined
+							},
+							confirmed: workflowLaunchConfirmed,
 							includeChatContext: true
 						}
 					: undefined,
@@ -3383,11 +3517,24 @@
 								</div>
 							{:else}
 								<div class=" pb-2 {dragged ? 'z-0' : 'z-10'}">
-									{#if selectedWorkflow}
-										<SelectedWorkflowBar
-											name={selectedWorkflow.name}
-											description={selectedWorkflow.description || ''}
-											modelLabel={selectedWorkflowModelLabel}
+									{#if selectedWorkflow && selectedWorkflowLaunch}
+										<WorkflowLaunchPanel
+											workflow={selectedWorkflow}
+											launch={selectedWorkflowLaunch}
+											values={workflowLaunchValues}
+											fileCount={files.length}
+											running={workflowLaunchRunning}
+											confirmed={workflowLaunchConfirmed}
+											preflight={workflowLaunchPreflight}
+											onValuesChange={(next) => {
+												workflowLaunchValues = next;
+												workflowLaunchPreflight = null;
+											}}
+											onConfirmedChange={(next) => {
+												workflowLaunchConfirmed = next;
+												workflowLaunchPreflight = null;
+											}}
+											onExecute={executeSelectedWorkflowLaunch}
 											onClear={clearSelectedWorkflow}
 										/>
 									{/if}
@@ -3476,12 +3623,25 @@
 							{/if}
 						{:else}
 							<div class="flex items-center h-full">
-								{#if selectedWorkflow}
-									<div class="absolute bottom-[8.5rem] left-0 right-0 z-20 px-4">
-										<SelectedWorkflowBar
-											name={selectedWorkflow.name}
-											description={selectedWorkflow.description || ''}
-											modelLabel={selectedWorkflowModelLabel}
+								{#if selectedWorkflow && selectedWorkflowLaunch}
+									<div class="absolute bottom-[8.5rem] left-0 right-0 z-20 max-h-[65vh] overflow-y-auto px-4">
+										<WorkflowLaunchPanel
+											workflow={selectedWorkflow}
+											launch={selectedWorkflowLaunch}
+											values={workflowLaunchValues}
+											fileCount={files.length}
+											running={workflowLaunchRunning}
+											confirmed={workflowLaunchConfirmed}
+											preflight={workflowLaunchPreflight}
+											onValuesChange={(next) => {
+												workflowLaunchValues = next;
+												workflowLaunchPreflight = null;
+											}}
+											onConfirmedChange={(next) => {
+												workflowLaunchConfirmed = next;
+												workflowLaunchPreflight = null;
+											}}
+											onExecute={executeSelectedWorkflowLaunch}
 											onClear={clearSelectedWorkflow}
 										/>
 									</div>

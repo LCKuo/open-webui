@@ -5,9 +5,17 @@
 	import { get } from 'svelte/store';
 	import { writable } from 'svelte/store';
 	import { toast } from 'svelte-sonner';
-	import { Background, BackgroundVariant, Controls, MiniMap, SvelteFlow } from '@xyflow/svelte';
+	import {
+		Background,
+		BackgroundVariant,
+		Controls,
+		MiniMap,
+		SvelteFlow,
+		type Viewport
+	} from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import { showSidebar, user } from '$lib/stores';
+	import { models, showSidebar, user } from '$lib/stores';
+	import { getSemanticDatasets, type SemanticDataset } from '$lib/apis/interact-semantic';
 	import {
 		getWorkflowById,
 		getWorkflowRuns,
@@ -23,434 +31,24 @@
 	} from '$lib/apis/workflows';
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
-
-	type WorkflowNodeCategory =
-		| 'trigger'
-		| 'agent'
-		| 'model'
-		| 'prompt'
-		| 'rag'
-		| 'tool'
-		| 'logic'
-		| 'output'
-		| 'ops';
-
-	type WorkflowNodeDefinition = {
-		type: string;
-		label: string;
-		category: WorkflowNodeCategory;
-		description: string;
-	};
-
-	const NODE_GROUPS: { id: WorkflowNodeCategory; label: string }[] = [
-		{ id: 'trigger', label: '輸入與觸發' },
-		{ id: 'agent', label: '代理' },
-		{ id: 'model', label: '模型' },
-		{ id: 'prompt', label: '提示與記憶' },
-		{ id: 'rag', label: 'RAG 與資料' },
-		{ id: 'tool', label: '工具' },
-		{ id: 'logic', label: '邏輯' },
-		{ id: 'output', label: '輸出' },
-		{ id: 'ops', label: '維運' }
-	];
-
-	const RUNTIME_SUPPORTED_NODE_TYPES = new Set([
-		'input',
-		'chat_input',
-		'channel_input',
-		'webhook_trigger',
-		'schedule_trigger',
-		'file_upload',
-		'form_input',
-		'agent',
-		'supervisor_agent',
-		'worker_agent',
-		'planner',
-		'evaluator',
-		'chat_model',
-		'vision_model',
-		'output',
-		'chat_output',
-		'channel_reply',
-		'media_output',
-		'file_output',
-		'handoff',
-		'webhook_response',
-		'notification',
-		'conversation_memory',
-		'summary_memory',
-		'entity_memory',
-		'context_builder',
-		'merge',
-		'trace',
-		'usage_meter',
-		'error_handler',
-		'fallback',
-		'system_prompt',
-		'prompt_template',
-		'calculator',
-		'transform_json',
-		'extract_fields',
-		'database_query',
-		'semantic_query'
-	]);
-
-	const NODE_DEFINITIONS: WorkflowNodeDefinition[] = [
-		{
-			type: 'chat_input',
-			label: '聊天輸入',
-			category: 'trigger',
-			description: '從站內聊天訊息啟動。'
-		},
-		{
-			type: 'channel_input',
-			label: '頻道輸入',
-			category: 'trigger',
-			description: '從 LINE、WeChat、Telegram 或其他已連接頻道啟動。'
-		},
-		{
-			type: 'webhook_trigger',
-			label: 'Webhook 觸發',
-			category: 'trigger',
-			description: '從 HTTP Webhook 事件啟動。'
-		},
-		{
-			type: 'schedule_trigger',
-			label: '排程觸發',
-			category: 'trigger',
-			description: '依週期或一次性排程執行。'
-		},
-		{
-			type: 'file_upload',
-			label: '檔案上傳',
-			category: 'trigger',
-			description: '從上傳的文件、圖片、音訊或壓縮檔啟動。'
-		},
-		{
-			type: 'form_input',
-			label: '表單輸入',
-			category: 'trigger',
-			description: '在工作流開始前收集結構化欄位。'
-		},
-		{
-			type: 'agent',
-			label: '代理',
-			category: 'agent',
-			description: '可推理、呼叫工具並產生最終回覆的主要代理。'
-		},
-		{
-			type: 'supervisor_agent',
-			label: '主管代理',
-			category: 'agent',
-			description: '協調多個工作代理並決定下一步。'
-		},
-		{
-			type: 'worker_agent',
-			label: '工作代理',
-			category: 'agent',
-			description: '負責研究、客服、程式等子任務的專用代理。'
-		},
-		{
-			type: 'planner',
-			label: '規劃器',
-			category: 'agent',
-			description: '執行前將使用者需求拆成有順序的步驟。'
-		},
-		{
-			type: 'agent_router',
-			label: '代理路由器',
-			category: 'agent',
-			description: '依意圖、頻道或上下文將任務分派給最適合的代理。'
-		},
-		{
-			type: 'evaluator',
-			label: '評估器',
-			category: 'agent',
-			description: '評分回覆、檢查政策，或決定是否重試。'
-		},
-		{
-			type: 'human_approval',
-			label: '人工核准',
-			category: 'agent',
-			description: '在敏感操作前暫停，等待人工核准。'
-		},
-		{
-			type: 'chat_model',
-			label: '聊天模型',
-			category: 'model',
-			description: '代理、提示或直接回覆步驟使用的 LLM。'
-		},
-		{
-			type: 'embedding_model',
-			label: '嵌入模型',
-			category: 'model',
-			description: '產生用於檢索與語意搜尋的 embeddings。'
-		},
-		{
-			type: 'vision_model',
-			label: '視覺模型',
-			category: 'model',
-			description: '讀取圖片、截圖、PDF 或多模態輸入。'
-		},
-		{
-			type: 'image_model',
-			label: '圖片模型',
-			category: 'model',
-			description: '在工作流中生成或編輯圖片。'
-		},
-		{
-			type: 'speech_to_text',
-			label: '語音轉文字',
-			category: 'model',
-			description: '轉錄語音訊息或音訊檔。'
-		},
-		{
-			type: 'text_to_speech',
-			label: '文字轉語音',
-			category: 'model',
-			description: '為支援的頻道產生語音輸出。'
-		},
-		{
-			type: 'system_prompt',
-			label: '系統提示',
-			category: 'prompt',
-			description: '定義代理角色、限制與回覆風格。'
-		},
-		{
-			type: 'prompt_template',
-			label: '提示範本',
-			category: 'prompt',
-			description: '用變數與上下文組合可重用提示。'
-		},
-		{
-			type: 'conversation_memory',
-			label: '對話記憶',
-			category: 'prompt',
-			description: '讀取近期聊天紀錄，維持對話連續性。'
-		},
-		{
-			type: 'summary_memory',
-			label: '摘要記憶',
-			category: 'prompt',
-			description: '維護長對話的壓縮摘要。'
-		},
-		{
-			type: 'entity_memory',
-			label: '實體記憶',
-			category: 'prompt',
-			description: '追蹤人物、產品、訂單等命名實體。'
-		},
-		{
-			type: 'document_loader',
-			label: '文件載入器',
-			category: 'rag',
-			description: '載入檔案、URL 或知識庫文件。'
-		},
-		{
-			type: 'web_loader',
-			label: '網頁載入器',
-			category: 'rag',
-			description: '在檢索或摘要前擷取並清理網頁內容。'
-		},
-		{
-			type: 'database_query',
-			label: '單表資料庫查詢（舊版）',
-			category: 'rag',
-			description: '以白名單讀取單一資料表；跨表統計請使用企業語意查詢。'
-		},
-		{
-			type: 'semantic_query',
-			label: '企業語意查詢',
-			category: 'rag',
-			description: '使用已發布資料集執行跨表聚合、排名與期間分析，並強制套用企業 ACL。'
-		},
-		{
-			type: 'split_text',
-			label: '文字切分',
-			category: 'rag',
-			description: '將長文字切塊，用於 embeddings、檢索或 map-reduce。'
-		},
-		{
-			type: 'vector_store',
-			label: '向量資料庫',
-			category: 'rag',
-			description: '將 embeddings 寫入 collection 或索引。'
-		},
-		{
-			type: 'retriever',
-			label: '檢索器',
-			category: 'rag',
-			description: '從向量資料庫或知識庫搜尋相關上下文。'
-		},
-		{
-			type: 'reranker',
-			label: '重排序器',
-			category: 'rag',
-			description: '送入模型前重新排序檢索到的文件。'
-		},
-		{
-			type: 'context_builder',
-			label: '上下文組裝器',
-			category: 'rag',
-			description: '將檢索資料、記憶與變數組裝成上下文。'
-		},
-		{
-			type: 'tool_call',
-			label: '工具呼叫',
-			category: 'tool',
-			description: '呼叫已設定的 Open WebUI 工具或函式。'
-		},
-		{
-			type: 'mcp_tools',
-			label: 'MCP 工具',
-			category: 'tool',
-			description: '將 MCP server 工具提供給代理使用。'
-		},
-		{
-			type: 'http_request',
-			label: 'HTTP 請求',
-			category: 'tool',
-			description: '帶 headers 與 payload 呼叫外部 REST API。'
-		},
-		{
-			type: 'code_interpreter',
-			label: '程式執行器',
-			category: 'tool',
-			description: '執行程式，用於計算、解析、圖表或檔案處理。'
-		},
-		{
-			type: 'calculator',
-			label: '計算器',
-			category: 'tool',
-			description: '進行價格、日期與總額等確定性計算。'
-		},
-		{
-			type: 'search_tool',
-			label: '搜尋工具',
-			category: 'tool',
-			description: '搜尋網路或內部索引。'
-		},
-		{
-			type: 'crm_tool',
-			label: 'CRM 工具',
-			category: 'tool',
-			description: '讀取或更新客戶紀錄。'
-		},
-		{
-			type: 'ticket_tool',
-			label: '工單工具',
-			category: 'tool',
-			description: '建立、更新或分派客服工單。'
-		},
-		{
-			type: 'condition',
-			label: '條件判斷',
-			category: 'logic',
-			description: '依表達式、狀態、角色或頻道分支。'
-		},
-		{
-			type: 'switch_router',
-			label: '多路路由',
-			category: 'logic',
-			description: '依意圖或欄位值路由到多個分支之一。'
-		},
-		{
-			type: 'loop',
-			label: '迴圈',
-			category: 'logic',
-			description: '重複子流程直到成功、逾時或達到最大嘗試次數。'
-		},
-		{
-			type: 'merge',
-			label: '合併',
-			category: 'logic',
-			description: '將多個分支重新合併成一條路徑。'
-		},
-		{
-			type: 'transform_json',
-			label: '轉換 JSON',
-			category: 'logic',
-			description: '對結構化資料進行映射、重新命名、篩選或重塑。'
-		},
-		{
-			type: 'extract_fields',
-			label: '欄位擷取',
-			category: 'logic',
-			description: '從文字或模型輸出中擷取具型別的欄位。'
-		},
-		{
-			type: 'rate_limit',
-			label: '速率限制',
-			category: 'logic',
-			description: '限制高成本模型或工具呼叫頻率。'
-		},
-		{
-			type: 'chat_output',
-			label: '聊天輸出',
-			category: 'output',
-			description: '回覆到站內聊天。'
-		},
-		{
-			type: 'channel_reply',
-			label: '頻道回覆',
-			category: 'output',
-			description: '回覆到 LINE、WeChat、Telegram 或其他頻道。'
-		},
-		{
-			type: 'media_output',
-			label: '多媒體輸出',
-			category: 'output',
-			description: '傳送圖片、音訊、文件或生成式多媒體。'
-		},
-		{
-			type: 'file_output',
-			label: '檔案輸出',
-			category: 'output',
-			description: '回傳生成檔案，供下載或頻道傳送。'
-		},
-		{
-			type: 'handoff',
-			label: '轉人工',
-			category: 'output',
-			description: '將對話轉交給人工客服或操作員。'
-		},
-		{
-			type: 'webhook_response',
-			label: 'Webhook 回應',
-			category: 'output',
-			description: '向呼叫端回傳結構化 HTTP 回應。'
-		},
-		{
-			type: 'notification',
-			label: '通知',
-			category: 'output',
-			description: '透過 email、聊天或 webhook 通知人員或系統。'
-		},
-		{
-			type: 'trace',
-			label: '追蹤紀錄',
-			category: 'ops',
-			description: '記錄重要步驟的輸入、輸出與耗時。'
-		},
-		{
-			type: 'usage_meter',
-			label: '用量計量',
-			category: 'ops',
-			description: '追蹤 token、模型與工具用量，用於計費或限制。'
-		},
-		{
-			type: 'error_handler',
-			label: '錯誤處理',
-			category: 'ops',
-			description: '捕捉錯誤並轉成使用者可理解的安全回覆。'
-		},
-		{
-			type: 'fallback',
-			label: '備援',
-			category: 'ops',
-			description: '當模型、API 或工具失敗時執行替代路徑。'
-		}
-	];
+	import WorkflowCanvasNode from '$lib/components/workflows/WorkflowCanvasNode.svelte';
+	import WorkflowLaunchSettings from '$lib/components/workflows/WorkflowLaunchSettings.svelte';
+	import WorkflowNodeLibrary from '$lib/components/workflows/WorkflowNodeLibrary.svelte';
+	import {
+		normalizeWorkflowLaunch,
+		type WorkflowLaunchConfig
+	} from '$lib/components/workflows/workflowLaunch';
+	import {
+		WORKFLOW_NODE_BY_TYPE,
+		buildWorkflowNode,
+		buildWorkflowTemplateGraph,
+		type WorkflowConfigField
+	} from '$lib/components/workflows/workflowNodeCatalog';
+	import CheckCircle from '$lib/components/icons/CheckCircle.svelte';
+	import ChevronLeft from '$lib/components/icons/ChevronLeft.svelte';
+	import CodeBracket from '$lib/components/icons/CodeBracket.svelte';
+	import InfoCircle from '$lib/components/icons/InfoCircle.svelte';
+	import GarbageBin from '$lib/components/icons/GarbageBin.svelte';
 
 	const VISIBILITY_OPTIONS = [
 		{
@@ -503,6 +101,10 @@
 	let description = '';
 	let visibility = 'private';
 	let meta: Record<string, any> = {};
+	let launchConfig: WorkflowLaunchConfig = normalizeWorkflowLaunch({
+		graph: { nodes: [], edges: [] },
+		meta: {}
+	} as any);
 	let aclScope = 'private';
 	let allowAgentSelection = false;
 	let intentKeywords = '';
@@ -530,56 +132,65 @@
 	let isDirty = false;
 	let showUnsavedConfirm = false;
 	let pendingNavigation = '/workflows';
-	let selectedNodeGroup: WorkflowNodeCategory = 'agent';
-	let nodeSearch = '';
 	let selectedNodeConfigId = '';
 	let nodeConfigJson = '{}';
+	let selectedNodeLabel = '';
+	let inspectorTab: 'node' | 'workflow' | 'test' = 'node';
+	let compactPanel: 'library' | 'canvas' | 'inspector' = 'canvas';
+	let pendingTemplateId = '';
+	let showTemplateConfirm = false;
+	let semanticDatasets: SemanticDataset[] = [];
+	let canvasElement: HTMLDivElement;
 
 	const nodes = writable<any[]>([]);
 	const edges = writable<any[]>([]);
-
-	const nodeStyle = {
-		minWidth: '260px',
-		minHeight: '64px',
-		padding: '0 20px',
-		fontSize: '15px',
-		fontWeight: 700
-	};
+	const viewport = writable<Viewport>({ x: 0, y: 0, zoom: 1 });
+	const nodeTypes = { workflow: WorkflowCanvasNode };
 
 	$: workflowId = $page.params.id ?? '';
 	$: canEdit = Boolean(workflow && ($user?.role === 'admin' || workflow.user_id === $user?.id));
-	$: filteredNodeDefinitions = NODE_DEFINITIONS.filter((node) => {
-		const term = nodeSearch.trim().toLowerCase();
-		if (!term && node.category !== selectedNodeGroup) return false;
-		if (!term) return true;
-
-		return [node.label, node.type, node.description].join(' ').toLowerCase().includes(term);
-	});
-	$: selectedGroupCount = NODE_DEFINITIONS.filter(
-		(node) => node.category === selectedNodeGroup
-	).length;
 	$: selectedNode = $nodes.find((node) => node.selected) ?? null;
 	$: if (selectedNode && selectedNode.id !== selectedNodeConfigId) {
 		selectedNodeConfigId = selectedNode.id;
+		selectedNodeLabel = selectedNode.data?.label ?? '';
 		nodeConfigJson = JSON.stringify(selectedNode.data?.config ?? {}, null, 2);
+		inspectorTab = 'node';
 	}
+	$: selectedNodeDefinition = selectedNode
+		? WORKFLOW_NODE_BY_TYPE.get(selectedNode.data?.type ?? '')
+		: undefined;
+	$: selectedNodeFields = selectedNodeDefinition?.configFields ?? [];
 	$: visibilityDescription =
 		VISIBILITY_OPTIONS.find((option) => option.value === visibility)?.description ?? '';
 	$: aclScopeDescription =
 		ACL_SCOPE_OPTIONS.find((option) => option.value === aclScope)?.description ?? '';
 
-	const getNodeDefinition = (type: string) =>
-		NODE_DEFINITIONS.find((definition) => definition.type === type);
-
-	const nodeClassForKind = (kind: string) => {
-		const definition = getNodeDefinition(kind);
-		return definition ? `workflow-node workflow-node-${definition.category}` : 'workflow-node';
-	};
-
-	const rendererTypeForDefinition = (definition: WorkflowNodeDefinition) => {
-		if (definition.category === 'trigger') return 'input';
-		if (definition.category === 'output') return 'output';
-		return 'default';
+	const hydrateNode = (node: any) => {
+		const semanticType = node.data?.type ?? node.data?.kind ?? node.type;
+		const definition =
+			WORKFLOW_NODE_BY_TYPE.get(semanticType) ??
+			(semanticType === 'input'
+				? WORKFLOW_NODE_BY_TYPE.get('chat_input')
+				: semanticType === 'output'
+					? WORKFLOW_NODE_BY_TYPE.get('chat_output')
+					: undefined);
+		return {
+			...node,
+			type: 'workflow',
+			style: undefined,
+			class: 'workflow-node',
+			className: 'workflow-node',
+			data: {
+				...(node.data ?? {}),
+				type: semanticType,
+				label: node.data?.label ?? definition?.label ?? semanticType,
+				category: definition?.category ?? node.data?.category ?? 'control',
+				description: definition?.description ?? node.data?.description ?? '',
+				inputType: definition?.inputType ?? node.data?.inputType ?? 'any',
+				outputType: definition?.outputType ?? node.data?.outputType ?? 'any',
+				config: node.data?.config ?? definition?.defaultConfig ?? {}
+			}
+		};
 	};
 
 	const graph = () => ({
@@ -649,7 +260,8 @@
 
 		return {
 			...(meta ?? {}),
-			acl
+			acl,
+			launch: launchConfig
 		};
 	};
 
@@ -701,27 +313,32 @@
 	const normalizeGraph = () => ({
 		nodes: get(nodes).map((node) => ({
 			...node,
-			type: node.type === 'input' || node.type === 'output' ? node.type : 'default',
-			class: node.class ?? nodeClassForKind(node.data?.type ?? node.type),
-			className: node.className ?? node.class ?? nodeClassForKind(node.data?.type ?? node.type),
-			style: {
-				...nodeStyle,
-				...(node.style ?? {})
-			},
+			type: 'workflow',
+			class: 'workflow-node',
+			className: 'workflow-node',
+			style: undefined,
 			data: {
 				...(node.data ?? {}),
 				type: node.data?.type ?? node.type,
 				category:
 					node.data?.category ??
-					getNodeDefinition(node.data?.type ?? node.type)?.category ??
-					'logic',
+					WORKFLOW_NODE_BY_TYPE.get(node.data?.type ?? node.type)?.category ??
+					'control',
 				description:
 					node.data?.description ??
-					getNodeDefinition(node.data?.type ?? node.type)?.description ??
-					''
+					WORKFLOW_NODE_BY_TYPE.get(node.data?.type ?? node.type)?.description ??
+					'',
+				inputType:
+					node.data?.inputType ??
+					WORKFLOW_NODE_BY_TYPE.get(node.data?.type ?? node.type)?.inputType ??
+					'any',
+				outputType:
+					node.data?.outputType ??
+					WORKFLOW_NODE_BY_TYPE.get(node.data?.type ?? node.type)?.outputType ??
+					'any'
 			}
 		})),
-		edges: get(edges)
+		edges: get(edges).map((edge) => ({ ...edge, type: edge.type ?? 'smoothstep' }))
 	});
 
 	nodes.subscribe(() => {
@@ -746,22 +363,19 @@
 			description = res.description ?? '';
 			visibility = res.visibility;
 			meta = res.meta ?? {};
+			launchConfig = normalizeWorkflowLaunch(res);
 			syncAclState(meta);
-			nodes.set(
-				(res.graph?.nodes ?? []).map((node) => ({
-					...node,
-					type: node.type === 'input' || node.type === 'output' ? node.type : 'default',
-					class: node.class ?? nodeClassForKind(node.data?.type ?? node.type),
-					className: node.className ?? node.class ?? nodeClassForKind(node.data?.type ?? node.type),
-					style: {
-						...nodeStyle,
-						...(node.style ?? {})
-					}
-				}))
+			nodes.set((res.graph?.nodes ?? []).map(hydrateNode));
+			edges.set(
+				(res.graph?.edges ?? []).map((edge) => ({ ...edge, type: edge.type ?? 'smoothstep' }))
 			);
-			edges.set(res.graph?.edges ?? []);
 			syncJson();
-			runs = await getWorkflowRuns(localStorage.token, workflowId, 10).catch(() => []);
+			[runs, semanticDatasets] = await Promise.all([
+				getWorkflowRuns(localStorage.token, workflowId, 10).catch(() => []),
+				getSemanticDatasets(localStorage.token)
+					.then((result) => result.datasets.filter((dataset) => dataset.status === 'published'))
+					.catch(() => [])
+			]);
 			lastSavedSignature = graphSignature();
 			isDirty = false;
 			loaded = true;
@@ -789,19 +403,12 @@
 			});
 			workflow = res;
 			meta = res.meta ?? {};
+			launchConfig = normalizeWorkflowLaunch(res);
 			syncAclState(meta);
-			nodes.set(
-				(res.graph?.nodes ?? []).map((node) => ({
-					...node,
-					class: node.class ?? nodeClassForKind(node.data?.type ?? node.type),
-					className: node.className ?? node.class ?? nodeClassForKind(node.data?.type ?? node.type),
-					style: {
-						...nodeStyle,
-						...(node.style ?? {})
-					}
-				}))
+			nodes.set((res.graph?.nodes ?? []).map(hydrateNode));
+			edges.set(
+				(res.graph?.edges ?? []).map((edge) => ({ ...edge, type: edge.type ?? 'smoothstep' }))
 			);
-			edges.set(res.graph?.edges ?? []);
 			syncJson();
 			lastSavedSignature = graphSignature();
 			isDirty = false;
@@ -894,51 +501,70 @@
 		}
 	};
 
-	const addNode = (kind: string) => {
-		const definition =
-			getNodeDefinition(kind) ??
-			({
-				type: kind,
-				label: kind.replaceAll('_', ' '),
-				category: 'logic',
-				description: ''
-			} satisfies WorkflowNodeDefinition);
-		const next = get(nodes).length + 1;
+	const addNode = (kind: string, position?: { x: number; y: number }) => {
+		const definition = WORKFLOW_NODE_BY_TYPE.get(kind);
+		if (!definition) {
+			toast.error('這個節點尚未提供正式執行器。');
+			return;
+		}
+		const next = get(nodes).length;
 		const id = `${kind}-${Date.now()}`;
-		const defaultConfig =
-			kind === 'semantic_query'
-				? {
-						dataset_id: '',
-						use_incoming_plan: false,
-						plan: {
-							version: '1',
-							datasetId: '',
-							dimensions: [],
-							measures: [],
-							metrics: [],
-							orderBy: [],
-							limit: 20
-						}
-					}
-				: undefined;
-		nodes.update((items) => [
-			...items,
-			{
-				id,
-				type: rendererTypeForDefinition(definition),
-				class: nodeClassForKind(kind),
-				className: nodeClassForKind(kind),
-				position: { x: 120 + next * 40, y: 100 + next * 30 },
-				style: nodeStyle,
-				data: {
-					label: definition.label,
-					type: definition.type,
-					category: definition.category,
-					description: definition.description,
-					...(defaultConfig ? { config: defaultConfig } : {})
+		const currentViewport = get(viewport);
+		const rect = canvasElement?.getBoundingClientRect();
+		const fallbackPosition = rect
+			? {
+					x: (rect.width * 0.5 - currentViewport.x) / currentViewport.zoom - 132 + (next % 3) * 24,
+					y: (rect.height * 0.45 - currentViewport.y) / currentViewport.zoom - 70 + (next % 3) * 24
 				}
-			}
+			: { x: 120 + next * 36, y: 120 + next * 28 };
+		const node = buildWorkflowNode(kind, id, position ?? fallbackPosition);
+		nodes.update((items) => [
+			...items.map((item) => ({ ...item, selected: false })),
+			{ ...node, selected: true }
 		]);
+		selectedNodeConfigId = '';
+		inspectorTab = 'node';
+		compactPanel = 'canvas';
+	};
+
+	const handleCanvasDragOver = (event: DragEvent) => {
+		if (!canEdit) return;
+		event.preventDefault();
+		if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+	};
+
+	const handleCanvasDrop = (event: DragEvent) => {
+		if (!canEdit || !canvasElement || !event.dataTransfer) return;
+		event.preventDefault();
+		const kind = event.dataTransfer.getData('application/interact-workflow-node');
+		if (!kind) return;
+		const rect = canvasElement.getBoundingClientRect();
+		const currentViewport = get(viewport);
+		addNode(kind, {
+			x: (event.clientX - rect.left - currentViewport.x) / currentViewport.zoom - 132,
+			y: (event.clientY - rect.top - currentViewport.y) / currentViewport.zoom - 60
+		});
+	};
+
+	const applyTemplate = (templateId: string) => {
+		const graph = buildWorkflowTemplateGraph(templateId);
+		nodes.set(graph.nodes.map(hydrateNode));
+		edges.set(graph.edges);
+		viewport.set({ x: 30, y: 80, zoom: 0.62 });
+		validation = null;
+		selectedNodeConfigId = '';
+		markDirty();
+		compactPanel = 'canvas';
+		toast.success('已套用入門範本，請依標示完成必要設定。');
+	};
+
+	const requestTemplate = (templateId: string) => {
+		if (get(nodes).length === 0) {
+			applyTemplate(templateId);
+			return;
+		}
+		pendingTemplateId = templateId;
+		showTemplateConfirm = true;
 	};
 
 	const edgeId = (source: string, target: string) => `${source}-${target}-${Date.now()}`;
@@ -956,28 +582,39 @@
 	const isValidConnection = (connection: any) => {
 		if (!connection.source || !connection.target || connection.source === connection.target)
 			return false;
-		return !get(edges).some(
-			(edge) => edge.source === connection.source && edge.target === connection.target
-		);
-	};
+		if (
+			get(edges).some(
+				(edge) => edge.source === connection.source && edge.target === connection.target
+			)
+		)
+			return false;
 
-	const connectLastTwo = () => {
 		const currentNodes = get(nodes);
-		if (currentNodes.length < 2) {
-			toast.error('請先新增至少兩個節點');
-			return;
-		}
+		const sourceNode = currentNodes.find((node) => node.id === connection.source);
+		const targetNode = currentNodes.find((node) => node.id === connection.target);
+		const sourceType = sourceNode?.data?.outputType ?? 'any';
+		const targetType = targetNode?.data?.inputType ?? 'any';
+		if (sourceType === 'none' || targetType === 'none') return false;
+		if (sourceType !== 'any' && targetType !== 'any' && sourceType !== targetType) return false;
 
-		const source = currentNodes[currentNodes.length - 2].id;
-		const target = currentNodes[currentNodes.length - 1].id;
-		if (!isValidConnection({ source, target })) {
-			toast.error('這些節點已連接，或無法建立連線。');
-			return;
+		const adjacency = new Map<string, string[]>();
+		for (const edge of get(edges)) {
+			adjacency.set(edge.source, [...(adjacency.get(edge.source) ?? []), edge.target]);
 		}
-		edges.update((items) => [
-			...items,
-			{ id: edgeId(source, target), source, target, deletable: true }
+		adjacency.set(connection.source, [
+			...(adjacency.get(connection.source) ?? []),
+			connection.target
 		]);
+		const stack = [connection.target];
+		const visited = new Set<string>();
+		while (stack.length) {
+			const nodeId = stack.pop()!;
+			if (nodeId === connection.source) return false;
+			if (visited.has(nodeId)) continue;
+			visited.add(nodeId);
+			stack.push(...(adjacency.get(nodeId) ?? []));
+		}
+		return true;
 	};
 
 	const deleteSelected = () => {
@@ -1027,7 +664,16 @@
 			}
 			nodes.update((items) =>
 				items.map((node) =>
-					node.id === selectedNode.id ? { ...node, data: { ...(node.data ?? {}), config } } : node
+					node.id === selectedNode.id
+						? {
+								...node,
+								data: {
+									...(node.data ?? {}),
+									label: selectedNodeLabel.trim() || selectedNodeDefinition?.label || node.id,
+									config
+								}
+							}
+						: node
 				)
 			);
 			markDirty();
@@ -1036,6 +682,57 @@
 			toast.error(`${error}`);
 		}
 	};
+
+	const readNodeConfig = () => {
+		try {
+			const parsed = JSON.parse(nodeConfigJson);
+			return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+		} catch {
+			return {};
+		}
+	};
+
+	const configFieldValue = (field: WorkflowConfigField) => {
+		const value = readNodeConfig()[field.key];
+		if (field.type === 'tags') return Array.isArray(value) ? value.join(', ') : (value ?? '');
+		if (field.type === 'json') return JSON.stringify(value ?? {}, null, 2);
+		return value ?? (field.type === 'checkbox' ? false : '');
+	};
+
+	const updateConfigField = (field: WorkflowConfigField, rawValue: unknown) => {
+		const config = readNodeConfig();
+		let value = rawValue;
+		if (field.type === 'tags') {
+			value = String(rawValue)
+				.split(',')
+				.map((item) => item.trim())
+				.filter(Boolean);
+		} else if (field.type === 'number') {
+			value = rawValue === '' ? undefined : Number(rawValue);
+		} else if (field.type === 'json') {
+			try {
+				value = JSON.parse(String(rawValue));
+			} catch {
+				toast.error(`${field.label}不是有效的 JSON。`);
+				return;
+			}
+		}
+		if (value === undefined) delete config[field.key];
+		else config[field.key] = value;
+		nodeConfigJson = JSON.stringify(config, null, 2);
+	};
+
+	const nodeMissingRequiredConfig = () =>
+		selectedNodeFields.filter((field) => {
+			if (!field.required) return false;
+			const value = readNodeConfig()[field.key];
+			return (
+				value === undefined ||
+				value === null ||
+				value === '' ||
+				(Array.isArray(value) && !value.length)
+			);
+		});
 
 	const formatDate = (value: number | null) =>
 		value ? new Date(Math.floor(value / 1000000)).toLocaleString() : '-';
@@ -1073,6 +770,20 @@
 	<div class="text-sm text-gray-500">你有尚未儲存的工作流變更。現在離開會捨棄這些變更。</div>
 </ConfirmDialog>
 
+<ConfirmDialog
+	bind:show={showTemplateConfirm}
+	title="以範本取代目前畫布？"
+	confirmLabel="套用範本"
+	on:confirm={() => {
+		if (pendingTemplateId) applyTemplate(pendingTemplateId);
+		pendingTemplateId = '';
+	}}
+>
+	<div class="text-sm leading-6 text-gray-500">
+		目前節點與連線會被範本取代。你仍可在離開頁面前選擇不儲存。
+	</div>
+</ConfirmDialog>
+
 {#if !loaded || !workflow}
 	<div
 		class="flex h-screen max-h-[100dvh] w-full items-center justify-center transition-width duration-200 ease-in-out {$showSidebar
@@ -1092,10 +803,11 @@
 		>
 			<div class="flex min-w-0 items-center gap-3">
 				<button
-					class="rounded-lg border border-gray-200 px-3 py-2 text-sm dark:border-gray-800"
+					class="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
 					on:click={leaveEditor}
+					title="返回工作流中心"
 				>
-					返回
+					<ChevronLeft className="size-4" /> 返回
 				</button>
 				<div class="min-w-0">
 					<input
@@ -1120,6 +832,17 @@
 
 			{#if canEdit}
 				<div class="flex flex-wrap items-center gap-2">
+					<button
+						class="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
+						on:click={() => {
+							jsonMode = !jsonMode;
+							syncJson();
+						}}
+						title="切換畫布 JSON"
+					>
+						<CodeBracket className="size-4" />
+						{jsonMode ? '返回畫布' : 'JSON'}
+					</button>
 					<button
 						class="rounded-lg border border-gray-200 px-3 py-2 text-sm dark:border-gray-800"
 						on:click={validateWorkflow}
@@ -1151,8 +874,33 @@
 			{/if}
 		</div>
 
-		<div class="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px]">
-			<div class="workflow-canvas relative min-h-[520px] bg-gray-50 dark:bg-[#070b12]">
+		<div
+			class="compact-panel-tabs border-b border-gray-200 bg-white p-2 dark:border-gray-800 dark:bg-gray-950"
+		>
+			<div class="grid grid-cols-3 rounded-lg bg-gray-100 p-1 dark:bg-gray-900">
+				{#each [{ id: 'library', label: '節點與範本' }, { id: 'canvas', label: '畫布' }, { id: 'inspector', label: selectedNode ? '節點設定' : '工作流設定' }] as option}
+					<button
+						class="rounded-md px-3 py-1.5 text-xs font-medium {compactPanel === option.id
+							? 'bg-white text-gray-900 shadow-sm dark:bg-gray-800 dark:text-white'
+							: 'text-gray-500'}"
+						on:click={() => (compactPanel = option.id as typeof compactPanel)}
+						>{option.label}</button
+					>
+				{/each}
+			</div>
+		</div>
+
+		<div class="workflow-editor-layout min-h-0 flex-1" data-compact-panel={compactPanel}>
+			<WorkflowNodeLibrary {canEdit} onAdd={addNode} onApplyTemplate={requestTemplate} />
+
+			<div
+				class="workflow-canvas relative min-h-[520px] bg-slate-50 dark:bg-[#070b12]"
+				bind:this={canvasElement}
+				on:dragover={handleCanvasDragOver}
+				on:drop={handleCanvasDrop}
+				role="application"
+				aria-label="工作流畫布"
+			>
 				{#if jsonMode}
 					<div class="flex h-full flex-col gap-3 p-4">
 						<textarea
@@ -1173,582 +921,701 @@
 						</div>
 					</div>
 				{:else}
+					<div
+						class="canvas-guide pointer-events-none absolute left-4 top-4 z-10 max-w-[22rem] rounded-lg border border-gray-200 bg-white/95 px-3 py-2 shadow-sm backdrop-blur dark:border-gray-700 dark:bg-gray-900/95"
+					>
+						<div class="text-xs font-semibold text-gray-800 dark:text-gray-100">建立方式</div>
+						<div class="mt-1 text-xs leading-5 text-gray-500">
+							1. 從左側新增節點　2. 從右側圓點拖線　3. 選取節點完成設定
+						</div>
+					</div>
+					{#if $nodes.length === 0}
+						<div
+							class="pointer-events-none absolute inset-0 z-[5] flex items-center justify-center p-6"
+						>
+							<div
+								class="pointer-events-auto max-w-sm rounded-lg border border-dashed border-gray-300 bg-white p-5 text-center shadow-sm dark:border-gray-700 dark:bg-gray-900"
+							>
+								<div class="text-base font-semibold text-gray-900 dark:text-gray-100">
+									從第一個節點開始
+								</div>
+								<div class="mt-2 text-sm leading-6 text-gray-500">
+									開啟左側「入門範本」，或新增一個輸入節點。
+								</div>
+								<button
+									class="mt-4 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
+									on:click={() => requestTemplate('chat-assistant')}
+								>
+									使用聊天助理範本
+								</button>
+							</div>
+						</div>
+					{/if}
 					<SvelteFlow
 						{nodes}
 						{edges}
+						{nodeTypes}
+						{viewport}
 						fitView
+						fitViewOptions={{ padding: 0.22, maxZoom: 1 }}
 						onedgecreate={createEdge}
 						{isValidConnection}
 						nodesDraggable={canEdit}
 						nodesConnectable={canEdit}
 						elementsSelectable={canEdit}
+						deleteKey={canEdit ? ['Backspace', 'Delete'] : null}
+						connectionRadius={28}
+						onnodeclick={() => {
+							inspectorTab = 'node';
+							compactPanel = 'inspector';
+						}}
 					>
 						<Controls />
-						<MiniMap pannable zoomable />
-						<Background variant={BackgroundVariant.Dots} gap={40} size={1.4} />
+						<MiniMap pannable zoomable nodeColor="#64748b" maskColor="rgb(15 23 42 / 0.08)" />
+						<Background variant={BackgroundVariant.Dots} gap={32} size={1.2} />
 					</SvelteFlow>
+					<div
+						class="canvas-status absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-lg border border-gray-200 bg-white/95 px-3 py-1.5 text-xs text-gray-500 shadow-sm backdrop-blur dark:border-gray-700 dark:bg-gray-900/95"
+					>
+						{$nodes.length} 個節點 · {$edges.length} 條連線 · 空白鍵拖曳畫布 · Delete 刪除
+					</div>
 				{/if}
 			</div>
 
 			<aside
-				class="flex min-h-0 flex-col gap-4 overflow-y-auto border-l border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-950"
+				class="workflow-inspector flex min-h-0 flex-col overflow-hidden border-l border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-950"
 			>
-				<fieldset class="contents" disabled={!canEdit}>
-					<section class="space-y-3">
-						<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">工作流設定</div>
-						<textarea
-							class="h-20 w-full resize-none rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-							bind:value={description}
-							on:input={() => queueMicrotask(markDirty)}
-							placeholder="描述"
-						></textarea>
-						<select
-							class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-							bind:value={visibility}
-							on:change={handleVisibilityChange}
-						>
-							{#each VISIBILITY_OPTIONS as option}
-								<option value={option.value}>{option.label}</option>
-							{/each}
-						</select>
-						<div
-							class="rounded-lg bg-gray-50 px-3 py-2 text-xs leading-5 text-gray-600 dark:bg-gray-900 dark:text-gray-300"
-						>
-							{visibilityDescription}
-						</div>
-						<div class="space-y-2 rounded-lg border border-gray-200 p-3 dark:border-gray-800">
-							<div class="text-xs font-semibold text-gray-500">存取政策</div>
-							{#if visibility === 'shared'}
-								<label class="space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300">
-									<span>共享範圍</span>
-									<select
-										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
-										bind:value={aclScope}
-										on:change={() => queueMicrotask(markDirty)}
-									>
-										{#each ACL_SCOPE_OPTIONS.filter((option) => option.value !== 'private') as option}
-											<option value={option.value}>{option.label}</option>
-										{/each}
-									</select>
-								</label>
-								<div class="text-xs leading-5 text-gray-500 dark:text-gray-400">
-									{aclScopeDescription}
-								</div>
-							{/if}
-							<label class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-200">
-								<input
-									class="mt-1"
-									type="checkbox"
-									bind:checked={allowAgentSelection}
-									on:change={() => queueMicrotask(markDirty)}
-								/>
-								<span>
-									<span class="font-medium">允許代理自動選擇</span>
-									<span class="block text-xs leading-5 text-gray-500 dark:text-gray-400">
-										只有已發布、具備存取權且通過信心與歧義檢查的工作流才會執行。
-									</span>
-								</span>
-							</label>
-							{#if allowAgentSelection}
-								<label class="block space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300">
-									<span>意圖片語</span>
-									<input
-										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
-										bind:value={intentKeywords}
-										on:input={() => queueMicrotask(markDirty)}
-										placeholder="例如：查詢發票, 發票付款狀態"
-									/>
-								</label>
-								<label class="block space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300">
-									<span>使用者說法範例（每行一則）</span>
-									<textarea
-										class="h-24 w-full resize-y rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
-										bind:value={intentExamples}
-										on:input={() => queueMicrotask(markDirty)}
-										placeholder="幫我查上個月的發票付款狀態"
-									></textarea>
-								</label>
-								<label class="block space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300">
-									<span>必要詞（必須全部出現）</span>
-									<input
-										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
-										bind:value={requiredKeywords}
-										on:input={() => queueMicrotask(markDirty)}
-										placeholder="例如：A 公司"
-									/>
-								</label>
-								<label class="block space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300">
-									<span>排除詞（命中即不選）</span>
-									<input
-										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
-										bind:value={negativeKeywords}
-										on:input={() => queueMicrotask(markDirty)}
-										placeholder="例如：作廢, 退款"
-									/>
-								</label>
-								<div class="grid grid-cols-3 gap-2">
-									<label class="space-y-1 text-xs text-gray-600 dark:text-gray-300"
-										><span>信心門檻</span><input
-											class="w-full rounded-lg border border-gray-200 bg-transparent px-2 py-2 text-sm outline-none dark:border-gray-800"
-											type="number"
-											min="0.5"
-											max="0.95"
-											step="0.01"
-											bind:value={agentSelectionThreshold}
-											on:input={() => queueMicrotask(markDirty)}
-										/></label
-									>
-									<label class="space-y-1 text-xs text-gray-600 dark:text-gray-300"
-										><span>優先序</span><input
-											class="w-full rounded-lg border border-gray-200 bg-transparent px-2 py-2 text-sm outline-none dark:border-gray-800"
-											type="number"
-											min="-100"
-											max="100"
-											step="1"
-											bind:value={agentSelectionPriority}
-											on:input={() => queueMicrotask(markDirty)}
-										/></label
-									>
-									<label class="space-y-1 text-xs text-gray-600 dark:text-gray-300"
-										><span>歧義差距</span><input
-											class="w-full rounded-lg border border-gray-200 bg-transparent px-2 py-2 text-sm outline-none dark:border-gray-800"
-											type="number"
-											min="0.05"
-											max="0.3"
-											step="0.01"
-											bind:value={agentAmbiguityMargin}
-											on:input={() => queueMicrotask(markDirty)}
-										/></label
-									>
-								</div>
-							{/if}
-
-							{#if visibility === 'shared'}
-								{#if aclScope === 'company'}
-									<input
-										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-										bind:value={allowedCompanyUserIds}
-										on:input={() => queueMicrotask(markDirty)}
-										placeholder="額外允許的公司 ID（選填）"
-									/>
-								{:else if aclScope === 'selected_members'}
-									<input
-										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-										bind:value={allowedMemberIds}
-										on:input={() => queueMicrotask(markDirty)}
-										placeholder="允許的公司成員 ID"
-									/>
-								{:else if aclScope === 'selected_groups'}
-									<input
-										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-										bind:value={allowedGroupIds}
-										on:input={() => queueMicrotask(markDirty)}
-										placeholder="允許的 WebUI 群組 ID"
-									/>
-								{/if}
-							{/if}
-							<input
-								class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-								bind:value={allowedChannelIds}
-								on:input={() => queueMicrotask(markDirty)}
-								placeholder="限制頻道 ID（留空代表不限）"
-							/>
-							<input
-								class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-								bind:value={allowedModelIds}
-								on:input={() => queueMicrotask(markDirty)}
-								placeholder="限制模型 ID（留空代表不限）"
-							/>
-						</div>
-
-						{#if allowAgentSelection}
-							<div class="space-y-2 rounded-lg border border-gray-200 p-3 dark:border-gray-800">
-								<div class="text-xs font-semibold text-gray-600 dark:text-gray-300">
-									代理選型測試
-								</div>
+				<div class="grid grid-cols-3 border-b border-gray-200 p-2 dark:border-gray-800">
+					<button
+						class="inspector-tab {inspectorTab === 'node' ? 'active' : ''}"
+						on:click={() => (inspectorTab = 'node')}
+						disabled={!selectedNode}>節點</button
+					>
+					<button
+						class="inspector-tab {inspectorTab === 'workflow' ? 'active' : ''}"
+						on:click={() => (inspectorTab = 'workflow')}>工作流</button
+					>
+					<button
+						class="inspector-tab {inspectorTab === 'test' ? 'active' : ''}"
+						on:click={() => (inspectorTab = 'test')}>檢查與測試</button
+					>
+				</div>
+				<div class="min-h-0 flex-1 overflow-y-auto p-4">
+					<fieldset class="contents" disabled={!canEdit}>
+						{#if inspectorTab === 'workflow'}
+							<section class="space-y-3">
+								<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">工作流設定</div>
 								<textarea
-									class="h-20 w-full resize-y rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-									bind:value={selectorTestMessage}
-									placeholder="輸入一段真實使用者訊息"
+									class="h-20 w-full resize-none rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+									bind:value={description}
+									on:input={() => queueMicrotask(markDirty)}
+									placeholder="描述"
 								></textarea>
-								<button
-									class="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm disabled:opacity-50 dark:border-gray-800"
-									on:click={testAgentSelection}
-									disabled={selectorTesting || isDirty || workflow.status !== 'published'}
+								<div class="border-t border-gray-200 pt-4 dark:border-gray-800">
+									<WorkflowLaunchSettings
+										value={launchConfig}
+										disabled={!canEdit}
+										onChange={(next) => {
+											launchConfig = next;
+											queueMicrotask(markDirty);
+										}}
+									/>
+								</div>
+								<div class="border-t border-gray-200 pt-4 dark:border-gray-800">
+									<div class="mb-3 text-sm font-semibold text-gray-900 dark:text-gray-100">
+										分享與存取
+									</div>
+								<select
+									class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+									bind:value={visibility}
+									on:change={handleVisibilityChange}
 								>
-									{selectorTesting ? '判斷中...' : '測試已發布工作流選型'}
-								</button>
-								{#if isDirty || workflow.status !== 'published'}
-									<div class="text-xs leading-5 text-amber-700 dark:text-amber-300">
-										請先發布目前版本，才能得到與實際 Agent 相同的結果。
+									{#each VISIBILITY_OPTIONS as option}
+										<option value={option.value}>{option.label}</option>
+									{/each}
+								</select>
+								<div
+									class="rounded-lg bg-gray-50 px-3 py-2 text-xs leading-5 text-gray-600 dark:bg-gray-900 dark:text-gray-300"
+								>
+									{visibilityDescription}
+								</div>
+								</div>
+								<div class="space-y-2 rounded-lg border border-gray-200 p-3 dark:border-gray-800">
+									<div class="text-xs font-semibold text-gray-500">存取政策</div>
+									{#if visibility === 'shared'}
+										<label class="space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300">
+											<span>共享範圍</span>
+											<select
+												class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
+												bind:value={aclScope}
+												on:change={() => queueMicrotask(markDirty)}
+											>
+												{#each ACL_SCOPE_OPTIONS.filter((option) => option.value !== 'private') as option}
+													<option value={option.value}>{option.label}</option>
+												{/each}
+											</select>
+										</label>
+										<div class="text-xs leading-5 text-gray-500 dark:text-gray-400">
+											{aclScopeDescription}
+										</div>
+									{/if}
+									<label class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-200">
+										<input
+											class="mt-1"
+											type="checkbox"
+											bind:checked={allowAgentSelection}
+											on:change={() => queueMicrotask(markDirty)}
+										/>
+										<span>
+											<span class="font-medium">允許代理自動選擇</span>
+											<span class="block text-xs leading-5 text-gray-500 dark:text-gray-400">
+												只有已發布、具備存取權且通過信心與歧義檢查的工作流才會執行。
+											</span>
+										</span>
+									</label>
+									{#if allowAgentSelection}
+										<label
+											class="block space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300"
+										>
+											<span>意圖片語</span>
+											<input
+												class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
+												bind:value={intentKeywords}
+												on:input={() => queueMicrotask(markDirty)}
+												placeholder="例如：查詢發票, 發票付款狀態"
+											/>
+										</label>
+										<label
+											class="block space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300"
+										>
+											<span>使用者說法範例（每行一則）</span>
+											<textarea
+												class="h-24 w-full resize-y rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
+												bind:value={intentExamples}
+												on:input={() => queueMicrotask(markDirty)}
+												placeholder="幫我查上個月的發票付款狀態"
+											></textarea>
+										</label>
+										<label
+											class="block space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300"
+										>
+											<span>必要詞（必須全部出現）</span>
+											<input
+												class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
+												bind:value={requiredKeywords}
+												on:input={() => queueMicrotask(markDirty)}
+												placeholder="例如：A 公司"
+											/>
+										</label>
+										<label
+											class="block space-y-1 text-xs font-medium text-gray-600 dark:text-gray-300"
+										>
+											<span>排除詞（命中即不選）</span>
+											<input
+												class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm font-normal outline-none dark:border-gray-800"
+												bind:value={negativeKeywords}
+												on:input={() => queueMicrotask(markDirty)}
+												placeholder="例如：作廢, 退款"
+											/>
+										</label>
+										<div class="grid grid-cols-3 gap-2">
+											<label class="space-y-1 text-xs text-gray-600 dark:text-gray-300"
+												><span>信心門檻</span><input
+													class="w-full rounded-lg border border-gray-200 bg-transparent px-2 py-2 text-sm outline-none dark:border-gray-800"
+													type="number"
+													min="0.5"
+													max="0.95"
+													step="0.01"
+													bind:value={agentSelectionThreshold}
+													on:input={() => queueMicrotask(markDirty)}
+												/></label
+											>
+											<label class="space-y-1 text-xs text-gray-600 dark:text-gray-300"
+												><span>優先序</span><input
+													class="w-full rounded-lg border border-gray-200 bg-transparent px-2 py-2 text-sm outline-none dark:border-gray-800"
+													type="number"
+													min="-100"
+													max="100"
+													step="1"
+													bind:value={agentSelectionPriority}
+													on:input={() => queueMicrotask(markDirty)}
+												/></label
+											>
+											<label class="space-y-1 text-xs text-gray-600 dark:text-gray-300"
+												><span>歧義差距</span><input
+													class="w-full rounded-lg border border-gray-200 bg-transparent px-2 py-2 text-sm outline-none dark:border-gray-800"
+													type="number"
+													min="0.05"
+													max="0.3"
+													step="0.01"
+													bind:value={agentAmbiguityMargin}
+													on:input={() => queueMicrotask(markDirty)}
+												/></label
+											>
+										</div>
+									{/if}
+
+									{#if visibility === 'shared'}
+										{#if aclScope === 'company'}
+											<input
+												class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+												bind:value={allowedCompanyUserIds}
+												on:input={() => queueMicrotask(markDirty)}
+												placeholder="額外允許的公司 ID（選填）"
+											/>
+										{:else if aclScope === 'selected_members'}
+											<input
+												class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+												bind:value={allowedMemberIds}
+												on:input={() => queueMicrotask(markDirty)}
+												placeholder="允許的公司成員 ID"
+											/>
+										{:else if aclScope === 'selected_groups'}
+											<input
+												class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+												bind:value={allowedGroupIds}
+												on:input={() => queueMicrotask(markDirty)}
+												placeholder="允許的 WebUI 群組 ID"
+											/>
+										{/if}
+									{/if}
+									<input
+										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+										bind:value={allowedChannelIds}
+										on:input={() => queueMicrotask(markDirty)}
+										placeholder="限制頻道 ID（留空代表不限）"
+									/>
+									<input
+										class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+										bind:value={allowedModelIds}
+										on:input={() => queueMicrotask(markDirty)}
+										placeholder="限制模型 ID（留空代表不限）"
+									/>
+								</div>
+
+								{#if allowAgentSelection}
+									<div class="space-y-2 rounded-lg border border-gray-200 p-3 dark:border-gray-800">
+										<div class="text-xs font-semibold text-gray-600 dark:text-gray-300">
+											代理選型測試
+										</div>
+										<textarea
+											class="h-20 w-full resize-y rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+											bind:value={selectorTestMessage}
+											placeholder="輸入一段真實使用者訊息"
+										></textarea>
+										<button
+											class="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm disabled:opacity-50 dark:border-gray-800"
+											on:click={testAgentSelection}
+											disabled={selectorTesting || isDirty || workflow.status !== 'published'}
+										>
+											{selectorTesting ? '判斷中...' : '測試已發布工作流選型'}
+										</button>
+										{#if isDirty || workflow.status !== 'published'}
+											<div class="text-xs leading-5 text-amber-700 dark:text-amber-300">
+												請先發布目前版本，才能得到與實際 Agent 相同的結果。
+											</div>
+										{/if}
+										{#if selectorResult}
+											<div class="rounded-lg bg-gray-50 p-3 text-xs dark:bg-gray-900">
+												<div
+													class="font-semibold {selectorResult.decision === 'selected'
+														? 'text-green-700 dark:text-green-300'
+														: selectorResult.decision === 'ambiguous'
+															? 'text-amber-700 dark:text-amber-300'
+															: 'text-gray-600 dark:text-gray-300'}"
+												>
+													{selectorResult.decision === 'selected'
+														? '可安全選擇'
+														: selectorResult.decision === 'ambiguous'
+															? '需要使用者確認'
+															: '不應呼叫工作流'}
+												</div>
+												{#each selectorResult.items.slice(0, 3) as item}
+													<div class="mt-2 flex items-center justify-between gap-3">
+														<span class="truncate">{item.name}</span>
+														<span class="font-mono">{Math.round(item.confidence * 100)}%</span>
+													</div>
+												{/each}
+											</div>
+										{/if}
 									</div>
 								{/if}
-								{#if selectorResult}
-									<div class="rounded-lg bg-gray-50 p-3 text-xs dark:bg-gray-900">
-										<div
-											class="font-semibold {selectorResult.decision === 'selected'
-												? 'text-green-700 dark:text-green-300'
-												: selectorResult.decision === 'ambiguous'
-													? 'text-amber-700 dark:text-amber-300'
-													: 'text-gray-600 dark:text-gray-300'}"
-										>
-											{selectorResult.decision === 'selected'
-												? '可安全選擇'
-												: selectorResult.decision === 'ambiguous'
-													? '需要使用者確認'
-													: '不應呼叫工作流'}
+							</section>
+						{/if}
+
+						{#if inspectorTab === 'node'}
+							{#if selectedNode && selectedNodeDefinition}
+								<section class="space-y-4">
+									<div class="rounded-lg border border-gray-200 p-3 dark:border-gray-800">
+										<div class="flex items-start justify-between gap-3">
+											<div>
+												<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">
+													{selectedNodeDefinition.label}
+												</div>
+												<div class="mt-1 font-mono text-[11px] text-gray-400">
+													{selectedNodeDefinition.type}
+												</div>
+											</div>
+											{#if nodeMissingRequiredConfig().length === 0}
+												<span
+													class="inline-flex items-center gap-1 rounded bg-green-50 px-2 py-1 text-[11px] font-medium text-green-700 dark:bg-green-950/50 dark:text-green-200"
+												>
+													<CheckCircle className="size-3.5" /> 設定完整
+												</span>
+											{:else}
+												<span
+													class="rounded bg-amber-50 px-2 py-1 text-[11px] font-medium text-amber-700 dark:bg-amber-950/50 dark:text-amber-200"
+													>缺少必要設定</span
+												>
+											{/if}
 										</div>
-										{#each selectorResult.items.slice(0, 3) as item}
-											<div class="mt-2 flex items-center justify-between gap-3">
-												<span class="truncate">{item.name}</span>
-												<span class="font-mono">{Math.round(item.confidence * 100)}%</span>
+										<p class="mt-3 text-xs leading-5 text-gray-500">
+											{selectedNodeDefinition.description}
+										</p>
+									</div>
+
+									<label class="block space-y-1.5">
+										<span class="text-xs font-semibold text-gray-700 dark:text-gray-200"
+											>畫布顯示名稱</span
+										>
+										<input
+											class="editor-input"
+											bind:value={selectedNodeLabel}
+											placeholder={selectedNodeDefinition.label}
+										/>
+									</label>
+
+									{#each selectedNodeFields as field}
+										<label class="block space-y-1.5">
+											<span
+												class="flex items-center gap-1 text-xs font-semibold text-gray-700 dark:text-gray-200"
+											>
+												{field.label}{#if field.required}<span
+														class="text-red-500"
+														aria-label="必填">*</span
+													>{/if}
+											</span>
+											{#if field.type === 'textarea'}
+												<textarea
+													class="editor-input min-h-28 resize-y"
+													value={configFieldValue(field)}
+													placeholder={field.placeholder ?? ''}
+													on:input={(event) => updateConfigField(field, event.currentTarget.value)}
+												></textarea>
+											{:else if field.type === 'select'}
+												<select
+													class="editor-input"
+													value={configFieldValue(field)}
+													on:change={(event) => updateConfigField(field, event.currentTarget.value)}
+												>
+													<option value="">請選擇</option>
+													{#if field.key === 'model_id'}
+														{#each $models as model}
+															<option value={model.id}>{model.name ?? model.id}</option>
+														{/each}
+													{:else if field.key === 'dataset_id'}
+														{#each semanticDatasets as dataset}
+															<option value={dataset.id}>{dataset.name}</option>
+														{/each}
+													{:else}
+														{#each field.options ?? [] as option}
+															<option value={option.value}>{option.label}</option>
+														{/each}
+													{/if}
+												</select>
+											{:else if field.type === 'checkbox'}
+												<span
+													class="flex items-start gap-2 rounded-lg border border-gray-200 p-3 dark:border-gray-800"
+												>
+													<input
+														class="mt-0.5"
+														type="checkbox"
+														checked={Boolean(configFieldValue(field))}
+														on:change={(event) =>
+															updateConfigField(field, event.currentTarget.checked)}
+													/>
+													<span class="text-xs leading-5 text-gray-500">{field.help}</span>
+												</span>
+											{:else if field.type === 'json'}
+												<textarea
+													class="editor-input min-h-36 resize-y font-mono text-xs"
+													value={configFieldValue(field)}
+													on:change={(event) => updateConfigField(field, event.currentTarget.value)}
+												></textarea>
+											{:else}
+												<input
+													class="editor-input"
+													type={field.type === 'number' ? 'number' : 'text'}
+													value={configFieldValue(field)}
+													min={field.min}
+													max={field.max}
+													step={field.step}
+													placeholder={field.placeholder ?? ''}
+													on:input={(event) => updateConfigField(field, event.currentTarget.value)}
+												/>
+											{/if}
+											{#if field.help && field.type !== 'checkbox'}
+												<span class="block text-xs leading-5 text-gray-500">{field.help}</span>
+											{/if}
+										</label>
+									{/each}
+
+									<details class="rounded-lg border border-gray-200 dark:border-gray-800">
+										<summary
+											class="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs font-medium text-gray-600 dark:text-gray-300"
+										>
+											<CodeBracket className="size-4" /> 進階 JSON
+										</summary>
+										<div class="border-t border-gray-200 p-3 dark:border-gray-800">
+											<textarea
+												class="h-44 w-full resize-y rounded-lg border border-gray-200 bg-transparent p-3 font-mono text-xs outline-none focus:border-blue-500 dark:border-gray-800"
+												bind:value={nodeConfigJson}
+												aria-label="節點進階 JSON 設定"
+											></textarea>
+										</div>
+									</details>
+
+									<div
+										class="sticky bottom-0 -mx-4 flex gap-2 border-t border-gray-200 bg-white px-4 py-3 dark:border-gray-800 dark:bg-gray-950"
+									>
+										<button
+											class="inline-flex flex-1 items-center justify-center gap-2 rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
+											on:click={applyNodeConfig}>套用設定</button
+										>
+										<button
+											class="inline-flex items-center justify-center rounded-lg border border-red-200 px-3 py-2 text-red-600 hover:bg-red-50 dark:border-red-900 dark:hover:bg-red-950"
+											on:click={deleteSelected}
+											title="刪除節點"
+											aria-label="刪除節點"
+										>
+											<GarbageBin className="size-4" />
+										</button>
+									</div>
+								</section>
+							{:else}
+								<section
+									class="rounded-lg border border-dashed border-gray-300 p-5 text-center dark:border-gray-700"
+								>
+									<div
+										class="mx-auto flex size-9 items-center justify-center rounded-lg bg-gray-100 text-gray-500 dark:bg-gray-900"
+									>
+										<InfoCircle className="size-5" />
+									</div>
+									<div class="mt-3 text-sm font-semibold text-gray-900 dark:text-gray-100">
+										尚未選取節點
+									</div>
+									<p class="mt-2 text-xs leading-5 text-gray-500">
+										在畫布選取節點後，這裡會顯示對應欄位與必要設定。
+									</p>
+								</section>
+							{/if}
+						{/if}
+
+						{#if inspectorTab === 'test'}
+							{#if validation}
+								<section class="rounded-xl border border-gray-200 p-3 text-sm dark:border-gray-800">
+									<div class="font-medium {validation.ok ? 'text-green-600' : 'text-red-600'}">
+										{validation.ok ? '工作流有效' : '工作流需要修正'}
+									</div>
+									{#each validation.errors as error}
+										<div class="mt-2 text-red-600">{error}</div>
+									{/each}
+									{#each validation.warnings as warning}
+										<div class="mt-2 text-amber-600">{warning}</div>
+									{/each}
+								</section>
+							{/if}
+
+							<section class="space-y-3">
+								<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">測試執行</div>
+								<textarea
+									class="h-28 w-full resize-none rounded-lg border border-gray-200 bg-transparent p-3 font-mono text-xs outline-none dark:border-gray-800"
+									bind:value={testInput}
+								></textarea>
+								<input
+									class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
+									bind:value={testModelId}
+									placeholder="測試模型 ID（模型節點未固定時使用）"
+								/>
+								<button
+									class="w-full rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
+									on:click={runWorkflow}
+									disabled={running}
+								>
+									{running ? '執行中...' : '執行測試'}
+								</button>
+							</section>
+
+							<section class="space-y-3">
+								<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">最近執行</div>
+								{#if runs.length === 0}
+									<div
+										class="rounded-lg border border-dashed border-gray-200 p-4 text-sm text-gray-500 dark:border-gray-800"
+									>
+										尚無執行紀錄。
+									</div>
+								{:else}
+									<div class="space-y-2">
+										{#each runs as run}
+											<div
+												class="rounded-lg border border-gray-200 p-3 text-xs dark:border-gray-800"
+											>
+												<div class="flex items-center justify-between gap-3">
+													<span
+														class="font-medium {run.status === 'success'
+															? 'text-green-600'
+															: run.status === 'error'
+																? 'text-red-600'
+																: 'text-gray-600'}"
+													>
+														{run.status}
+													</span>
+													<span class="text-gray-400"
+														>{formatDate(run.completed_at ?? run.created_at)}</span
+													>
+												</div>
+												{#if run.error}
+													<div class="mt-2 text-red-600">{run.error}</div>
+												{:else if run.output}
+													<pre
+														class="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-gray-50 p-2 text-gray-600 dark:bg-gray-900 dark:text-gray-300">{JSON.stringify(
+															run.output,
+															null,
+															2
+														)}</pre>
+												{/if}
 											</div>
 										{/each}
 									</div>
 								{/if}
-							</div>
+							</section>
 						{/if}
-					</section>
-
-					<section class="space-y-3">
-						<div class="flex items-center justify-between">
-							<div>
-								<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">節點庫</div>
-								<div class="text-xs text-gray-500">
-									{nodeSearch.trim()
-										? `找到 ${filteredNodeDefinitions.length} 個節點`
-										: `此分類有 ${selectedGroupCount} 個節點`}
-								</div>
-							</div>
-							<button
-								class="text-xs text-gray-500 hover:text-gray-900 dark:hover:text-gray-100"
-								on:click={() => {
-									jsonMode = !jsonMode;
-									syncJson();
-								}}
-							>
-								{jsonMode ? '畫布' : 'JSON'}
-							</button>
-						</div>
-						<input
-							class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none focus:border-blue-500 dark:border-gray-800"
-							bind:value={nodeSearch}
-							placeholder="搜尋節點"
-							aria-label="搜尋工作流節點"
-						/>
-						<div class="node-group-scroll flex gap-2 overflow-x-auto pb-1">
-							{#each NODE_GROUPS as group}
-								<button
-									class="node-group-pill {selectedNodeGroup === group.id ? 'selected' : ''}"
-									on:click={() => {
-										selectedNodeGroup = group.id;
-									}}
-									aria-pressed={selectedNodeGroup === group.id}
-								>
-									{group.label}
-								</button>
-							{/each}
-						</div>
-						<div class="node-palette space-y-2">
-							{#if filteredNodeDefinitions.length === 0}
-								<div
-									class="rounded-lg border border-dashed border-gray-200 p-4 text-sm text-gray-500 dark:border-gray-800"
-								>
-									沒有符合搜尋的節點。
-								</div>
-							{:else}
-								{#each filteredNodeDefinitions as definition}
-									<button
-										class="node-palette-item node-palette-{definition.category}"
-										on:click={() => addNode(definition.type)}
-										title={definition.description}
-									>
-										<span class="flex min-w-0 flex-1 flex-col text-left">
-											<span class="flex items-center gap-2 text-sm font-semibold">
-												<span class="truncate">{definition.label}</span>
-												<span
-													class="shrink-0 rounded px-1.5 py-0.5 text-[10px] {RUNTIME_SUPPORTED_NODE_TYPES.has(
-														definition.type
-													)
-														? 'bg-green-50 text-green-700 dark:bg-green-950 dark:text-green-200'
-														: 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-200'}"
-												>
-													{RUNTIME_SUPPORTED_NODE_TYPES.has(definition.type)
-														? '可執行'
-														: '設計預覽'}
-												</span>
-											</span>
-											<span class="mt-1 text-xs leading-5 text-gray-500 dark:text-gray-400">
-												{definition.description}
-											</span>
-										</span>
-										<span class="node-type-badge">{definition.type}</span>
-									</button>
-								{/each}
-							{/if}
-						</div>
-						<div
-							class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900 dark:border-amber-900/70 dark:bg-amber-950/40 dark:text-amber-100"
-						>
-							發布時會檢查每個節點是否已有正式執行器；尚未支援的節點會阻擋發布，避免執行時才失敗。
-						</div>
-						<button
-							class="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm dark:border-gray-800"
-							on:click={connectLastTwo}
-						>
-							連接最後兩個節點
-						</button>
-						<button
-							class="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm dark:border-gray-800"
-							on:click={deleteSelected}
-						>
-							刪除選取項目
-						</button>
-					</section>
-
-					{#if selectedNode}
-						<section class="space-y-3 rounded-lg border border-gray-200 p-3 dark:border-gray-800">
-							<div>
-								<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">節點設定</div>
-								<div class="mt-1 text-xs text-gray-500">
-									{selectedNode.data?.label || selectedNode.id} · {selectedNode.data?.type ||
-										selectedNode.type}
-								</div>
-							</div>
-							<div class="text-xs leading-5 text-gray-500">
-								模型節點可設定 <code>model_id</code>、<code>system_prompt</code>；提示節點使用
-								<code>template</code>；輸出節點可設定 <code>output_type</code>、<code>url</code
-								>、<code>filename</code> 或 <code>title</code>。
-							</div>
-							<textarea
-								class="h-40 w-full resize-y rounded-lg border border-gray-200 bg-transparent p-3 font-mono text-xs outline-none dark:border-gray-800"
-								bind:value={nodeConfigJson}
-								aria-label="節點 JSON 設定"
-							></textarea>
-							<button
-								class="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm dark:border-gray-800"
-								on:click={applyNodeConfig}>套用節點設定</button
-							>
-						</section>
-					{/if}
-
-					{#if validation}
-						<section class="rounded-xl border border-gray-200 p-3 text-sm dark:border-gray-800">
-							<div class="font-medium {validation.ok ? 'text-green-600' : 'text-red-600'}">
-								{validation.ok ? '工作流有效' : '工作流需要修正'}
-							</div>
-							{#each validation.errors as error}
-								<div class="mt-2 text-red-600">{error}</div>
-							{/each}
-							{#each validation.warnings as warning}
-								<div class="mt-2 text-amber-600">{warning}</div>
-							{/each}
-						</section>
-					{/if}
-
-					<section class="space-y-3">
-						<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">測試執行</div>
-						<textarea
-							class="h-28 w-full resize-none rounded-lg border border-gray-200 bg-transparent p-3 font-mono text-xs outline-none dark:border-gray-800"
-							bind:value={testInput}
-						></textarea>
-						<input
-							class="w-full rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-sm outline-none dark:border-gray-800"
-							bind:value={testModelId}
-							placeholder="測試模型 ID（模型節點未固定時使用）"
-						/>
-						<button
-							class="w-full rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white dark:bg-white dark:text-gray-900"
-							on:click={runWorkflow}
-							disabled={running}
-						>
-							{running ? '執行中...' : '執行測試'}
-						</button>
-					</section>
-
-					<section class="space-y-3">
-						<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">最近執行</div>
-						{#if runs.length === 0}
-							<div
-								class="rounded-lg border border-dashed border-gray-200 p-4 text-sm text-gray-500 dark:border-gray-800"
-							>
-								尚無執行紀錄。
-							</div>
-						{:else}
-							<div class="space-y-2">
-								{#each runs as run}
-									<div class="rounded-lg border border-gray-200 p-3 text-xs dark:border-gray-800">
-										<div class="flex items-center justify-between gap-3">
-											<span
-												class="font-medium {run.status === 'success'
-													? 'text-green-600'
-													: run.status === 'error'
-														? 'text-red-600'
-														: 'text-gray-600'}"
-											>
-												{run.status}
-											</span>
-											<span class="text-gray-400"
-												>{formatDate(run.completed_at ?? run.created_at)}</span
-											>
-										</div>
-										{#if run.error}
-											<div class="mt-2 text-red-600">{run.error}</div>
-										{:else if run.output}
-											<pre
-												class="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-gray-50 p-2 text-gray-600 dark:bg-gray-900 dark:text-gray-300">{JSON.stringify(
-													run.output,
-													null,
-													2
-												)}</pre>
-										{/if}
-									</div>
-								{/each}
-							</div>
-						{/if}
-					</section>
-				</fieldset>
+					</fieldset>
+				</div>
 			</aside>
 		</div>
 	</div>
 {/if}
 
 <style>
-	.node-group-scroll {
-		scrollbar-width: thin;
+	.workflow-editor-layout {
+		display: grid;
+		grid-template-columns: 292px minmax(420px, 1fr) 370px;
+		min-height: 0;
 	}
 
-	.node-group-pill {
-		white-space: nowrap;
-		border: 1px solid rgb(229 231 235);
-		border-radius: 999px;
-		padding: 0.45rem 0.75rem;
+	.compact-panel-tabs {
+		display: none;
+	}
+
+	.workflow-canvas,
+	.workflow-inspector {
+		min-width: 0;
+		min-height: 0;
+	}
+
+	.inspector-tab {
+		border-radius: 7px;
+		padding: 0.5rem 0.35rem;
 		font-size: 0.75rem;
 		font-weight: 600;
-		color: #475569;
-		background: transparent;
+		color: #64748b;
 		transition:
 			background 0.15s ease,
-			border-color 0.15s ease,
 			color 0.15s ease;
 	}
 
-	.node-group-pill:hover,
-	.node-group-pill.selected {
-		border-color: #2563eb;
-		background: rgb(37 99 235 / 0.08);
-		color: #1d4ed8;
-	}
-
-	:global(.dark) .node-group-pill {
-		border-color: rgb(31 41 55);
-		color: #cbd5e1;
-	}
-
-	:global(.dark) .node-group-pill:hover,
-	:global(.dark) .node-group-pill.selected {
-		border-color: #60a5fa;
-		background: rgb(96 165 250 / 0.12);
-		color: #bfdbfe;
-	}
-
-	.node-palette {
-		max-height: 25rem;
-		overflow-y: auto;
-		padding-right: 0.15rem;
-		scrollbar-width: thin;
-	}
-
-	.node-palette-item {
-		display: flex;
-		width: 100%;
-		align-items: flex-start;
-		gap: 0.75rem;
-		border: 1px solid rgb(229 231 235);
-		border-left-width: 4px;
-		border-radius: 0.5rem;
-		background: #ffffff;
-		padding: 0.75rem;
+	.inspector-tab:hover:not(:disabled) {
+		background: #f1f5f9;
 		color: #0f172a;
-		transition:
-			background 0.15s ease,
-			border-color 0.15s ease,
-			box-shadow 0.15s ease,
-			transform 0.15s ease;
 	}
 
-	.node-palette-item:hover {
-		border-color: rgb(148 163 184);
-		box-shadow: 0 8px 20px rgb(15 23 42 / 0.08);
-		transform: translateY(-1px);
+	.inspector-tab.active {
+		background: #e0e7ff;
+		color: #3730a3;
 	}
 
-	.node-palette-trigger {
-		border-left-color: #0ea5e9;
+	.inspector-tab:disabled {
+		cursor: not-allowed;
+		opacity: 0.42;
 	}
 
-	.node-palette-agent {
-		border-left-color: #8b5cf6;
-	}
-
-	.node-palette-model {
-		border-left-color: #2563eb;
-	}
-
-	.node-palette-prompt {
-		border-left-color: #f59e0b;
-	}
-
-	.node-palette-rag {
-		border-left-color: #14b8a6;
-	}
-
-	.node-palette-tool {
-		border-left-color: #6366f1;
-	}
-
-	.node-palette-logic {
-		border-left-color: #64748b;
-	}
-
-	.node-palette-output {
-		border-left-color: #10b981;
-	}
-
-	.node-palette-ops {
-		border-left-color: #ef4444;
-	}
-
-	.node-type-badge {
-		max-width: 8.5rem;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		border-radius: 999px;
-		background: rgb(241 245 249);
-		padding: 0.2rem 0.45rem;
-		font-family:
-			ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New',
-			monospace;
-		font-size: 0.65rem;
-		line-height: 1.2;
-		color: #475569;
-	}
-
-	:global(.dark) .node-palette-item {
-		border-color: rgb(31 41 55);
-		background: #0f172a;
+	:global(.dark) .inspector-tab:hover:not(:disabled) {
+		background: #1e293b;
 		color: #f8fafc;
 	}
 
-	:global(.dark) .node-palette-item:hover {
-		border-color: rgb(71 85 105);
-		box-shadow: 0 10px 24px rgb(0 0 0 / 0.3);
+	:global(.dark) .inspector-tab.active {
+		background: #312e81;
+		color: #e0e7ff;
 	}
 
-	:global(.dark) .node-type-badge {
-		background: rgb(30 41 59);
-		color: #cbd5e1;
+	.editor-input {
+		display: block;
+		width: 100%;
+		border: 1px solid #d1d5db;
+		border-radius: 8px;
+		background: transparent;
+		padding: 0.55rem 0.7rem;
+		font-size: 0.875rem;
+		line-height: 1.35;
+		outline: none;
+		transition:
+			border-color 0.15s ease,
+			box-shadow 0.15s ease;
+	}
+
+	.editor-input:focus {
+		border-color: #2563eb;
+		box-shadow: 0 0 0 3px rgb(37 99 235 / 0.14);
+	}
+
+	:global(.dark) .editor-input {
+		border-color: #374151;
+		color: #f8fafc;
+	}
+
+	:global(.dark) .editor-input option {
+		background: #111827;
+		color: #f8fafc;
+	}
+
+	@media (max-width: 1279px) {
+		.compact-panel-tabs {
+			display: block;
+		}
+
+		.workflow-editor-layout {
+			display: block;
+			position: relative;
+		}
+
+		.workflow-editor-layout > :global(*) {
+			display: none;
+			height: 100%;
+		}
+
+		.workflow-editor-layout[data-compact-panel='library'] > :global(.node-library),
+		.workflow-editor-layout[data-compact-panel='canvas'] > .workflow-canvas,
+		.workflow-editor-layout[data-compact-panel='inspector'] > .workflow-inspector {
+			display: flex;
+		}
+
+		.workflow-editor-layout[data-compact-panel='canvas'] > .workflow-canvas {
+			display: block;
+		}
+
+		.workflow-inspector {
+			border-left: 0;
+		}
+	}
+
+	@media (max-width: 639px) {
+		.canvas-guide,
+		.canvas-status,
+		.workflow-canvas :global(.svelte-flow__minimap) {
+			display: none;
+		}
 	}
 
 	.workflow-canvas :global(.svelte-flow__node-default),

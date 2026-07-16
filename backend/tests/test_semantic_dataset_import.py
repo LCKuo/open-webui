@@ -1,3 +1,5 @@
+from open_webui.semantic_query.compiler import SemanticCompiler
+from open_webui.semantic_query.contracts import QueryPlan
 from open_webui.semantic_query.dataset_import import resolve_portable_dataset
 
 
@@ -181,6 +183,29 @@ def test_portable_import_resolves_non_crm_schema_and_preserves_semantics():
     assert definition['measures'][0]['filters'][0]['fieldId'] == 'shipment-status'
     assert definition['measures'][1]['aggregation'] == 'count_distinct'
     assert definition['metrics'][0]['expression']['rightMeasureId'] == 'shipment.count'
+
+
+def test_portable_import_compiles_relationships_with_non_readable_join_keys():
+    catalog = portable_catalog()
+    catalog['objects'][0]['fields'][1]['readable'] = False
+    catalog['objects'][1]['fields'][0]['readable'] = False
+
+    result = resolve_portable_dataset(portable_document(), catalog, 'connector-logistics')
+
+    assert result['ok'] is True
+    compiled = SemanticCompiler('postgresql', catalog, result['dataset']['definition']).compile(
+        QueryPlan.model_validate(
+            {
+                'datasetId': 'delivery-performance',
+                'dimensions': ['agent.name'],
+                'measures': ['shipment.fees'],
+                'orderBy': [{'fieldId': 'shipment.fees', 'direction': 'desc'}],
+                'limit': 20,
+            }
+        )
+    )
+    assert 't0."agent_id" = t1."id"' in compiled.sql
+    assert compiled.joins == ['shipments-to-agents']
 
 
 def test_portable_import_reports_missing_objects_without_saving_partial_definition():

@@ -13,6 +13,7 @@ from open_webui.semantic_query.service import (
     _connector_allowed,
     _dataset_allowed,
     _enforce_connector_catalog_policy,
+    _execute_sync,
     _manifest_score,
     _redact_plan,
     execute_query,
@@ -200,6 +201,37 @@ def test_compiler_generates_parameterized_read_only_sql(connector_type, table_fr
     assert compiled.parameters == ['A%']
     assert ';' not in compiled.sql
     assert compiled.joins == ['orders_employee']
+
+
+def test_compiler_allows_non_readable_keys_for_confirmed_relationship_joins():
+    catalog = catalog_fixture()
+    catalog['objects'][0]['fields'][1]['readable'] = False
+    catalog['objects'][1]['fields'][0]['readable'] = False
+
+    compiled = SemanticCompiler('postgresql', catalog, definition_fixture()).compile(plan_fixture())
+
+    assert 't0."salesperson_id" = t1."id"' in compiled.sql
+    assert compiled.joins == ['orders_employee']
+
+
+def test_compiler_does_not_make_non_readable_relationship_keys_selectable():
+    catalog = catalog_fixture()
+    catalog['objects'][0]['fields'][1]['readable'] = False
+    definition = definition_fixture()
+    definition['dimensions'].append(
+        {
+            'id': 'sales.salesperson_id',
+            'name': 'Salesperson ID',
+            'fieldId': 'orders.salesperson_id',
+        }
+    )
+    plan = plan_fixture()
+    plan.dimensions.append('sales.salesperson_id')
+
+    with pytest.raises(SemanticQueryError) as captured:
+        SemanticCompiler('postgresql', catalog, definition).compile(plan)
+
+    assert captured.value.code == 'SEMANTIC-FIELD-NOT-ALLOWED'
 
 
 def test_query_plan_rejects_raw_sql_and_unknown_properties():
@@ -481,9 +513,39 @@ def test_external_channel_requires_explicit_connector_and_dataset_channel_access
     _dataset_allowed(dataset, external)
 
     dataset['access_mode'] = 'all_company_members'
+    _dataset_allowed(dataset, external)
+
+    external.channel_id = 'channel-b'
     with pytest.raises(SemanticQueryError) as captured:
         _dataset_allowed(dataset, external)
     assert captured.value.code == 'SEMANTIC-DATASET-NOT-ALLOWED'
+
+
+def test_dataset_channel_allowlist_adds_external_access_without_blocking_internal_principals():
+    dataset = {
+        'company_user_id': 'company-a',
+        'status': 'published',
+        'current_version_id': 'version-1',
+        'access_mode': 'company_admins',
+        'allowed_member_ids': [],
+        'allowed_group_ids': [],
+        'allowed_model_ids': ['model-a'],
+        'allowed_channel_ids': ['channel-a'],
+        'allowed_workflow_ids': [],
+    }
+    internal_admin = runtime_context()
+    internal_admin.user_role = 'admin'
+    internal_admin.channel_id = None
+    internal_admin.workflow_id = None
+    _dataset_allowed(dataset, internal_admin)
+
+    external = runtime_context(groups=[])
+    external.company_member_id = None
+    external.company_member_role = None
+    external.external_user_id = 'line-user-a'
+    external.channel_source = 'line'
+    external.workflow_id = None
+    _dataset_allowed(dataset, external)
 
 
 def test_row_policy_resolves_trusted_context_and_denies_missing_values():
@@ -637,6 +699,46 @@ async def test_query_validation_does_not_reserve_daily_entitlement(monkeypatch):
 
     assert captured.value.code == 'QUERY-PLAN-INVALID'
     assert calls == []
+
+
+def test_postgres_execution_sets_a_parameterized_local_timeout(monkeypatch):
+    commands = []
+
+    class Cursor:
+        description = [('employee.name',)]
+
+        def execute(self, sql, parameters=None):
+            commands.append((sql, parameters))
+
+        def fetchall(self):
+            return [('Amy',)]
+
+        def close(self):
+            pass
+
+    class Connection:
+        autocommit = True
+
+        def cursor(self):
+            return Cursor()
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr('open_webui.semantic_query.service._pg_connect', lambda _connector: Connection())
+    connector = connector_fixture()
+
+    rows = _execute_sync(connector, 'SELECT %s AS "employee.name"', ['Amy'])
+
+    assert rows == [{'employee.name': 'Amy'}]
+    assert commands == [
+        ('SET TRANSACTION READ ONLY', None),
+        ("SELECT set_config('statement_timeout', %s, true)", ('10000ms',)),
+        ('SELECT %s AS "employee.name"', ['Amy']),
+    ]
 
 
 @pytest.mark.asyncio

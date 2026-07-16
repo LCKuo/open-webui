@@ -219,20 +219,21 @@ def _dataset_allowed(dataset: dict[str, Any], context: QueryRuntimeContext) -> N
     if dataset.get('status') not in {'published', 'degraded'} or not dataset.get('current_version_id'):
         raise SemanticQueryError('SEMANTIC-DATASET-NOT-PUBLISHED')
     access_mode = dataset.get('access_mode') or 'company_admins'
-    if access_mode == 'selected_channels' and (
-        not context.channel_id or context.channel_id not in (dataset.get('allowed_channel_ids') or [])
-    ):
-        raise SemanticQueryError('SEMANTIC-DATASET-NOT-ALLOWED', 'The channel is not explicitly allowed.')
-    if not _principal_allowed(
+    allowed_channels = dataset.get('allowed_channel_ids') or []
+    if context.external_user_id:
+        if not context.channel_id or context.channel_id not in allowed_channels:
+            raise SemanticQueryError('SEMANTIC-DATASET-NOT-ALLOWED', 'The channel is not explicitly allowed.')
+    elif not _principal_allowed(
         access_mode,
         dataset.get('allowed_member_ids') or [],
         dataset.get('allowed_group_ids') or [],
         context,
     ):
         raise SemanticQueryError('SEMANTIC-DATASET-NOT-ALLOWED')
+    if context.channel_id and allowed_channels and context.channel_id not in allowed_channels:
+        raise SemanticQueryError('SEMANTIC-DATASET-NOT-ALLOWED', 'The channel is not explicitly allowed.')
     for key, value in (
         ('allowed_model_ids', context.model_id),
-        ('allowed_channel_ids', context.channel_id),
         ('allowed_workflow_ids', context.workflow_id),
     ):
         allowed = dataset.get(key) or []
@@ -561,7 +562,10 @@ def _execute_sync(connector: InteractDataConnectorModel, sql: str, parameters: l
             connection.autocommit = False
             cursor = connection.cursor()
             cursor.execute('SET TRANSACTION READ ONLY')
-            cursor.execute('SET LOCAL statement_timeout = %s', (connector.query_timeout_seconds * 1000,))
+            cursor.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f'{connector.query_timeout_seconds * 1000}ms',),
+            )
         elif connector_type in {'mysql', 'mariadb'}:
             connection = _mysql_connect(connector)
             cursor = connection.cursor()
