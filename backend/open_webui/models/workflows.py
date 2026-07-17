@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from typing import Any, Literal, Optional
 from uuid import uuid4
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 _tables_ready = False
 _tables_lock = asyncio.Lock()
 _publish_locks: dict[str, asyncio.Lock] = {}
+log = logging.getLogger(__name__)
 
 WorkflowVisibility = Literal['private', 'shared', 'public_template']
 WorkflowStatus = Literal['draft', 'published', 'archived']
@@ -167,6 +169,22 @@ class WorkflowTable:
                         checkfirst=True,
                     )
                 )
+            from open_webui.utils.workflow_launch import add_guidance_node_to_legacy_graph
+
+            async with get_async_db_context() as db:
+                rows = (await db.execute(select(Workflow))).scalars().all()
+                upgraded = False
+                for row in rows:
+                    try:
+                        graph, changed = add_guidance_node_to_legacy_graph(row.graph, row.meta)
+                    except Exception:
+                        log.exception('Unable to upgrade legacy workflow graph id=%s', row.id)
+                        continue
+                    if changed:
+                        row.graph = graph
+                        upgraded = True
+                if upgraded:
+                    await db.commit()
             _tables_ready = True
 
     async def insert(
@@ -364,7 +382,9 @@ class WorkflowTable:
                     raise ValueError('The published workflow version no longer exists.')
 
                 # Restore the immutable published contract, never an unreviewed draft graph.
-                workflow.graph = version.graph
+                from open_webui.utils.workflow_launch import add_guidance_node_to_legacy_graph
+
+                workflow.graph, _ = add_guidance_node_to_legacy_graph(version.graph, version.meta)
                 workflow.meta = version.meta
                 workflow.status = 'published'
                 workflow.updated_at = int(time.time_ns())

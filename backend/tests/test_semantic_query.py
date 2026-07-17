@@ -21,7 +21,12 @@ from open_webui.semantic_query.service import (
     validate_dataset_definition,
     validate_query,
 )
-from open_webui.tools.interact_database import QueryContext, _connector_context_allowed
+from open_webui.tools.interact_database import (
+    QueryContext,
+    _connector_context_allowed,
+    _load_connector,
+    _resolve_default_connector,
+)
 from pydantic import ValidationError
 
 
@@ -458,6 +463,26 @@ def test_legacy_connector_selected_channel_requires_company_and_channel():
     context.channel_id = 'channel-a'
     context.company_user_id = 'company-b'
     assert _connector_context_allowed(connector, context) is False
+
+
+@pytest.mark.asyncio
+async def test_external_channel_cannot_fall_back_to_webui_local_admin_connector():
+    context = QueryContext(
+        user_id='webui-admin',
+        user_role='admin',
+        model_id='model-a',
+        channel_id='line-channel',
+        channel_source='channel',
+        company_user_id=None,
+        company_member_id=None,
+        company_member_role=None,
+        group_ids=[],
+    )
+
+    with pytest.raises(PermissionError, match='No company identity'):
+        await _resolve_default_connector(context)
+    with pytest.raises(PermissionError, match='interactive WebUI administrators'):
+        await _load_connector('webui_local', context)
 
 
 def test_dataset_acl_requires_every_context_scope():

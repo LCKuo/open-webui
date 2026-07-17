@@ -82,7 +82,9 @@ const INSTRUCTIONS: Record<WorkflowLaunchMode, string> = {
 
 const inferredMode = (workflow: Pick<WorkflowResponse, 'graph'>): WorkflowLaunchMode => {
 	const types = new Set(
-		(workflow.graph?.nodes ?? []).map((node) => node?.data?.type ?? node?.data?.kind).filter(Boolean)
+		(workflow.graph?.nodes ?? [])
+			.map((node) => node?.data?.type ?? node?.data?.kind)
+			.filter(Boolean)
 	);
 	if (types.has('file_upload')) return 'file_input';
 	if (types.has('form_input')) return 'form_input';
@@ -100,7 +102,14 @@ const boundedInteger = (value: unknown, fallback: number, minimum: number, maxim
 export const normalizeWorkflowLaunch = (
 	workflow: Pick<WorkflowResponse, 'graph' | 'meta'>
 ): WorkflowLaunchConfig => {
-	const raw = workflow.meta?.launch ?? {};
+	const guidanceNode = (workflow.graph?.nodes ?? []).find(
+		(node) => (node?.data?.type ?? node?.data?.kind) === 'user_input'
+	);
+	const nodeLaunch = guidanceNode?.data?.config?.launch;
+	const raw =
+		nodeLaunch && typeof nodeLaunch === 'object' && !Array.isArray(nodeLaunch)
+			? nodeLaunch
+			: (workflow.meta?.launch ?? {});
 	const mode = WORKFLOW_LAUNCH_OPTIONS.some((item) => item.value === raw.mode)
 		? (raw.mode as WorkflowLaunchMode)
 		: inferredMode(workflow);
@@ -125,7 +134,8 @@ export const normalizeWorkflowLaunch = (
 					required: [],
 					additionalProperties: false as const
 				};
-	const schema = raw.inputSchema && typeof raw.inputSchema === 'object' ? raw.inputSchema : defaultSchema;
+	const schema =
+		raw.inputSchema && typeof raw.inputSchema === 'object' ? raw.inputSchema : defaultSchema;
 	return {
 		version: 1,
 		mode,
@@ -163,14 +173,16 @@ export const workflowLaunchLabel = (workflow: Pick<WorkflowResponse, 'graph' | '
 
 export const workflowLaunchSummary = (workflow: Pick<WorkflowResponse, 'graph' | 'meta'>) => {
 	const launch = normalizeWorkflowLaunch(workflow);
-	return WORKFLOW_LAUNCH_OPTIONS.find((item) => item.value === launch.mode)?.label ?? launch.buttonLabel;
+	return (
+		WORKFLOW_LAUNCH_OPTIONS.find((item) => item.value === launch.mode)?.label ?? launch.buttonLabel
+	);
 };
 
 export const buildWorkflowLaunchInput = (
 	launch: WorkflowLaunchConfig,
 	values: Record<string, unknown>,
 	message: string,
-	files: any[]
+	files: unknown[]
 ) => {
 	const merged = { ...launch.defaultInput, ...values };
 	const resolvedMessage = String(message || merged.message || '');

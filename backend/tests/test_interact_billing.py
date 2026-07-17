@@ -9,6 +9,7 @@ from open_webui.utils.interact_billing import (
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 
 def test_internal_context_summary_hides_transcript_from_usage_log():
@@ -136,6 +137,103 @@ async def test_authorize_sends_company_member_context():
     assert authorize_payload["metadata"]["companyMemberRole"] == "member"
     assert authorization.company_member_id == "member-1"
     assert authorization.company_member_email == "member@example.com"
+
+
+@pytest.mark.asyncio
+async def test_authorize_line_owner_uses_company_identity_without_member_context():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-owner", email="owner@example.com")
+    metadata = {
+        "chat_id": "chat",
+        "message_id": "message",
+        "session_id": "session",
+        "interact_channel": {
+            "identitySource": "line-binding",
+            "companyUserId": "company-1",
+            "companyMemberId": None,
+            "companyMemberEmail": "owner@example.com",
+            "companyMemberRole": "owner",
+        },
+    }
+
+    authorization = await client.authorize(
+        user,
+        {
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 10,
+        },
+        metadata,
+    )
+
+    authorize_payload = client.requests[-1][2]
+    assert authorize_payload["company_user_id"] == "company-1"
+    assert "company_member_id" not in authorize_payload
+    assert "company_member_email" not in authorize_payload
+    assert "companyMemberId" not in authorize_payload["metadata"]
+    assert metadata["interact_company"] == {"companyUserId": "company-1"}
+    assert authorization.company_member_id is None
+    assert authorization.company_member_email is None
+
+
+@pytest.mark.asyncio
+async def test_authorize_line_member_keeps_verified_member_context():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-owner", email="owner@example.com")
+    metadata = {
+        "chat_id": "chat",
+        "message_id": "message",
+        "interact_channel": {
+            "identitySource": "line-binding",
+            "companyUserId": "company-1",
+            "companyMemberId": "member-1",
+            "companyMemberEmail": "member@example.com",
+            "companyMemberRole": "member",
+        },
+    }
+
+    authorization = await client.authorize(
+        user,
+        {
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 10,
+        },
+        metadata,
+    )
+
+    authorize_payload = client.requests[-1][2]
+    assert authorize_payload["company_member_id"] == "member-1"
+    assert authorize_payload["company_member_email"] == "member@example.com"
+    assert authorization.company_member_id == "member-1"
+
+
+@pytest.mark.asyncio
+async def test_authorize_line_member_without_member_id_fails_closed():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-owner", email="owner@example.com")
+
+    with pytest.raises(HTTPException) as error:
+        await client.authorize(
+            user,
+            {
+                "model": "model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_completion_tokens": 10,
+            },
+            {
+                "interact_channel": {
+                    "identitySource": "line-binding",
+                    "companyUserId": "company-1",
+                    "companyMemberId": None,
+                    "companyMemberEmail": "member@example.com",
+                    "companyMemberRole": "member",
+                },
+            },
+        )
+
+    assert getattr(error.value, "status_code", None) == 403
+    assert client.requests == []
 
 
 @pytest.mark.asyncio

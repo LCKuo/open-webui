@@ -3,8 +3,10 @@ import base64
 import datetime as dt
 import hashlib
 import hmac
+import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -25,16 +27,19 @@ from markdown import markdown as render_markdown
 from open_webui.models.auths import Auths
 from open_webui.models.chats import ChatForm, Chats
 from open_webui.models.config import Config
+from open_webui.models.files import FileForm, Files
 from open_webui.models.interact_channels import (
     InteractChannelModel,
     InteractChannels,
+    InteractLineIdentityBindingModel,
 )
 from open_webui.models.interact_data_connectors import InteractDataConnectors
 from open_webui.models.interact_sso import InteractSsoTickets
-from open_webui.tools.interact_database import scan_data_connector_schema
 from open_webui.models.users import Users
-from open_webui.utils.auth import get_password_hash, get_verified_user
+from open_webui.storage.provider import Storage
+from open_webui.tools.interact_database import scan_data_connector_schema
 from open_webui.utils.assistant_content import output_text, response_text
+from open_webui.utils.auth import get_password_hash, get_verified_user
 from open_webui.utils.automations import (
     _resolve_model_features,
     _resolve_model_filter_ids,
@@ -50,8 +55,14 @@ from open_webui.utils.interact_billing import (
     is_billing_enabled,
     usage_token_counts,
 )
+from open_webui.utils.line_rich_menu import (
+    build_line_role_menus,
+    parse_line_postback_data,
+)
 from open_webui.utils.misc import get_message_list, validate_email_format
 from open_webui.utils.models import get_all_models
+from open_webui.utils.workflow_launch import validate_launch_input
+from open_webui.utils.workflows import WorkflowAccessContext
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from starlette.responses import StreamingResponse
@@ -73,12 +84,28 @@ LINE_WORKFLOW_MENU_COMMANDS = {
     '工作流選單',
     '選單',
 }
+LINE_ACCOUNT_LINK_COMMANDS = {
+    '綁定帳號',
+    '綁定企業帳號',
+    '帳號綁定',
+}
 LINE_WORKFLOW_MENU_LIMIT = 6
+LINE_WORKFLOW_MAX_CAROUSEL_BUBBLES = 12
+LINE_WORKFLOW_MAX_MENU_OPTIONS = LINE_WORKFLOW_MENU_LIMIT * LINE_WORKFLOW_MAX_CAROUSEL_BUBBLES
+try:
+    _line_inbound_max_mb = int(os.environ.get('LINE_INBOUND_MAX_FILE_MB', '50'))
+except (TypeError, ValueError):
+    _line_inbound_max_mb = 50
+MAX_LINE_INBOUND_CONTENT_BYTES = max(1, min(500, _line_inbound_max_mb)) * 1024 * 1024
 _context_summary_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 _channel_worker_tasks: set[asyncio.Task] = set()
 _channel_worker_stop: asyncio.Event | None = None
 _channel_worker_wakeup: asyncio.Event | None = None
 _channel_worker_expected = 0
+_line_rich_menu_tasks: set[asyncio.Task] = set()
+_line_rich_menu_tasks_by_channel: dict[str, asyncio.Task] = {}
+_line_rich_menu_resync: dict[str, bool] = {}
+_line_rich_menu_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 def _channel_worker_setting(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -154,8 +181,16 @@ async def _process_channel_job(app, worker_id: str, job, lease_seconds: int, max
                     str(payload.get('workflowVersionId') or '') or None,
                     str(payload.get('workflowTrigger') or '') or None,
                     payload.get('workflowData') if isinstance(payload.get('workflowData'), dict) else {},
+                    payload.get('companyIdentity') if isinstance(payload.get('companyIdentity'), dict) else None,
                 )
-            await InteractChannels.save_job_result(job.id, result, lease_seconds)
+            saved = await InteractChannels.save_job_result(
+                job.id,
+                worker_id,
+                result,
+                lease_seconds,
+            )
+            if not saved:
+                raise RuntimeError('Channel job lease was lost before saving the result.')
 
         if job.platform == 'line':
             await _send_line_push_result(
@@ -166,14 +201,20 @@ async def _process_channel_job(app, worker_id: str, job, lease_seconds: int, max
             )
         else:
             raise RuntimeError(f'Unsupported queued channel platform: {job.platform}')
-        await InteractChannels.complete_job(job.id)
+        if not await InteractChannels.complete_job(job.id, worker_id):
+            raise RuntimeError('Channel job lease was lost before completion.')
     except asyncio.CancelledError:
-        await InteractChannels.release_job(job.id)
+        await InteractChannels.release_job(job.id, worker_id)
         raise
     except Exception as error:
         log.exception('Interact channel job failed: job=%s attempt=%s', job.id, job.attempts)
-        will_retry = await InteractChannels.retry_job(job.id, str(error), max_attempts=max_attempts)
-        if not will_retry and channel and job.platform == 'line':
+        retry_state = await InteractChannels.retry_job(
+            job.id,
+            worker_id,
+            str(error),
+            max_attempts=max_attempts,
+        )
+        if retry_state is False and channel and job.platform == 'line':
             fallback = channel.fallback_message or '資料查詢發生錯誤，請稍後再試或聯繫管理員。'
             try:
                 await _send_line_push(
@@ -182,7 +223,7 @@ async def _process_channel_job(app, worker_id: str, job, lease_seconds: int, max
                     fallback,
                     retry_key=str(uuid5(NAMESPACE_URL, f'{job.id}:fallback')),
                 )
-                await InteractChannels.complete_job(job.id)
+                await InteractChannels.complete_job(job.id, worker_id)
             except Exception:
                 log.exception('Interact channel terminal fallback delivery failed: job=%s', job.id)
     finally:
@@ -218,6 +259,7 @@ async def start_channel_job_workers(app) -> None:
     global _channel_worker_stop, _channel_worker_wakeup, _channel_worker_expected
     await InteractChannels.ensure_tables()
     await InteractChannels.cleanup_jobs()
+    await InteractChannels.cleanup_workflow_sessions()
     if _channel_worker_tasks:
         return
     _channel_worker_stop = asyncio.Event()
@@ -233,6 +275,8 @@ async def start_channel_job_workers(app) -> None:
         _channel_worker_tasks.add(task)
         task.add_done_callback(_channel_worker_tasks.discard)
     log.info('Started %s durable interact channel workers.', worker_count)
+    for channel_id in await InteractChannels.list_rich_menu_channel_ids(statuses={'pending', 'syncing', 'active'}):
+        schedule_line_rich_menu_sync(channel_id)
 
 
 async def stop_channel_job_workers() -> None:
@@ -248,6 +292,14 @@ async def stop_channel_job_workers() -> None:
     _channel_worker_stop = None
     _channel_worker_wakeup = None
     _channel_worker_expected = 0
+    rich_menu_tasks = list(_line_rich_menu_tasks)
+    for task in rich_menu_tasks:
+        task.cancel()
+    if rich_menu_tasks:
+        await asyncio.gather(*rich_menu_tasks, return_exceptions=True)
+    _line_rich_menu_tasks.clear()
+    _line_rich_menu_tasks_by_channel.clear()
+    _line_rich_menu_resync.clear()
 
 
 def wake_channel_job_workers() -> None:
@@ -320,6 +372,10 @@ CHANNEL_RUNTIME_ERROR_MESSAGES = {
     'AI-MODEL-NOT-FOUND': '此渠道設定的 AI 模型不存在或已停用。',
     'AI-ACCOUNT-NOT-FOUND': '此渠道綁定的 WebUI 帳號不存在。',
     'AI-ACCOUNT-PENDING': '此渠道綁定的 WebUI 帳號尚未完成啟用。',
+    'COMPANY-IDENTITY-NOT-FOUND': '企業帳號授權資料不一致，請重新綁定 LINE 帳號或聯繫管理員。',
+    'COMPANY-ACCOUNT-INACTIVE': '企業帳號或方案目前無法使用，請由管理員檢查方案狀態。',
+    'COMPANY-TOKEN-BALANCE-INSUFFICIENT': '企業 AI 使用額度不足，請由管理員補充額度。',
+    'BILLING-AUTHORIZATION-FAILED': '企業 AI 使用授權失敗，請聯繫管理員。',
     'AI-RUNTIME-FAILED': 'AI 執行服務發生未分類錯誤，請聯繫管理員。',
 }
 
@@ -334,9 +390,31 @@ def _channel_runtime_failure(detail: str) -> tuple[str, str]:
         code = 'AI-ACCOUNT-NOT-FOUND'
     elif 'pending approval' in lowered:
         code = 'AI-ACCOUNT-PENDING'
+    elif 'member_not_found' in lowered or 'company member binding is incomplete' in lowered:
+        code = 'COMPANY-IDENTITY-NOT-FOUND'
+    elif 'company portal account is inactive' in lowered or 'account_inactive' in lowered:
+        code = 'COMPANY-ACCOUNT-INACTIVE'
+    elif 'token balance is insufficient' in lowered or 'insufficient_tokens' in lowered:
+        code = 'COMPANY-TOKEN-BALANCE-INSUFFICIENT'
+    elif 'billing authorization failed' in lowered:
+        code = 'BILLING-AUTHORIZATION-FAILED'
     else:
         code = 'AI-RUNTIME-FAILED'
     return code, f'{CHANNEL_RUNTIME_ERROR_MESSAGES[code]}（錯誤代碼：{code}）'
+
+
+def _runtime_error_detail(*payloads: Any) -> str:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        error = payload.get('error')
+        if isinstance(error, dict):
+            detail = error.get('content') or error.get('detail') or error.get('message')
+        else:
+            detail = error
+        if detail:
+            return str(detail).strip()
+    return ''
 
 
 def _context_summary_settings() -> tuple[int, int, int]:
@@ -464,9 +542,7 @@ def _safe_sso_return_url(value: str | None) -> str | None:
     if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password:
         return None
     configured = {
-        item.strip().lower()
-        for item in (os.environ.get('INTERACT_SSO_RETURN_HOSTS') or '').split(',')
-        if item.strip()
+        item.strip().lower() for item in (os.environ.get('INTERACT_SSO_RETURN_HOSTS') or '').split(',') if item.strip()
     }
     allowed = {'interact-vision.com.tw', 'www.interact-vision.com.tw', 'localhost', '127.0.0.1'} | configured
     if parsed.hostname.lower() not in allowed:
@@ -492,6 +568,11 @@ class ChannelChatRequest(BaseModel):
     workflowVersionId: str | None = Field(default=None, min_length=1, max_length=128)
     workflowTrigger: str | None = Field(default=None, min_length=1, max_length=80)
     workflowData: dict[str, Any] = Field(default_factory=dict)
+    companyUserId: str | None = Field(default=None, max_length=200)
+    companyMemberId: str | None = Field(default=None, max_length=200)
+    companyMemberEmail: str | None = Field(default=None, max_length=320)
+    companyMemberRole: str | None = Field(default=None, max_length=40)
+    companyGroupIds: list[str] = Field(default_factory=list, max_length=200)
 
 
 class ProvisionAccountRequest(BaseModel):
@@ -516,8 +597,33 @@ class ChannelHealthRequest(BaseModel):
     allowMissingUser: bool = False
 
 
+class RichMenuSyncRequest(BaseModel):
+    companyEmail: str = Field(..., min_length=3, max_length=320)
+    companyUserId: str | None = Field(default=None, max_length=200)
+    force: bool = False
+
+
+class LineIdentityPrepareRequest(BaseModel):
+    companyEmail: str = Field(..., min_length=3, max_length=320)
+    companyUserId: str = Field(..., min_length=1, max_length=200)
+    state: str = Field(..., min_length=20, max_length=300)
+    linkToken: str = Field(..., min_length=20, max_length=300)
+    companyMemberId: str | None = Field(default=None, max_length=200)
+    memberEmail: str = Field(..., min_length=3, max_length=320)
+    memberRole: Literal['owner', 'admin', 'member']
+    memberStatus: Literal['active'] = 'active'
+    groupIds: list[str] = Field(default_factory=list, max_length=200)
+
+
+class LineIdentityUnlinkRequest(BaseModel):
+    companyEmail: str = Field(..., min_length=3, max_length=320)
+    companyUserId: str = Field(..., min_length=1, max_length=200)
+    bindingId: str = Field(..., min_length=1, max_length=200)
+
+
 class ChannelSyncRequest(BaseModel):
     companyEmail: str = Field(..., min_length=3, max_length=320)
+    companyUserId: str | None = Field(default=None, max_length=200)
     channelType: Literal['line', 'wechat', 'telegram']
     channelIdentifier: str = Field(..., min_length=1, max_length=160)
     name: str = Field(..., min_length=1, max_length=80)
@@ -534,6 +640,8 @@ class ChannelSyncRequest(BaseModel):
     maxConcurrentJobs: int = Field(default=8, ge=1, le=64)
     dailyUserLimit: int = Field(default=50, ge=1, le=10000)
     dailyBotTokenLimit: int = Field(default=100000, ge=1000, le=10000000)
+    richMenuEnabled: bool = False
+    richMenuLiffUri: str | None = Field(default=None, max_length=1000)
 
 
 class DataConnectorAllowedChannelRef(BaseModel):
@@ -566,9 +674,9 @@ class DataConnectorSyncRequest(BaseModel):
     max_rows: int = Field(default=100, ge=1, le=10000)
     query_timeout_seconds: int = Field(default=15, ge=1, le=300)
     allow_write: bool = False
-    access_mode: Literal[
-        'company_admins', 'selected_members', 'all_company_members', 'selected_channels'
-    ] = 'company_admins'
+    access_mode: Literal['company_admins', 'selected_members', 'all_company_members', 'selected_channels'] = (
+        'company_admins'
+    )
     allowed_member_ids: list[str] = Field(default_factory=list, max_length=300)
     allowed_group_ids: list[str] = Field(default_factory=list, max_length=300)
     allowed_model_ids: list[str] = Field(default_factory=list, max_length=300)
@@ -701,7 +809,10 @@ def _tool_failure_from_items(items: Any) -> tuple[str, str] | None:
                 message = str(payload.get('message') or '工具執行失敗，請聯繫管理員。')
                 return code, f'{message}（錯誤代碼：{code}）'
             if raw.startswith('Error: Tool call arguments could not be parsed'):
-                return 'TOOL-ARGUMENTS-INVALID', '模型產生的工具參數格式不正確，請重新描述需求。（錯誤代碼：TOOL-ARGUMENTS-INVALID）'
+                return (
+                    'TOOL-ARGUMENTS-INVALID',
+                    '模型產生的工具參數格式不正確，請重新描述需求。（錯誤代碼：TOOL-ARGUMENTS-INVALID）',
+                )
             if raw.startswith('Error: Tool "') and raw.endswith('not found.'):
                 return 'TOOL-NOT-AVAILABLE', '模型要求的工具目前不可用或未獲授權。（錯誤代碼：TOOL-NOT-AVAILABLE）'
             if tool_name.startswith('interact_database') and raw.lower().startswith('error:'):
@@ -1229,6 +1340,7 @@ async def _run_channel_message(
     workflow_version_id: str | None = None,
     workflow_trigger: str | None = None,
     workflow_data: dict[str, Any] | None = None,
+    company_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if channel.reply_mode != 'ai':
         return {'ok': True, 'content': _fallback_text(channel), 'usage': {}}
@@ -1266,6 +1378,11 @@ async def _run_channel_message(
                 workflowVersionId=workflow_version_id,
                 workflowTrigger=workflow_trigger,
                 workflowData=workflow_data or {},
+                companyUserId=str((company_identity or {}).get('companyUserId') or '') or None,
+                companyMemberId=str((company_identity or {}).get('companyMemberId') or '') or None,
+                companyMemberEmail=str((company_identity or {}).get('memberEmail') or '') or None,
+                companyMemberRole=str((company_identity or {}).get('memberRole') or '') or None,
+                companyGroupIds=[str(item) for item in (company_identity or {}).get('groupIds') or []],
             ),
             x_interact_service_token=_service_token(),
         )
@@ -1314,14 +1431,18 @@ async def _claim_channel_event(
     platform_event_id: str,
     external_user_id: str,
     message: str,
+    *,
+    quota_exempt: bool = False,
+    force_process: bool = False,
 ) -> tuple[Any, str | None, bool]:
-    reserved_tokens = _estimated_reservation_tokens(message) if channel.reply_mode == 'ai' else 0
+    reserved_tokens = _estimated_reservation_tokens(message) if channel.reply_mode == 'ai' and not quota_exempt else 0
     claim = await InteractChannels.claim_event(
         channel,
         platform_event_id,
         external_user_id,
         reserved_tokens,
         _taipei_day_start(),
+        quota_exempt=quota_exempt,
     )
     if claim.reason == 'channel-deleted':
         raise HTTPException(status_code=404, detail='Channel not found or disabled.')
@@ -1335,7 +1456,7 @@ async def _claim_channel_event(
         content = _rate_limit_text(channel, claim.reason)
         await InteractChannels.set_response(claim.event_id, content, 0, claim.reason)
         return claim, content, False
-    if channel.reply_mode != 'ai':
+    if channel.reply_mode != 'ai' and not force_process:
         content = _fallback_text(channel)
         await InteractChannels.set_response(claim.event_id, content, 0, None)
         return claim, content, False
@@ -1375,6 +1496,7 @@ async def _complete_claimed_result(
     workflow_version_id: str | None = None,
     workflow_trigger: str | None = None,
     workflow_data: dict[str, Any] | None = None,
+    company_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reserved_tokens = _estimated_reservation_tokens(message) if channel.reply_mode == 'ai' else 0
     result = await _run_channel_message(
@@ -1390,6 +1512,7 @@ async def _complete_claimed_result(
         workflow_version_id,
         workflow_trigger,
         workflow_data,
+        company_identity,
     )
     content = str(result.get('content') or _fallback_text(channel)).strip()
     usage = result.get('usage') if isinstance(result.get('usage'), dict) else {}
@@ -1453,9 +1576,864 @@ async def _http_post_json(
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload, headers=headers) as response:
-            if (response.status < 200 or response.status >= 300) and response.status not in (accepted_statuses or set()):
+            if (response.status < 200 or response.status >= 300) and response.status not in (
+                accepted_statuses or set()
+            ):
                 detail = (await response.text())[:300]
                 raise RuntimeError(f'Platform reply failed ({response.status}): {detail}')
+
+
+async def _line_api_request(
+    channel: InteractChannelModel,
+    method: str,
+    url: str,
+    *,
+    json_payload: dict[str, Any] | None = None,
+    data: bytes | None = None,
+    content_type: str | None = None,
+    accepted_statuses: set[int] | None = None,
+) -> dict[str, Any]:
+    if not channel.channel_access_token:
+        raise RuntimeError('LINE channel access token is missing.')
+    headers = {'Authorization': f'Bearer {channel.channel_access_token}'}
+    if content_type:
+        headers['Content-Type'] = content_type
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(
+            method,
+            url,
+            json=json_payload,
+            data=data,
+            headers=headers,
+        ) as response:
+            body = await response.text()
+            if (response.status < 200 or response.status >= 300) and response.status not in (
+                accepted_statuses or set()
+            ):
+                raise RuntimeError(f'LINE Rich Menu API failed ({response.status}): {body[:500]}')
+            if not body:
+                return {}
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                return {'body': body[:500]}
+            return parsed if isinstance(parsed, dict) else {}
+
+
+async def _download_line_message_content(
+    channel: InteractChannelModel,
+    part: dict[str, Any],
+) -> dict[str, Any]:
+    """Download a LINE message attachment and persist it in shared WebUI storage."""
+    message_id = str(part.get('platformFileId') or '').strip()
+    if not message_id or not channel.channel_access_token:
+        raise RuntimeError('LINE attachment credentials are incomplete.')
+    owner = await Users.get_user_by_email(channel.company_email)
+    if not owner:
+        raise RuntimeError('The channel owner account no longer exists.')
+
+    headers = {'Authorization': f'Bearer {channel.channel_access_token}'}
+    timeout = aiohttp.ClientTimeout(total=90)
+    content = bytearray()
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(
+            f'https://api-data.line.me/v2/bot/message/{quote(message_id, safe="")}/content',
+            headers=headers,
+        ) as response:
+            if response.status < 200 or response.status >= 300:
+                detail = (await response.text())[:300]
+                raise RuntimeError(f'LINE content download failed ({response.status}): {detail}')
+            declared_size = int(response.headers.get('Content-Length') or 0)
+            if declared_size > MAX_LINE_INBOUND_CONTENT_BYTES:
+                raise RuntimeError('LINE attachment exceeds the server upload limit.')
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                content.extend(chunk)
+                if len(content) > MAX_LINE_INBOUND_CONTENT_BYTES:
+                    raise RuntimeError('LINE attachment exceeds the server upload limit.')
+            content_type = str(response.headers.get('Content-Type') or '').split(';', 1)[0].strip()
+
+    part_type = str(part.get('type') or 'file')
+    default_mime = {
+        'image': 'image/jpeg',
+        'audio': 'audio/m4a',
+        'video': 'video/mp4',
+        'file': 'application/octet-stream',
+    }.get(part_type, 'application/octet-stream')
+    content_type = content_type or default_mime
+    original_name = os.path.basename(str(part.get('filename') or '').strip())
+    if not original_name:
+        extension = mimetypes.guess_extension(content_type) or ''
+        original_name = f'LINE-{part_type}{extension}'
+
+    file_id = str(uuid4())
+    storage_name = f'{file_id}_{original_name}'
+    tags = {
+        'OpenWebUI-User-Email': owner.email,
+        'OpenWebUI-User-Id': owner.id,
+        'OpenWebUI-User-Name': owner.name,
+        'OpenWebUI-File-Id': file_id,
+        'Interact-Channel-Id': channel.id,
+        'Interact-Platform': 'line',
+    }
+    stored_bytes, file_path = await asyncio.to_thread(
+        Storage.upload_file,
+        io.BytesIO(bytes(content)),
+        storage_name,
+        tags,
+    )
+    try:
+        file_item = await Files.insert_new_file(
+            owner.id,
+            FileForm(
+                id=file_id,
+                filename=original_name,
+                path=file_path,
+                hash=hashlib.sha256(stored_bytes).hexdigest(),
+                data={},
+                meta={
+                    'name': original_name,
+                    'content_type': content_type,
+                    'size': len(stored_bytes),
+                    'source': 'interact-channel',
+                    'channel_id': channel.id,
+                    'platform': 'line',
+                    'platform_file_id': message_id,
+                },
+            ),
+        )
+    except Exception:
+        await asyncio.to_thread(Storage.delete_file, file_path)
+        raise
+    if not file_item:
+        await asyncio.to_thread(Storage.delete_file, file_path)
+        raise RuntimeError('LINE attachment could not be saved.')
+    return {
+        **part,
+        'filename': original_name,
+        'mimeType': content_type,
+        'content_type': content_type,
+        'size': len(stored_bytes),
+        'fileId': file_id,
+    }
+
+
+async def _hydrate_line_message_parts(
+    channel: InteractChannelModel,
+    parts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    hydrated = []
+    for part in parts:
+        hydrated.append(await _download_line_message_content(channel, part))
+    return hydrated
+
+
+def _line_portal_base_url() -> str | None:
+    configured = str(os.environ.get('INTERACT_PORTAL_BASE_URL') or '').strip().rstrip('/')
+    if configured:
+        return configured
+    if is_billing_enabled():
+        return InteractBillingClient().base_url.rstrip('/')
+    return None
+
+
+def _line_menu_alias_id(channel_id: str, audience: str, tab: str) -> str:
+    digest = hashlib.sha256(channel_id.encode()).hexdigest()[:12]
+    audience_code = {'guest': 'g', 'member': 'm', 'admin': 'a'}[audience]
+    tab_code = {'home': 'h', 'workflows': 'w', 'manage': 'x'}[tab]
+    return f'ia-{digest}-{audience_code}{tab_code}'
+
+
+def _line_identity_audience(binding: InteractLineIdentityBindingModel | None) -> str:
+    if not binding or binding.member_status != 'active':
+        return 'guest'
+    return 'admin' if binding.member_role in {'owner', 'admin'} else 'member'
+
+
+async def _line_assign_role_menu(
+    channel: InteractChannelModel,
+    external_user_id: str,
+    audience: str,
+) -> bool:
+    variants = await InteractChannels.list_rich_menu_variants(channel.id)
+    home = next(
+        (item for item in variants if item.audience == audience and item.tab == 'home' and item.rich_menu_id),
+        None,
+    )
+    if not home:
+        return False
+    await _line_api_request(
+        channel,
+        'POST',
+        (
+            'https://api.line.me/v2/bot/user/'
+            f'{quote(external_user_id, safe="")}/richmenu/{quote(home.rich_menu_id or "", safe="")}'
+        ),
+    )
+    return True
+
+
+async def _line_refresh_identity(
+    channel: InteractChannelModel,
+    external_user_id: str,
+    *,
+    force: bool = False,
+) -> InteractLineIdentityBindingModel | None:
+    binding = await InteractChannels.get_line_identity_binding(
+        channel_id=channel.id,
+        external_user_id=external_user_id,
+        reveal_external_user_id=True,
+    )
+    if not binding:
+        return None
+    if not force and binding.role_verified_at >= int(time.time()) - 300:
+        return binding
+    if not is_billing_enabled():
+        return None
+    previous_audience = _line_identity_audience(binding)
+    try:
+        result = await InteractBillingClient().authorize_line_identity(
+            company_user_id=binding.company_user_id,
+            company_member_id=binding.company_member_id,
+            member_email=binding.member_email,
+            channel_id=channel.id,
+        )
+        identity = result.get('identity') if isinstance(result, dict) else None
+        if not isinstance(identity, dict):
+            raise RuntimeError('Company identity response is invalid.')
+        binding = await InteractChannels.update_line_identity_binding(
+            binding.id,
+            company_member_id=identity.get('companyMemberId'),
+            member_email=str(identity.get('memberEmail') or binding.member_email),
+            member_role=str(identity.get('memberRole') or 'member'),
+            member_status=str(identity.get('memberStatus') or 'disabled'),
+            group_ids=[str(item) for item in identity.get('groupIds') or []],
+        )
+    except HTTPException as error:
+        if error.status_code == status.HTTP_403_FORBIDDEN:
+            disabled = await InteractChannels.update_line_identity_binding(
+                binding.id,
+                company_member_id=binding.company_member_id,
+                member_email=binding.member_email,
+                member_role=binding.member_role,
+                member_status='disabled',
+                group_ids=binding.group_ids,
+            )
+            if disabled:
+                with suppress(Exception):
+                    await _line_assign_role_menu(channel, external_user_id, 'guest')
+            return disabled
+        log.exception('Unable to refresh LINE identity binding=%s', binding.id)
+        return None
+    except Exception:
+        log.exception('Unable to refresh LINE identity binding=%s', binding.id)
+        return None
+    if binding and _line_identity_audience(binding) != previous_audience:
+        with suppress(Exception):
+            await _line_assign_role_menu(
+                channel,
+                external_user_id,
+                _line_identity_audience(binding),
+            )
+    return binding
+
+
+async def _send_line_messages(
+    channel: InteractChannelModel,
+    reply_token: str | None,
+    messages: list[dict[str, Any]],
+) -> None:
+    if not channel.channel_access_token or not reply_token:
+        raise RuntimeError('LINE access token or reply token is missing.')
+    await _http_post_json(
+        'https://api.line.me/v2/bot/message/reply',
+        {'replyToken': reply_token, 'messages': messages[:5]},
+        {
+            'Authorization': f'Bearer {channel.channel_access_token}',
+            'Content-Type': 'application/json',
+        },
+    )
+
+
+async def _issue_line_account_link(
+    channel: InteractChannelModel,
+    external_user_id: str,
+    reply_token: str | None,
+) -> None:
+    portal_base_url = _line_portal_base_url()
+    if not portal_base_url:
+        raise RuntimeError('Main website URL is not configured for LINE account linking.')
+    token_result = await _line_api_request(
+        channel,
+        'POST',
+        f'https://api.line.me/v2/bot/user/{quote(external_user_id, safe="")}/linkToken',
+    )
+    link_token = str(token_result.get('linkToken') or '')
+    if not link_token:
+        raise RuntimeError('LINE did not return an account link token.')
+    state = secrets.token_urlsafe(32)
+    await InteractChannels.create_line_identity_link(
+        state=state,
+        channel_id=channel.id,
+        external_user_id=external_user_id,
+        link_token=link_token,
+    )
+    query = urlencode(
+        {
+            'state': state,
+            'linkToken': link_token,
+            'channelId': channel.id,
+        }
+    )
+    url = f'{portal_base_url}/company-portal/line-link?{query}'
+    await _send_line_messages(
+        channel,
+        reply_token,
+        [
+            {
+                'type': 'flex',
+                'altText': '綁定企業帳號以使用公司工作流',
+                'contents': {
+                    'type': 'bubble',
+                    'size': 'kilo',
+                    'body': {
+                        'type': 'box',
+                        'layout': 'vertical',
+                        'spacing': 'md',
+                        'contents': [
+                            {'type': 'text', 'text': '綁定企業帳號', 'weight': 'bold', 'size': 'xl'},
+                            {
+                                'type': 'text',
+                                'text': '登入主站台並確認後，LINE 會依您的企業角色顯示可用功能。',
+                                'wrap': True,
+                                'size': 'sm',
+                                'color': '#475569',
+                            },
+                            {
+                                'type': 'text',
+                                'text': '連結 10 分鐘內有效，且只能使用一次。',
+                                'wrap': True,
+                                'size': 'xs',
+                                'color': '#64748B',
+                            },
+                        ],
+                    },
+                    'footer': {
+                        'type': 'box',
+                        'layout': 'vertical',
+                        'contents': [
+                            {
+                                'type': 'button',
+                                'style': 'primary',
+                                'color': '#06C755',
+                                'height': 'sm',
+                                'action': {'type': 'uri', 'label': '前往安全綁定', 'uri': url},
+                            }
+                        ],
+                    },
+                },
+            }
+        ],
+    )
+
+
+async def _clear_line_rich_menu(
+    channel: InteractChannelModel,
+    rich_menu_id: str | None,
+) -> None:
+    variants = await InteractChannels.list_rich_menu_variants(channel.id)
+    bindings = await InteractChannels.list_line_identity_bindings(
+        channel_id=channel.id,
+        reveal_external_user_id=True,
+    )
+    menu_ids = {str(item.rich_menu_id) for item in variants if item.rich_menu_id}
+    if rich_menu_id:
+        menu_ids.add(rich_menu_id)
+    if not menu_ids and not variants and not bindings:
+        return
+    if not channel.channel_access_token:
+        raise RuntimeError('LINE channel access token is required to remove the existing Rich Menu.')
+    await _line_api_request(
+        channel,
+        'DELETE',
+        'https://api.line.me/v2/bot/user/all/richmenu',
+        accepted_statuses={404},
+    )
+    for binding in bindings:
+        if binding.external_user_id:
+            await _line_api_request(
+                channel,
+                'DELETE',
+                f'https://api.line.me/v2/bot/user/{quote(binding.external_user_id, safe="")}/richmenu',
+                accepted_statuses={404},
+            )
+    for variant in variants:
+        await _line_api_request(
+            channel,
+            'DELETE',
+            f'https://api.line.me/v2/bot/richmenu/alias/{quote(variant.alias_id, safe="")}',
+            accepted_statuses={404},
+        )
+    for menu_id in menu_ids:
+        await _line_api_request(
+            channel,
+            'DELETE',
+            f'https://api.line.me/v2/bot/richmenu/{quote(menu_id, safe="")}',
+            accepted_statuses={404},
+        )
+
+
+async def sync_line_rich_menu(channel_id: str, *, force: bool = False) -> dict[str, Any]:
+    lock = _line_rich_menu_locks.setdefault(channel_id, asyncio.Lock())
+    async with lock:
+        channel = await InteractChannels.get_by_id(channel_id)
+        state = await InteractChannels.get_rich_menu(channel_id)
+        if not channel or not state:
+            return {'ok': False, 'status': 'absent'}
+        previous_status = state.status
+        state_revision = int(getattr(state, 'revision', 0) or 0)
+        sync_token = await InteractChannels.claim_rich_menu_sync(
+            channel_id,
+            state_revision,
+        )
+        if not sync_token:
+            return {'ok': True, 'status': 'syncing', 'busy': True}
+        state = await InteractChannels.get_rich_menu(channel_id) or state
+
+        async def finish_status(**kwargs):
+            return await InteractChannels.update_rich_menu_status(
+                channel_id,
+                sync_token=sync_token,
+                expected_revision=state_revision,
+                **kwargs,
+            )
+
+        async def superseded_result() -> dict[str, Any]:
+            await InteractChannels.release_rich_menu_sync(channel_id, sync_token)
+            schedule_line_rich_menu_sync(channel_id)
+            return {'ok': True, 'status': 'pending', 'superseded': True}
+
+        effective_enabled = bool(
+            state.enabled and channel.channel_type == 'line' and channel.enabled and channel.reply_mode == 'ai'
+        )
+        previous_variants = await InteractChannels.list_rich_menu_variants(channel_id)
+        previous_by_key = {(variant.audience, variant.tab): variant for variant in previous_variants}
+        bindings = await InteractChannels.list_line_identity_bindings(
+            channel_id=channel_id,
+            reveal_external_user_id=True,
+        )
+        if not effective_enabled:
+            try:
+                await _line_api_request(
+                    channel,
+                    'DELETE',
+                    'https://api.line.me/v2/bot/user/all/richmenu',
+                    accepted_statuses={404},
+                )
+                for binding in bindings:
+                    if binding.external_user_id:
+                        await _line_api_request(
+                            channel,
+                            'DELETE',
+                            f'https://api.line.me/v2/bot/user/{quote(binding.external_user_id, safe="")}/richmenu',
+                            accepted_statuses={404},
+                        )
+                for variant in previous_variants:
+                    with suppress(Exception):
+                        await _line_api_request(
+                            channel,
+                            'DELETE',
+                            f'https://api.line.me/v2/bot/richmenu/alias/{quote(variant.alias_id, safe="")}',
+                            accepted_statuses={404},
+                        )
+                    if variant.rich_menu_id:
+                        with suppress(Exception):
+                            await _line_api_request(
+                                channel,
+                                'DELETE',
+                                f'https://api.line.me/v2/bot/richmenu/{quote(variant.rich_menu_id, safe="")}',
+                                accepted_statuses={404},
+                            )
+                await InteractChannels.delete_rich_menu_variants(channel_id)
+            except Exception as error:
+                updated = await finish_status(
+                    status='error',
+                    rich_menu_id=state.rich_menu_id,
+                    content_hash=state.content_hash,
+                    workflow_ids=state.workflow_ids,
+                    last_error=str(error),
+                )
+                if not updated:
+                    return await superseded_result()
+                return {'ok': False, 'status': 'error', 'error': str(error)}
+            updated = await finish_status(
+                status='disabled',
+                rich_menu_id=None,
+                content_hash=None,
+                workflow_ids=[],
+                synced=True,
+            )
+            if not updated:
+                return await superseded_result()
+            return {'ok': True, 'status': 'disabled', 'workflowCount': 0}
+
+        if not channel.channel_access_token:
+            error = 'LINE channel access token is required before enabling Rich Menu.'
+            updated = await finish_status(
+                status='error',
+                rich_menu_id=state.rich_menu_id,
+                content_hash=state.content_hash,
+                workflow_ids=state.workflow_ids,
+                last_error=error,
+            )
+            if not updated:
+                return await superseded_result()
+            return {'ok': False, 'status': 'error', 'error': error}
+
+        workflows = await _line_workflow_options(channel, limit=0)
+        artifacts = []
+        for audience, tabs in {
+            'guest': ['home'],
+            'member': ['home', 'workflows'],
+            'admin': ['home', 'workflows', 'manage'],
+        }.items():
+            aliases = {tab: _line_menu_alias_id(channel_id, audience, tab) for tab in tabs}
+            artifacts.extend(
+                build_line_role_menus(
+                    audience=audience,
+                    alias_ids=aliases,
+                    channel_name=channel.name,
+                    portal_base_url=_line_portal_base_url(),
+                )
+            )
+        digest = hashlib.sha256()
+        for artifact in artifacts:
+            digest.update(artifact.content_hash.encode())
+        menu_set_hash = digest.hexdigest()
+        unchanged = bool(
+            not force
+            and previous_status == 'active'
+            and state.content_hash == menu_set_hash
+            and len(previous_variants) == len(artifacts)
+            and all(
+                previous_by_key.get((artifact.audience, artifact.tab))
+                and previous_by_key[(artifact.audience, artifact.tab)].rich_menu_id
+                and previous_by_key[(artifact.audience, artifact.tab)].content_hash == artifact.content_hash
+                for artifact in artifacts
+            )
+        )
+        if unchanged:
+            updated = await finish_status(
+                status='active',
+                rich_menu_id=state.rich_menu_id,
+                content_hash=menu_set_hash,
+                workflow_ids=[str(item.get('id')) for item in workflows],
+                synced=True,
+            )
+            if not updated:
+                return await superseded_result()
+            return {
+                'ok': True,
+                'status': 'active',
+                'workflowCount': len(workflows),
+                'displayedWorkflowCount': min(len(workflows), LINE_WORKFLOW_MAX_MENU_OPTIONS),
+                'variantCount': len(artifacts),
+                'unchanged': True,
+            }
+
+        created_ids: dict[tuple[str, str], str] = {}
+        selected_ids: dict[tuple[str, str], str] = {}
+        attempted_alias_keys: set[tuple[str, str]] = set()
+        assigned_users: list[tuple[str, str]] = []
+        default_linked = False
+        try:
+            for artifact in artifacts:
+                key = (artifact.audience, artifact.tab)
+                previous = previous_by_key.get(key)
+                if not force and previous and previous.rich_menu_id and previous.content_hash == artifact.content_hash:
+                    selected_ids[key] = previous.rich_menu_id
+                    continue
+                await _line_api_request(
+                    channel,
+                    'POST',
+                    'https://api.line.me/v2/bot/richmenu/validate',
+                    json_payload=artifact.menu,
+                    content_type='application/json',
+                )
+                created = await _line_api_request(
+                    channel,
+                    'POST',
+                    'https://api.line.me/v2/bot/richmenu',
+                    json_payload=artifact.menu,
+                    content_type='application/json',
+                )
+                rich_menu_id = str(created.get('richMenuId') or '')
+                if not rich_menu_id:
+                    raise RuntimeError('LINE did not return a Rich Menu ID.')
+                await _line_api_request(
+                    channel,
+                    'POST',
+                    f'https://api-data.line.me/v2/bot/richmenu/{quote(rich_menu_id, safe="")}/content',
+                    data=artifact.image,
+                    content_type='image/png',
+                )
+                created_ids[key] = rich_menu_id
+                selected_ids[key] = rich_menu_id
+
+            for artifact in artifacts:
+                key = (artifact.audience, artifact.tab)
+                rich_menu_id = selected_ids[key]
+                attempted_alias_keys.add(key)
+                await _line_api_request(
+                    channel,
+                    'POST',
+                    'https://api.line.me/v2/bot/richmenu/alias',
+                    json_payload={
+                        'richMenuAliasId': artifact.alias_id,
+                        'richMenuId': rich_menu_id,
+                    },
+                    content_type='application/json',
+                    accepted_statuses={400},
+                )
+                await _line_api_request(
+                    channel,
+                    'POST',
+                    f'https://api.line.me/v2/bot/richmenu/alias/{quote(artifact.alias_id, safe="")}',
+                    json_payload={'richMenuId': rich_menu_id},
+                    content_type='application/json',
+                )
+
+            guest_home_id = selected_ids[('guest', 'home')]
+            await _line_api_request(
+                channel,
+                'POST',
+                f'https://api.line.me/v2/bot/user/all/richmenu/{quote(guest_home_id, safe="")}',
+            )
+            default_linked = True
+            for binding in bindings:
+                if not binding.external_user_id:
+                    continue
+                audience = _line_identity_audience(binding)
+                target_id = selected_ids[(audience, 'home')]
+                await _line_api_request(
+                    channel,
+                    'POST',
+                    (
+                        'https://api.line.me/v2/bot/user/'
+                        f'{quote(binding.external_user_id, safe="")}/richmenu/{quote(target_id, safe="")}'
+                    ),
+                )
+                assigned_users.append((binding.external_user_id, audience))
+
+            updated = await InteractChannels.commit_rich_menu_set(
+                channel_id=channel_id,
+                sync_token=sync_token,
+                expected_revision=state_revision,
+                rich_menu_id=guest_home_id,
+                content_hash=menu_set_hash,
+                workflow_ids=[str(item.get('id')) for item in workflows],
+                variants=[
+                    {
+                        'audience': artifact.audience,
+                        'tab': artifact.tab,
+                        'alias_id': artifact.alias_id,
+                        'rich_menu_id': selected_ids[(artifact.audience, artifact.tab)],
+                        'content_hash': artifact.content_hash,
+                    }
+                    for artifact in artifacts
+                ],
+            )
+            if not updated:
+                raise RuntimeError('Rich Menu state could not be persisted.')
+
+            selected_aliases = {artifact.alias_id for artifact in artifacts}
+            for previous in previous_variants:
+                if previous.alias_id not in selected_aliases:
+                    with suppress(Exception):
+                        await _line_api_request(
+                            channel,
+                            'DELETE',
+                            f'https://api.line.me/v2/bot/richmenu/alias/{quote(previous.alias_id, safe="")}',
+                            accepted_statuses={404},
+                        )
+            selected_set = set(selected_ids.values())
+            for previous in previous_variants:
+                if previous.rich_menu_id and previous.rich_menu_id not in selected_set:
+                    with suppress(Exception):
+                        await _line_api_request(
+                            channel,
+                            'DELETE',
+                            f'https://api.line.me/v2/bot/richmenu/{quote(previous.rich_menu_id, safe="")}',
+                            accepted_statuses={404},
+                        )
+            if state.rich_menu_id and state.rich_menu_id not in selected_set:
+                with suppress(Exception):
+                    await _line_api_request(
+                        channel,
+                        'DELETE',
+                        f'https://api.line.me/v2/bot/richmenu/{quote(state.rich_menu_id, safe="")}',
+                        accepted_statuses={404},
+                    )
+            return {
+                'ok': True,
+                'status': 'active',
+                'workflowCount': len(workflows),
+                'displayedWorkflowCount': min(len(workflows), LINE_WORKFLOW_MAX_MENU_OPTIONS),
+                'variantCount': len(artifacts),
+            }
+        except Exception as error:
+            if default_linked:
+                with suppress(Exception):
+                    if state.rich_menu_id:
+                        await _line_api_request(
+                            channel,
+                            'POST',
+                            f'https://api.line.me/v2/bot/user/all/richmenu/{quote(state.rich_menu_id, safe="")}',
+                        )
+                    else:
+                        await _line_api_request(
+                            channel,
+                            'DELETE',
+                            'https://api.line.me/v2/bot/user/all/richmenu',
+                            accepted_statuses={404},
+                        )
+            for external_user_id, audience in reversed(assigned_users):
+                previous_home = previous_by_key.get((audience, 'home'))
+                with suppress(Exception):
+                    if previous_home and previous_home.rich_menu_id:
+                        await _line_api_request(
+                            channel,
+                            'POST',
+                            (
+                                'https://api.line.me/v2/bot/user/'
+                                f'{quote(external_user_id, safe="")}/richmenu/'
+                                f'{quote(previous_home.rich_menu_id, safe="")}'
+                            ),
+                        )
+                    else:
+                        await _line_api_request(
+                            channel,
+                            'DELETE',
+                            f'https://api.line.me/v2/bot/user/{quote(external_user_id, safe="")}/richmenu',
+                            accepted_statuses={404},
+                        )
+            for artifact in artifacts:
+                key = (artifact.audience, artifact.tab)
+                if key not in attempted_alias_keys:
+                    continue
+                previous = previous_by_key.get(key)
+                with suppress(Exception):
+                    if previous and previous.rich_menu_id:
+                        await _line_api_request(
+                            channel,
+                            'POST',
+                            f'https://api.line.me/v2/bot/richmenu/alias/{quote(artifact.alias_id, safe="")}',
+                            json_payload={'richMenuId': previous.rich_menu_id},
+                            content_type='application/json',
+                        )
+                    else:
+                        await _line_api_request(
+                            channel,
+                            'DELETE',
+                            f'https://api.line.me/v2/bot/richmenu/alias/{quote(artifact.alias_id, safe="")}',
+                            accepted_statuses={404},
+                        )
+            for rich_menu_id in created_ids.values():
+                with suppress(Exception):
+                    await _line_api_request(
+                        channel,
+                        'DELETE',
+                        f'https://api.line.me/v2/bot/richmenu/{quote(rich_menu_id, safe="")}',
+                        accepted_statuses={404},
+                    )
+            updated = None
+            with suppress(Exception):
+                updated = await finish_status(
+                    status='error',
+                    rich_menu_id=state.rich_menu_id,
+                    content_hash=state.content_hash,
+                    workflow_ids=state.workflow_ids,
+                    last_error=str(error),
+                )
+            if not updated:
+                return await superseded_result()
+            log.exception('Failed to synchronize LINE role menus for channel=%s', channel_id)
+            return {'ok': False, 'status': 'error', 'error': str(error)}
+
+
+def schedule_line_rich_menu_sync(channel_id: str, *, force: bool = False) -> None:
+    existing = _line_rich_menu_tasks_by_channel.get(channel_id)
+    if existing and not existing.done():
+        _line_rich_menu_resync[channel_id] = bool(force or _line_rich_menu_resync.get(channel_id))
+        return
+
+    async def runner() -> None:
+        next_force = force
+        while True:
+            result = await sync_line_rich_menu(channel_id, force=next_force)
+            queued_force = _line_rich_menu_resync.pop(channel_id, None)
+            if result.get('busy'):
+                next_force = bool(next_force or queued_force)
+                await asyncio.sleep(2)
+                continue
+            if queued_force is not None:
+                next_force = bool(queued_force)
+                continue
+            return
+
+    task = asyncio.create_task(runner(), name=f'line-rich-menu-{channel_id}')
+    _line_rich_menu_tasks.add(task)
+    _line_rich_menu_tasks_by_channel[channel_id] = task
+
+    def cleanup(completed: asyncio.Task) -> None:
+        _line_rich_menu_tasks.discard(completed)
+        if _line_rich_menu_tasks_by_channel.get(channel_id) is completed:
+            _line_rich_menu_tasks_by_channel.pop(channel_id, None)
+            _line_rich_menu_resync.pop(channel_id, None)
+
+    task.add_done_callback(cleanup)
+
+
+async def schedule_company_line_rich_menu_refresh(
+    *,
+    company_user_id: str | None = None,
+    company_email: str | None = None,
+    channel_ids: list[str] | None = None,
+) -> int:
+    channels = await InteractChannels.list_line_channels_for_company(
+        company_user_id=company_user_id,
+        company_email=company_email,
+        channel_ids=channel_ids,
+    )
+    scheduled = 0
+    for channel in channels:
+        if await InteractChannels.mark_rich_menu_pending(channel.id):
+            schedule_line_rich_menu_sync(channel.id)
+            scheduled += 1
+    return scheduled
+
+
+def _rich_menu_status_payload(state, workflow_count: int | None = None) -> dict[str, Any]:
+    if not state:
+        return {
+            'enabled': False,
+            'status': 'disabled',
+            'workflowCount': 0,
+            'displayedWorkflowCount': 0,
+            'lastError': None,
+            'syncedAt': None,
+        }
+    return {
+        'enabled': state.enabled,
+        'status': state.status,
+        'workflowCount': workflow_count if workflow_count is not None else len(state.workflow_ids),
+        'displayedWorkflowCount': min(len(state.workflow_ids), LINE_WORKFLOW_MAX_MENU_OPTIONS),
+        'lastError': state.last_error,
+        'syncedAt': state.synced_at,
+        'updatedAt': state.updated_at,
+        'extensionContractVersion': 1,
+        'liffReady': True,
+    }
 
 
 async def _read_webhook_body(request: Request) -> bytes:
@@ -1475,6 +2453,11 @@ async def _read_webhook_body(request: Request) -> bytes:
 def _line_workflow_menu_requested(message: str) -> bool:
     normalized = re.sub(r'[\s！？!。．,.，、]+', '', str(message or '')).casefold()
     return normalized in LINE_WORKFLOW_MENU_COMMANDS
+
+
+def _line_account_link_requested(message: str) -> bool:
+    normalized = re.sub(r'[\s！？!。．,.，、]+', '', str(message or '')).casefold()
+    return normalized in LINE_ACCOUNT_LINK_COMMANDS
 
 
 def _line_table_text(table) -> str:
@@ -1609,14 +2592,8 @@ def _line_workflow_postback_data(option: dict[str, Any]) -> str:
 
 def _line_workflow_postback(event: dict[str, Any]) -> tuple[str, str] | None:
     postback = event.get('postback') if isinstance(event.get('postback'), dict) else {}
-    raw_data = str(postback.get('data') or '')
-    if not raw_data or len(raw_data) > 300:
-        return None
-    try:
-        data = json.loads(raw_data)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict) or data.get('a') != 'workflow.run.v1':
+    data = parse_line_postback_data(postback.get('data'))
+    if not data or data.get('a') != 'workflow.run.v1':
         return None
     workflow_id = str(data.get('w') or '')
     version_id = str(data.get('v') or '')
@@ -1626,8 +2603,54 @@ def _line_workflow_postback(event: dict[str, Any]) -> tuple[str, str] | None:
     return workflow_id, version_id
 
 
+def _line_postback_action(event: dict[str, Any]) -> dict[str, Any] | None:
+    postback = event.get('postback') if isinstance(event.get('postback'), dict) else {}
+    return parse_line_postback_data(postback.get('data'))
+
+
+async def _line_resolve_workflow_postback(
+    channel: InteractChannelModel,
+    action: dict[str, Any] | None,
+    binding: InteractLineIdentityBindingModel | None = None,
+) -> dict[str, Any] | None:
+    if not action:
+        return None
+    if not binding or binding.member_status != 'active':
+        return None
+    workflow_id = str(action.get('w') or '')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', workflow_id):
+        return None
+    options = await _line_workflow_options(channel, limit=0, binding=binding)
+    if action.get('a') == 'workflow.run.v1':
+        version_id = str(action.get('v') or '')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', version_id):
+            return None
+        return next(
+            (item for item in options if item.get('id') == workflow_id and item.get('versionId') == version_id),
+            None,
+        )
+    if action.get('a') != 'workflow.launch.v2':
+        return None
+    option = next((item for item in options if item.get('id') == workflow_id), None)
+    return option if option and option.get('versionId') else None
+
+
+def _line_rich_menu_help_text() -> str:
+    return (
+        'LINE AI 工作台\n\n'
+        '1. 先用「綁定帳號」連結企業身分；選單會依擁有者、管理員或一般成員角色更新。\n'
+        '2. 「立即執行」工作流點擊後會直接開始。\n'
+        '3. 「需要輸入」與「需要檔案」會依作者設定逐步引導；可輸入「取消」結束。\n'
+        '4. 「全部工作流」只顯示目前身分、模型與渠道有權執行的已發布流程。\n\n'
+        '畫面不是授權依據；每次執行都會重新檢查企業角色與 ACL。'
+    )
+
+
 async def _line_workflow_options(
     channel: InteractChannelModel,
+    *,
+    limit: int = 13,
+    binding: InteractLineIdentityBindingModel | None = None,
 ) -> list[dict[str, Any]]:
     if channel.channel_type != 'line' or not channel.enabled or channel.reply_mode != 'ai':
         return []
@@ -1637,11 +2660,26 @@ async def _line_workflow_options(
             return []
         from open_webui.routers import workflows as workflow_routes
 
-        options = await workflow_routes.list_instant_workflows_for_user_context(
+        context = None
+        if binding and binding.member_status == 'active':
+            is_owner = binding.member_role == 'owner'
+            context = WorkflowAccessContext(
+                user_id=user.id if is_owner else None,
+                role=user.role if is_owner else 'user',
+                company_user_id=binding.company_user_id,
+                company_member_id=binding.company_member_id,
+                company_member_role=binding.member_role,
+                group_ids=set(binding.group_ids),
+                channel_id=channel.id,
+                model_id=channel.model_id,
+            )
+
+        options = await workflow_routes.list_channel_workflows_for_user_context(
             user,
             channel_id=channel.id,
             model_id=channel.model_id,
-            limit=13,
+            limit=limit,
+            access_context=context,
         )
     except Exception:
         log.exception('Failed to load LINE workflow options for channel=%s', channel.id)
@@ -1649,11 +2687,376 @@ async def _line_workflow_options(
     return options
 
 
+def _line_workflow_contract(option: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'mode': option.get('launchMode') or 'instant',
+        'instruction': option.get('instruction') or '',
+        'inputSchema': option.get('inputSchema')
+        or {
+            'type': 'object',
+            'properties': {},
+            'required': [],
+            'additionalProperties': False,
+        },
+        'defaultInput': option.get('defaultInput') or {},
+        'fileRules': option.get('fileRules') or {},
+        'confirmation': 'never',
+    }
+
+
+def _line_guided_input(option: dict[str, Any]) -> dict[str, Any]:
+    defaults = option.get('defaultInput') if isinstance(option.get('defaultInput'), dict) else {}
+    mode = str(option.get('launchMode') or 'text_input')
+    default_message = str(defaults.get('message') or '')
+    data = {key: value for key, value in defaults.items() if key != 'message'}
+    completed = list(data)
+    result: dict[str, Any] = {
+        'message': (
+            default_message
+            if default_message
+            else f'執行工作流：{option.get("name") or "未命名工作流"}'
+            if mode == 'form_input'
+            else ''
+        ),
+        'data': data,
+        'files': [],
+        'parts': [],
+        'completedFields': completed,
+    }
+    if default_message and mode == 'text_input':
+        result['completedFields'].append('message')
+    return result
+
+
+def _line_next_guided_field(option: dict[str, Any], session_input: dict[str, Any]) -> str | None:
+    mode = str(option.get('launchMode') or 'instant')
+    completed = {str(item) for item in session_input.get('completedFields') or []}
+    if mode == 'text_input':
+        return None if 'message' in completed else 'message'
+    if mode == 'file_input':
+        return None if 'files' in completed else 'files'
+    schema = option.get('inputSchema') if isinstance(option.get('inputSchema'), dict) else {}
+    properties = schema.get('properties') if isinstance(schema.get('properties'), dict) else {}
+    return next((str(key) for key in properties if str(key) not in completed), None)
+
+
+def _line_guided_prompt(
+    option: dict[str, Any],
+    session_input: dict[str, Any],
+    field_key: str | None,
+    *,
+    error: str | None = None,
+) -> str:
+    name = ' '.join(str(option.get('name') or '工作流').split())
+    instruction = ' '.join(str(option.get('instruction') or '').split())
+    prefix = [f'【需要輸入】{name}']
+    if instruction:
+        prefix.extend(['', instruction])
+    if error:
+        prefix.extend(['', f'輸入有誤：{error}'])
+    mode = str(option.get('launchMode') or 'text_input')
+    if field_key == 'files' or mode == 'file_input':
+        rules = option.get('fileRules') if isinstance(option.get('fileRules'), dict) else {}
+        max_files = int(rules.get('maxFiles') or 5)
+        uploaded = len(session_input.get('files') or [])
+        allowed = '、'.join(str(item) for item in rules.get('allowedMimeTypes') or ['任何格式'])
+        prefix.extend(
+            [
+                '',
+                '請上傳檔案或多媒體。',
+                f'允許格式：{allowed}',
+                f'最多 {max_files} 個，單檔上限 {int(rules.get("maxSizeMB") or 25)} MB。',
+            ]
+        )
+        if uploaded:
+            prefix.append(f'目前已收到 {uploaded} 個；全部上傳後請輸入「完成上傳」。')
+        elif max_files > 1:
+            prefix.append('可連續上傳；全部上傳後請輸入「完成上傳」。')
+    elif field_key:
+        schema = option.get('inputSchema') if isinstance(option.get('inputSchema'), dict) else {}
+        properties = schema.get('properties') if isinstance(schema.get('properties'), dict) else {}
+        field = properties.get(field_key) if isinstance(properties.get(field_key), dict) else {}
+        required = field_key in (schema.get('required') or [])
+        title = str(field.get('title') or ('訊息' if field_key == 'message' else field_key))
+        description = str(field.get('description') or '').strip()
+        completed = len(session_input.get('completedFields') or [])
+        total = max(1, len(properties) if mode == 'form_input' else 1)
+        prefix.extend(
+            ['', f'第 {min(completed + 1, total)}/{total} 項：{title}{"（必填）" if required else "（可略過）"}']
+        )
+        if description:
+            prefix.append(description)
+        if field.get('enum'):
+            prefix.append('可選值：' + '、'.join(str(item) for item in field['enum']))
+        if field.get('minimum') is not None or field.get('maximum') is not None:
+            prefix.append(f'範圍：{field.get("minimum", "不限")} 至 {field.get("maximum", "不限")}')
+    prefix.extend(['', '可輸入「取消」結束；非必填欄位可輸入「略過」。'])
+    return '\n'.join(prefix)
+
+
+def _line_parse_guided_value(field: dict[str, Any], raw: str) -> tuple[bool, Any, str | None]:
+    field_type = str(field.get('type') or 'string')
+    value = raw.strip()
+    if field_type == 'boolean':
+        normalized = value.lower()
+        if normalized in {'是', '對', 'true', '1', 'yes', 'y'}:
+            return True, True, None
+        if normalized in {'否', '不', 'false', '0', 'no', 'n'}:
+            return True, False, None
+        return False, None, '請輸入「是」或「否」。'
+    if field_type == 'integer':
+        try:
+            return True, int(value), None
+        except ValueError:
+            return False, None, '請輸入整數。'
+    if field_type == 'number':
+        try:
+            return True, float(value), None
+        except ValueError:
+            return False, None, '請輸入數字。'
+    enum = field.get('enum') if isinstance(field.get('enum'), list) else []
+    if enum and value not in [str(item) for item in enum]:
+        return False, None, '請輸入列出的其中一個選項。'
+    return True, value, None
+
+
+def _line_part_as_file(part: dict[str, Any]) -> dict[str, Any]:
+    part_type = str(part.get('type') or 'file')
+    mime_defaults = {
+        'image': 'image/*',
+        'video': 'video/*',
+        'audio': 'audio/*',
+        'file': '',
+    }
+    return {
+        'name': part.get('filename') or f'LINE-{part_type}',
+        'filename': part.get('filename') or f'LINE-{part_type}',
+        'content_type': part.get('content_type')
+        or part.get('mimeType')
+        or mime_defaults.get(part_type, 'application/octet-stream'),
+        'size': int(part.get('size') or 0),
+        'platformFileId': part.get('platformFileId'),
+        'id': part.get('fileId'),
+        'fileId': part.get('fileId'),
+    }
+
+
+async def _line_advance_workflow_session(
+    option: dict[str, Any],
+    session,
+    message_text: str,
+    parts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    session_input = dict(session.input or {})
+    session_input['data'] = dict(session_input.get('data') or {})
+    session_input['parts'] = list(session_input.get('parts') or [])
+    session_input['files'] = list(session_input.get('files') or [])
+    session_input['completedFields'] = list(session_input.get('completedFields') or [])
+    normalized_text = message_text.strip()
+    expected_revision = int(getattr(session, 'revision', 0) or 0)
+
+    def conflict() -> dict[str, Any]:
+        return {
+            'status': 'conflict',
+            'text': '上一則輸入仍在處理中，這一則沒有套用。請依最新提示再輸入一次。',
+        }
+
+    if normalized_text.lower() in {'取消', 'cancel', '結束', '停止'}:
+        deleted = await InteractChannels.delete_workflow_session(
+            session.id,
+            expected_revision=expected_revision,
+        )
+        if not deleted:
+            return conflict()
+        return {'status': 'cancelled', 'text': '已取消這次工作流輸入，不會執行任何動作。'}
+
+    if session.status == 'ready':
+        if normalized_text.lower() not in {'確認', '確認執行', '執行', 'confirm', 'yes', 'y'}:
+            return {
+                'status': 'prompt',
+                'text': '資料已保留並等待執行。請輸入「確認執行」繼續，或輸入「取消」。',
+            }
+        return {'status': 'execute', 'input': session_input, 'confirmed': True, 'session': session}
+
+    if session.status == 'executing':
+        return conflict()
+
+    if session.status == 'confirming':
+        if normalized_text.lower() not in {'確認', '確認執行', '執行', 'confirm', 'yes', 'y'}:
+            return {
+                'status': 'prompt',
+                'text': '這個工作流包含外部動作。請輸入「確認執行」繼續，或輸入「取消」。',
+            }
+        updated = await InteractChannels.update_workflow_session(
+            session.id,
+            status='ready',
+            session_input=session_input,
+            current_field=None,
+            expected_revision=expected_revision,
+        )
+        if not updated:
+            return conflict()
+        return {
+            'status': 'execute',
+            'input': session_input,
+            'confirmed': True,
+            'session': updated,
+        }
+
+    field_key = session.current_field or _line_next_guided_field(option, session_input)
+    completed = session_input['completedFields']
+    if field_key == 'files':
+        rules = option.get('fileRules') if isinstance(option.get('fileRules'), dict) else {}
+        max_files = int(rules.get('maxFiles') or 5)
+        upload_finished = normalized_text.lower() in {'完成', '完成上傳', 'done'}
+        if not parts and not (upload_finished and session_input['files']):
+            return {
+                'status': 'prompt',
+                'text': _line_guided_prompt(
+                    option,
+                    session_input,
+                    'files',
+                    error='這一步需要直接上傳檔案、圖片、音訊或影片。',
+                ),
+            }
+        if parts:
+            session_input['parts'].extend(parts)
+            session_input['files'].extend(_line_part_as_file(part) for part in parts)
+            if normalized_text and not normalized_text.startswith('[LINE '):
+                session_input['message'] = normalized_text
+        if upload_finished or len(session_input['files']) >= max_files or max_files == 1:
+            if 'files' not in completed:
+                completed.append('files')
+        else:
+            updated = await InteractChannels.update_workflow_session(
+                session.id,
+                status='collecting',
+                session_input=session_input,
+                current_field='files',
+                expected_revision=expected_revision,
+            )
+            if not updated:
+                return conflict()
+            return {
+                'status': 'prompt',
+                'text': _line_guided_prompt(option, session_input, 'files'),
+                'session': updated,
+            }
+    elif field_key:
+        schema = option.get('inputSchema') if isinstance(option.get('inputSchema'), dict) else {}
+        properties = schema.get('properties') if isinstance(schema.get('properties'), dict) else {}
+        field = properties.get(field_key) if isinstance(properties.get(field_key), dict) else {'type': 'string'}
+        required = field_key in (schema.get('required') or [])
+        if normalized_text == '略過':
+            if required:
+                return {
+                    'status': 'prompt',
+                    'text': _line_guided_prompt(
+                        option,
+                        session_input,
+                        field_key,
+                        error='這是必填欄位，不能略過。',
+                    ),
+                }
+        else:
+            ok, value, error = _line_parse_guided_value(field, normalized_text)
+            if not ok:
+                return {
+                    'status': 'prompt',
+                    'text': _line_guided_prompt(option, session_input, field_key, error=error),
+                }
+            if field_key == 'message':
+                session_input['message'] = value
+            else:
+                session_input['data'][field_key] = value
+        if field_key not in completed:
+            completed.append(field_key)
+
+    next_field = _line_next_guided_field(option, session_input)
+    if next_field:
+        updated = await InteractChannels.update_workflow_session(
+            session.id,
+            status='collecting',
+            session_input=session_input,
+            current_field=next_field,
+            expected_revision=expected_revision,
+        )
+        if not updated:
+            return conflict()
+        return {
+            'status': 'prompt',
+            'text': _line_guided_prompt(option, session_input, next_field),
+            'session': updated,
+        }
+
+    contract = _line_workflow_contract(option)
+    checked = validate_launch_input(contract, {}, session_input, confirmed=True)
+    if not checked['ok']:
+        retry_field = field_key or (checked['missing_fields'][0] if checked['missing_fields'] else None)
+        if retry_field == 'files':
+            session_input['files'] = []
+            session_input['parts'] = []
+        elif retry_field:
+            session_input['completedFields'] = [item for item in completed if item != retry_field]
+        updated = await InteractChannels.update_workflow_session(
+            session.id,
+            status='collecting',
+            session_input=session_input,
+            current_field=retry_field,
+            expected_revision=expected_revision,
+        )
+        if not updated:
+            return conflict()
+        return {
+            'status': 'prompt',
+            'text': _line_guided_prompt(
+                option,
+                session_input,
+                retry_field,
+                error=' '.join(checked['errors']),
+            ),
+        }
+
+    session_input = checked['input']
+    if option.get('requiresConfirmation'):
+        updated = await InteractChannels.update_workflow_session(
+            session.id,
+            status='confirming',
+            session_input=session_input,
+            current_field=None,
+            expected_revision=expected_revision,
+        )
+        if not updated:
+            return conflict()
+        return {
+            'status': 'prompt',
+            'text': '資料已填寫完成。這個工作流包含外部動作，請輸入「確認執行」繼續，或輸入「取消」。',
+        }
+    updated = await InteractChannels.update_workflow_session(
+        session.id,
+        status='ready',
+        session_input=session_input,
+        current_field=None,
+        expected_revision=expected_revision,
+    )
+    if not updated:
+        return conflict()
+    return {
+        'status': 'execute',
+        'input': session_input,
+        'confirmed': True,
+        'session': updated,
+    }
+
+
 async def _line_selected_workflow_request(
     channel: InteractChannelModel,
     message: str,
+    binding: InteractLineIdentityBindingModel | None = None,
 ) -> tuple[str, str] | None:
-    """Run the deterministic selector before deciding whether LINE needs an acknowledgement."""
+    """Run the deterministic selector in the linked member's ACL context."""
+    if not binding or binding.member_status != 'active':
+        return None
     if not channel.enabled or channel.reply_mode != 'ai' or not channel.model_id:
         return None
     try:
@@ -1667,12 +3070,18 @@ async def _line_selected_workflow_request(
             message,
             channel_id=channel.id,
             model_id=channel.model_id,
+            access_context=WorkflowAccessContext(
+                user_id=user.id if binding.member_role == 'owner' else None,
+                role=user.role if binding.member_role == 'owner' else 'user',
+                company_user_id=binding.company_user_id,
+                company_member_id=binding.company_member_id,
+                company_member_role=binding.member_role,
+                group_ids=set(binding.group_ids),
+                channel_id=channel.id,
+                model_id=channel.model_id,
+            ),
         )
-        if (
-            selection.decision == 'selected'
-            and selection.selected_workflow_id
-            and selection.selected_version_id
-        ):
+        if selection.decision == 'selected' and selection.selected_workflow_id and selection.selected_version_id:
             return selection.selected_workflow_id, selection.selected_version_id
     except Exception:
         # Selection is advisory here; channel_chat can still retry it during execution.
@@ -1686,15 +3095,19 @@ def _line_workflow_menu_bubble(
     page: int,
     page_count: int,
     total: int,
+    displayed_total: int,
+    title: str = '快速工作流',
 ) -> dict[str, Any]:
     icon_url = _line_workflow_icon_url()
     subtitle = f'{total} 個已發布且可在此渠道使用的工作流'
+    if displayed_total < total:
+        subtitle = f'顯示前 {displayed_total} 個，共 {total} 個可用工作流'
     if page_count > 1:
         subtitle = f'{subtitle} · 第 {page}/{page_count} 頁'
     contents: list[dict[str, Any]] = [
         {
             'type': 'text',
-            'text': '快速工作流',
+            'text': title[:40],
             'weight': 'bold',
             'size': 'xl',
             'color': '#0F172A',
@@ -1711,7 +3124,41 @@ def _line_workflow_menu_bubble(
     ]
     for index, option in enumerate(options):
         name = ' '.join(str(option.get('name') or '未命名工作流').split())[:80]
-        description = ' '.join(str(option.get('description') or '點擊後立即執行').split())[:120]
+        launch_mode = str(option.get('launchMode') or 'instant')
+        is_instant = launch_mode == 'instant'
+        mode_label = '立即執行' if is_instant else '需要檔案' if launch_mode == 'file_input' else '需要輸入'
+        description = ' '.join(str(option.get('instruction') or option.get('description') or '').split())[:120]
+        text_contents: list[dict[str, Any]] = [
+            {
+                'type': 'text',
+                'text': mode_label,
+                'weight': 'bold',
+                'size': 'xxs',
+                'color': '#2563EB' if is_instant else '#0F766E',
+            },
+            {
+                'type': 'text',
+                'text': name,
+                'weight': 'bold',
+                'size': 'sm',
+                'color': '#0F172A',
+                'wrap': True,
+                'maxLines': 2,
+                'margin': 'xs',
+            },
+        ]
+        if description:
+            text_contents.append(
+                {
+                    'type': 'text',
+                    'text': description,
+                    'size': 'xs',
+                    'color': '#64748B',
+                    'margin': 'xs',
+                    'wrap': True,
+                    'maxLines': 2,
+                }
+            )
         row_contents: list[dict[str, Any]] = []
         if icon_url:
             row_contents.append(
@@ -1729,36 +3176,17 @@ def _line_workflow_menu_bubble(
                     'type': 'box',
                     'layout': 'vertical',
                     'flex': 4,
-                    'contents': [
-                        {
-                            'type': 'text',
-                            'text': name,
-                            'weight': 'bold',
-                            'size': 'sm',
-                            'color': '#0F172A',
-                            'wrap': True,
-                            'maxLines': 2,
-                        },
-                        {
-                            'type': 'text',
-                            'text': description,
-                            'size': 'xs',
-                            'color': '#64748B',
-                            'margin': 'xs',
-                            'wrap': True,
-                            'maxLines': 2,
-                        },
-                    ],
+                    'contents': text_contents,
                 },
                 {
                     'type': 'button',
                     'style': 'primary',
-                    'color': '#2563EB',
+                    'color': '#2563EB' if is_instant else '#0F766E',
                     'height': 'sm',
                     'flex': 2,
                     'action': {
                         'type': 'postback',
-                        'label': '執行',
+                        'label': '執行' if is_instant else '開始',
                         'data': _line_workflow_postback_data(option),
                         'displayText': f'執行：{name}'[:300],
                     },
@@ -1799,16 +3227,21 @@ def _line_workflow_menu_bubble(
     }
 
 
-def _line_workflow_menu_message(options: list[dict[str, Any]]) -> dict[str, Any]:
+def _line_workflow_menu_message(
+    options: list[dict[str, Any]],
+    *,
+    title: str = '全部工作流',
+) -> dict[str, Any]:
     if not options:
         return {
             'type': 'text',
-            'text': '目前沒有可在此 LINE 渠道執行的已發布瞬發工作流。',
+            'text': '目前沒有可在此 LINE 渠道執行的已發布工作流。',
         }
 
+    visible_options = options[:LINE_WORKFLOW_MAX_MENU_OPTIONS]
     pages = [
-        options[index : index + LINE_WORKFLOW_MENU_LIMIT]
-        for index in range(0, len(options), LINE_WORKFLOW_MENU_LIMIT)
+        visible_options[index : index + LINE_WORKFLOW_MENU_LIMIT]
+        for index in range(0, len(visible_options), LINE_WORKFLOW_MENU_LIMIT)
     ]
     bubbles = [
         _line_workflow_menu_bubble(
@@ -1816,14 +3249,29 @@ def _line_workflow_menu_message(options: list[dict[str, Any]]) -> dict[str, Any]
             page=index,
             page_count=len(pages),
             total=len(options),
+            displayed_total=len(visible_options),
+            title=title,
         )
         for index, page_options in enumerate(pages, start=1)
     ]
     return {
         'type': 'flex',
-        'altText': '快速工作流選單',
+        'altText': f'{title}選單'[:400],
         'contents': bubbles[0] if len(bubbles) == 1 else {'type': 'carousel', 'contents': bubbles},
     }
+
+
+def _line_filter_workflow_options(
+    options: list[dict[str, Any]],
+    category: str,
+) -> tuple[list[dict[str, Any]], str]:
+    if category == 'instant':
+        return [item for item in options if item.get('launchMode') == 'instant'], '立即執行'
+    if category == 'file':
+        return [item for item in options if item.get('launchMode') == 'file_input'], '需要檔案'
+    if category == 'guided':
+        return [item for item in options if item.get('launchMode') not in {'instant', 'file_input'}], '需要輸入'
+    return options, '全部工作流'
 
 
 def _channel_output_text(output: dict[str, Any]) -> str:
@@ -1871,7 +3319,12 @@ async def _line_delivery_messages(
     result: dict[str, Any],
 ) -> list[dict[str, Any]]:
     if result.get('lineWorkflowMenu'):
-        return [_line_workflow_menu_message(await _line_workflow_options(channel))]
+        return [
+            {
+                'type': 'text',
+                'text': '工作流選單已更新，請重新點選 LINE 選單中的工作流分類。',
+            }
+        ]
     return _line_result_messages(result)
 
 
@@ -1998,9 +3451,7 @@ async def _send_telegram_result(
         method = methods.get(str(output.get('type') or ''))
         url = str(output.get('url') or '')
         platform_file_id = str(output.get('platformFileId') or '')
-        media_reference = url or (
-            platform_file_id if output.get('platform') == 'telegram' else ''
-        )
+        media_reference = url or (platform_file_id if output.get('platform') == 'telegram' else '')
         if method and media_reference:
             await _http_post_json(
                 f'https://api.telegram.org/bot{channel.channel_secret}/{method[0]}',
@@ -2088,6 +3539,39 @@ async def channel_chat(  # noqa: C901
     if user.role == 'pending':
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Interact Web Ai user is pending approval.')
 
+    channel_id = str((payload.metadata or {}).get('channelId') or '').strip()
+    access_context: WorkflowAccessContext | None = None
+    verified_identity: dict[str, Any] | None = None
+    if payload.companyUserId:
+        if not channel_id or not payload.companyMemberEmail or not payload.companyMemberRole:
+            raise HTTPException(status_code=400, detail='LINE member identity is incomplete.')
+        channel = await InteractChannels.get_by_id(channel_id)
+        if (
+            not channel
+            or channel.company_email != payload.companyEmail.strip().lower()
+            or channel.company_user_id != payload.companyUserId
+        ):
+            raise HTTPException(status_code=403, detail='LINE member identity does not match this channel.')
+        authorization_result = await InteractBillingClient().authorize_line_identity(
+            company_user_id=payload.companyUserId,
+            company_member_id=payload.companyMemberId,
+            member_email=payload.companyMemberEmail,
+            channel_id=channel_id,
+        )
+        verified_identity = authorization_result.get('identity')
+        if not isinstance(verified_identity, dict):
+            raise HTTPException(status_code=403, detail='LINE member identity is not active.')
+        access_context = WorkflowAccessContext(
+            user_id=user.id if verified_identity.get('memberRole') == 'owner' else None,
+            role=user.role if verified_identity.get('memberRole') == 'owner' else 'user',
+            company_user_id=str(verified_identity.get('companyUserId') or ''),
+            company_member_id=verified_identity.get('companyMemberId'),
+            company_member_role=str(verified_identity.get('memberRole') or ''),
+            group_ids={str(item) for item in verified_identity.get('groupIds') or []},
+            channel_id=channel_id,
+            model_id=payload.modelId,
+        )
+
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
 
@@ -2161,6 +3645,18 @@ async def channel_chat(  # noqa: C901
             'modelId': model_id,
             'externalUserId': payload.externalUserId,
             'conversationId': payload.conversationId or payload.externalUserId,
+            **(
+                {
+                    'identitySource': 'line-binding',
+                    'companyUserId': verified_identity.get('companyUserId'),
+                    'companyMemberId': verified_identity.get('companyMemberId'),
+                    'companyMemberEmail': verified_identity.get('memberEmail'),
+                    'companyMemberRole': verified_identity.get('memberRole'),
+                    'groupIds': verified_identity.get('groupIds') or [],
+                }
+                if verified_identity
+                else {}
+            ),
         },
     }
     if payload.maxTokens:
@@ -2169,6 +3665,8 @@ async def channel_chat(  # noqa: C901
         form_data['params'] = {'function_calling': 'native'}
 
     tool_ids = _resolve_model_tool_ids(request.app, model_id)
+    if payload.channelType == 'line' and not verified_identity:
+        tool_ids = []
     features = await _resolve_model_features(request.app, model_id)
     filter_ids = _resolve_model_filter_ids(request.app, model_id)
     if tool_ids:
@@ -2182,19 +3680,19 @@ async def channel_chat(  # noqa: C901
     # WebUI chat. Ambiguous requests remain normal chat instead of guessing.
     from open_webui.routers import workflows as workflow_routes
 
-    channel_id = str((payload.metadata or {}).get('channelId') or '').strip()
     if payload.workflowId:
-        if not payload.workflowVersionId or not channel_id:
+        if not payload.workflowVersionId or not channel_id or not access_context:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='WORKFLOW-QUICK-ACTION-UNAVAILABLE',
             )
-        workflow_option = await workflow_routes.resolve_instant_workflow_for_user_context(
+        workflow_option = await workflow_routes.resolve_channel_workflow_for_user_context(
             user,
             payload.workflowId,
             payload.workflowVersionId,
             channel_id=channel_id,
             model_id=model_id,
+            access_context=access_context,
         )
         if not workflow_option:
             raise HTTPException(
@@ -2209,12 +3707,13 @@ async def channel_chat(  # noqa: C901
             'data': payload.workflowData,
             'confirmed': True,
         }
-    else:
+    elif access_context:
         selection = await workflow_routes.select_workflow_for_user_context(
             user,
             payload.message or ' '.join(str(part.get('type') or '') for part in payload.parts),
             channel_id=channel_id or None,
             model_id=model_id,
+            access_context=access_context,
         )
         if selection.decision == 'selected' and selection.selected_workflow_id:
             form_data['workflow'] = {
@@ -2236,6 +3735,24 @@ async def channel_chat(  # noqa: C901
     assistant_message = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
     response_data = _response_data(response)
     assistant_output = (assistant_message or {}).get('output') or (response_data or {}).get('output')
+    usage = (assistant_message or {}).get('usage')
+    outputs = _workflow_outputs_from_items(assistant_output)
+    runtime_error = _runtime_error_detail(assistant_message, response_data)
+    if runtime_error:
+        code, public_message = _channel_runtime_failure(runtime_error)
+        return {
+            'ok': False,
+            'chatId': chat_id,
+            'userMessageId': user_message_id,
+            'assistantMessageId': assistant_message_id,
+            'model': model_id,
+            'content': public_message,
+            'outputs': outputs,
+            'usage': usage,
+            'contextSummaryTokens': context_summary_tokens,
+            'reason': code,
+            'errorCode': code,
+        }
     tool_failure = _tool_failure_from_items(assistant_output)
     content = (
         tool_failure[1]
@@ -2245,10 +3762,6 @@ async def channel_chat(  # noqa: C901
             or output_text((assistant_message or {}).get('output'))
             or _message_content_from_response(response_data)
         )
-    )
-    usage = (assistant_message or {}).get('usage')
-    outputs = _workflow_outputs_from_items(
-        (assistant_message or {}).get('output') or (response_data or {}).get('output')
     )
 
     return {
@@ -2308,6 +3821,7 @@ async def sync_channel(
             {
                 'id': effective_channel_id,
                 'company_email': payload.companyEmail,
+                'company_user_id': payload.companyUserId,
                 'channel_type': payload.channelType,
                 'channel_identifier': payload.channelIdentifier,
                 'name': payload.name,
@@ -2332,6 +3846,21 @@ async def sync_channel(
             detail='The platform channel identifier is already bound.',
         )
 
+    existing_rich_menu = await InteractChannels.get_rich_menu(channel.id)
+    rich_menu_liff_uri = (
+        payload.richMenuLiffUri
+        if 'richMenuLiffUri' in payload.model_fields_set
+        else existing_rich_menu.liff_uri
+        if existing_rich_menu
+        else None
+    )
+    rich_menu = await InteractChannels.configure_rich_menu(
+        channel.id,
+        enabled=bool(payload.richMenuEnabled and payload.channelType == 'line'),
+        liff_uri=rich_menu_liff_uri,
+    )
+    schedule_line_rich_menu_sync(channel.id)
+
     return {
         'ok': True,
         'channelId': channel.id,
@@ -2340,6 +3869,7 @@ async def sync_channel(
         ),
         'enabled': channel.enabled,
         'updatedAt': channel.updated_at,
+        'richMenu': _rich_menu_status_payload(rich_menu),
     }
 
 
@@ -2625,6 +4155,16 @@ async def delete_channel(
             'channelId': channel_id,
         }
 
+    rich_menu = await InteractChannels.get_rich_menu(target_channel.id)
+    if rich_menu:
+        try:
+            await _clear_line_rich_menu(target_channel, rich_menu.rich_menu_id)
+        except Exception as error:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f'Unable to remove the LINE Rich Menu: {error}',
+            ) from error
+
     deleted = await InteractChannels.delete(target_channel.id)
     if not deleted:
         # A concurrent delete already removed the same verified channel.
@@ -2641,6 +4181,220 @@ async def delete_channel(
         'absent': False,
         'channelId': target_channel.id,
     }
+
+
+async def _require_company_channel(
+    channel_id: str,
+    company_email: str,
+    company_user_id: str | None = None,
+) -> InteractChannelModel:
+    channel = await InteractChannels.get_by_id(channel_id)
+    if not channel or channel.company_email != company_email.strip().lower():
+        raise HTTPException(status_code=404, detail='Channel not found.')
+    requested_company_id = str(company_user_id or '').strip()
+    if channel.company_user_id and channel.company_user_id != requested_company_id:
+        raise HTTPException(status_code=404, detail='Channel not found.')
+    return channel
+
+
+@router.get('/channels/{channel_id}/rich-menu')
+async def get_channel_rich_menu(
+    channel_id: str,
+    company_email: str,
+    company_user_id: str | None = None,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    channel = await _require_company_channel(channel_id, company_email, company_user_id)
+    state = await InteractChannels.get_rich_menu(channel_id)
+    workflow_count = 0
+    if state and state.enabled and channel.channel_type == 'line':
+        workflow_count = len(await _line_workflow_options(channel, limit=0))
+    return {
+        'ok': True,
+        'channelId': channel_id,
+        'richMenu': _rich_menu_status_payload(state, workflow_count),
+    }
+
+
+@router.post('/channels/{channel_id}/rich-menu/sync')
+async def synchronize_channel_rich_menu(
+    channel_id: str,
+    payload: RichMenuSyncRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    channel = await _require_company_channel(
+        channel_id,
+        payload.companyEmail,
+        payload.companyUserId,
+    )
+    result = await sync_line_rich_menu(channel_id, force=payload.force)
+    state = await InteractChannels.get_rich_menu(channel_id)
+    workflow_count = (
+        len(await _line_workflow_options(channel, limit=0))
+        if state and state.enabled and channel.channel_type == 'line'
+        else 0
+    )
+    response_status = status.HTTP_200_OK if result.get('ok') else status.HTTP_502_BAD_GATEWAY
+    return JSONResponse(
+        {
+            'ok': bool(result.get('ok')),
+            'richMenu': _rich_menu_status_payload(state, workflow_count),
+        },
+        status_code=response_status,
+    )
+
+
+@router.get('/channels/{channel_id}/line-identity-link')
+async def get_line_identity_link(
+    channel_id: str,
+    company_email: str,
+    company_user_id: str,
+    state: str,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    channel = await _require_company_channel(channel_id, company_email, company_user_id)
+    preview = await InteractChannels.get_line_identity_link_preview(
+        state=state,
+        channel_id=channel_id,
+    )
+    if not preview:
+        raise HTTPException(status_code=410, detail='This LINE account link has expired or was already used.')
+    return {
+        'ok': True,
+        'link': {
+            **preview,
+            'channelName': channel.name,
+            'channelIdentifier': channel.channel_identifier,
+        },
+    }
+
+
+@router.post('/channels/{channel_id}/line-identity-link/nonce')
+async def prepare_line_identity_link_nonce(
+    channel_id: str,
+    payload: LineIdentityPrepareRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    await _require_company_channel(channel_id, payload.companyEmail, payload.companyUserId)
+    nonce = secrets.token_urlsafe(32)
+    prepared = await InteractChannels.prepare_line_identity_nonce(
+        state=payload.state,
+        channel_id=channel_id,
+        link_token=payload.linkToken,
+        nonce=nonce,
+        company_user_id=payload.companyUserId,
+        company_email=payload.companyEmail,
+        company_member_id=payload.companyMemberId,
+        member_email=payload.memberEmail,
+        member_role=payload.memberRole,
+        member_status=payload.memberStatus,
+        group_ids=payload.groupIds,
+    )
+    if not prepared:
+        raise HTTPException(status_code=410, detail='This LINE account link has expired or was already used.')
+    redirect_query = urlencode({'linkToken': payload.linkToken, 'nonce': nonce})
+    return {
+        'ok': True,
+        'redirectUrl': f'https://access.line.me/dialog/bot/accountLink?{redirect_query}',
+    }
+
+
+@router.get('/channels/{channel_id}/line-identities')
+async def list_line_identities(
+    channel_id: str,
+    company_email: str,
+    company_user_id: str,
+    company_member_id: str | None = None,
+    member_email: str | None = None,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    await _require_company_channel(channel_id, company_email, company_user_id)
+    bindings = await InteractChannels.list_line_identity_bindings(
+        channel_id=channel_id,
+        company_user_id=company_user_id,
+        company_member_id=company_member_id,
+        member_email=member_email,
+    )
+    return {
+        'ok': True,
+        'bindings': [
+            {
+                'id': binding.id,
+                'channelId': binding.channel_id,
+                'companyMemberId': binding.company_member_id,
+                'memberEmail': binding.member_email,
+                'memberRole': binding.member_role,
+                'memberStatus': binding.member_status,
+                'groupIds': binding.group_ids,
+                'roleVerifiedAt': binding.role_verified_at,
+                'linkedAt': binding.linked_at,
+                'updatedAt': binding.updated_at,
+                'lineUserRef': binding.line_user_ref,
+            }
+            for binding in bindings
+        ],
+    }
+
+
+@router.post('/channels/{channel_id}/line-identities/unlink')
+async def unlink_line_identity(
+    channel_id: str,
+    payload: LineIdentityUnlinkRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    channel = await _require_company_channel(
+        channel_id,
+        payload.companyEmail,
+        payload.companyUserId,
+    )
+    bindings = await InteractChannels.list_line_identity_bindings(
+        channel_id=channel_id,
+        company_user_id=payload.companyUserId,
+        reveal_external_user_id=True,
+    )
+    binding = next((item for item in bindings if item.id == payload.bindingId), None)
+    if not binding:
+        raise HTTPException(status_code=404, detail='LINE identity binding not found.')
+    if binding.external_user_id:
+        try:
+            await _line_api_request(
+                channel,
+                'DELETE',
+                f'https://api.line.me/v2/bot/user/{quote(binding.external_user_id, safe="")}/richmenu',
+                accepted_statuses={404},
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=502,
+                detail='LINE 暫時無法重設此使用者的選單，綁定尚未解除，請稍後重試。',
+            ) from error
+    deleted = await InteractChannels.delete_line_identity_binding(
+        binding_id=payload.bindingId,
+        company_user_id=payload.companyUserId,
+        channel_id=channel_id,
+    )
+    if not deleted:
+        if binding.external_user_id:
+            with suppress(Exception):
+                await _line_assign_role_menu(
+                    channel,
+                    binding.external_user_id,
+                    _line_identity_audience(binding),
+                )
+        raise HTTPException(status_code=409, detail='LINE identity binding changed; refresh and retry.')
+    return {'ok': True, 'unlinked': True, 'bindingId': deleted.id}
 
 
 @router.get('/webhooks/{channel_type}/{channel_identifier}')
@@ -2696,21 +4450,106 @@ async def platform_webhook(  # noqa: C901
         results = []
         for index, event in enumerate(payload.get('events') or []):
             event_type = str(event.get('type') or '')
+            source = event.get('source') or {}
+            is_direct_line_chat = source.get('type') == 'user'
+            line_recipient_id = source.get('groupId') or source.get('roomId') or source.get('userId')
+            external_user_id = source.get('userId') or line_recipient_id or 'unknown'
+            if event_type == 'accountLink':
+                link = event.get('link') if isinstance(event.get('link'), dict) else {}
+                linked = None
+                if link.get('result') == 'ok' and source.get('userId') and link.get('nonce'):
+                    linked = await InteractChannels.consume_line_identity_link(
+                        nonce=str(link['nonce']),
+                        channel_id=channel.id,
+                        external_user_id=str(source['userId']),
+                    )
+                if linked:
+                    with suppress(Exception):
+                        await _line_assign_role_menu(
+                            channel,
+                            str(source['userId']),
+                            _line_identity_audience(linked),
+                        )
+                    await _send_line_reply(
+                        channel,
+                        event.get('replyToken'),
+                        (f'帳號已綁定：{linked.member_email}\n角色：{linked.member_role}\n選單已依您的權限更新。'),
+                    )
+                    results.append({'ok': True, 'accountLinked': True})
+                else:
+                    await _send_line_reply(
+                        channel,
+                        event.get('replyToken'),
+                        '綁定未完成或連結已失效，請從選單重新發起綁定。',
+                    )
+                    results.append({'ok': True, 'accountLinked': False})
+                continue
             message = event.get('message') or {}
             message_type = str(message.get('type') or '')
-            workflow_postback = _line_workflow_postback(event) if event_type == 'postback' else None
-            supported_message = event_type == 'message' and message_type in {
-                'text', 'image', 'video', 'audio', 'file'
-            }
+            postback_action = _line_postback_action(event) if event_type == 'postback' else None
+            postback_name = str((postback_action or {}).get('a') or '')
             if (
-                (channel.enabled and channel.reply_mode == 'silent')
-                or (not supported_message and workflow_postback is None)
+                event_type == 'message'
+                and message_type == 'text'
+                and _line_account_link_requested(str(message.get('text') or ''))
+            ):
+                postback_name = 'menu.account_link.v1'
+            identity_required = bool(
+                postback_name.startswith('menu.workflows')
+                or postback_name
+                in {
+                    'workflow.run.v1',
+                    'workflow.launch.v2',
+                    'menu.data.v1',
+                    'menu.file.v1',
+                    'menu.history.v1',
+                    'menu.resync.v1',
+                }
+            )
+            identity_binding = (
+                await _line_refresh_identity(
+                    channel,
+                    external_user_id,
+                    force=identity_required,
+                )
+                if is_direct_line_chat
+                else None
+            )
+            workflow_postback = await _line_resolve_workflow_postback(
+                channel,
+                postback_action,
+                identity_binding,
+            )
+            workflow_postback_requested = postback_name in {'workflow.run.v1', 'workflow.launch.v2'}
+            system_postback = postback_name in {
+                'menu.workflows.v1',
+                'menu.workflows.instant.v1',
+                'menu.workflows.guided.v1',
+                'menu.workflows.file.v1',
+                'menu.ask.v1',
+                'menu.data.v1',
+                'menu.file.v1',
+                'menu.history.v1',
+                'menu.help.v1',
+                'menu.account_link.v1',
+                'menu.account_status.v1',
+                'menu.resync.v1',
+                'menu.portal_required.v1',
+                'menu.tab.active.v1',
+            }
+            identity_management_action = postback_name in {
+                'menu.account_link.v1',
+                'menu.account_status.v1',
+            }
+            supported_message = event_type == 'message' and message_type in {'text', 'image', 'video', 'audio', 'file'}
+            if (channel.enabled and channel.reply_mode == 'silent' and not identity_management_action) or (
+                not supported_message and not workflow_postback_requested and not system_postback
             ):
                 results.append({'ok': True, 'skipped': True})
                 continue
             parts = (
                 []
-                if message_type == 'text' or workflow_postback
+                if message_type == 'text' or workflow_postback_requested or system_postback
                 else [
                     {
                         'type': message_type,
@@ -2723,25 +4562,45 @@ async def platform_webhook(  # noqa: C901
             )
             message_text = (
                 '執行 LINE 快速工作流'
-                if workflow_postback
+                if workflow_postback_requested
+                else '開啟 LINE 工作流選單'
+                if postback_name.startswith('menu.workflows')
+                else '開啟 LINE AI 輸入'
+                if postback_name in {'menu.ask.v1', 'menu.data.v1'}
+                else '查看 LINE AI 使用說明'
+                if postback_name == 'menu.help.v1'
                 else message.get('text') or f'[LINE {message_type}]'
             )
-            workflow_menu_requested = (
-                supported_message
-                and message_type == 'text'
-                and _line_workflow_menu_requested(message_text)
+            workflow_menu_requested = postback_name.startswith('menu.workflows') or (
+                supported_message and message_type == 'text' and _line_workflow_menu_requested(message_text)
             )
-            source = event.get('source') or {}
-            line_recipient_id = source.get('groupId') or source.get('roomId') or source.get('userId')
-            external_user_id = source.get('userId') or line_recipient_id or 'unknown'
             platform_event_id = (
                 event.get('webhookEventId') or hashlib.sha256(raw_body + str(index).encode()).hexdigest()
+            )
+            active_workflow_session = None
+            if supported_message and line_recipient_id and not workflow_menu_requested and not system_postback:
+                active_workflow_session = await InteractChannels.get_workflow_session(
+                    channel_id=channel.id,
+                    external_user_id=external_user_id,
+                    conversation_id=line_recipient_id,
+                )
+            quota_exempt = bool(
+                not is_direct_line_chat
+                or system_postback
+                or workflow_menu_requested
+                or active_workflow_session
+                or (
+                    workflow_postback_requested
+                    and (workflow_postback is None or workflow_postback.get('launchMode') != 'instant')
+                )
             )
             claim, content, should_process = await _claim_channel_event(
                 channel,
                 platform_event_id,
                 external_user_id,
                 message_text,
+                quota_exempt=quota_exempt,
+                force_process=identity_management_action,
             )
             if claim.duplicate and not claim.retry_delivery:
                 results.append({'ok': True, 'duplicate': True, 'skipped': True})
@@ -2750,41 +4609,465 @@ async def platform_webhook(  # noqa: C901
                 if should_process:
                     if not line_recipient_id:
                         raise RuntimeError('LINE recipient ID is missing.')
+                    if not is_direct_line_chat:
+                        response = (
+                            '為保護企業資料，AI 問答、資料查詢與工作流僅能在與官方帳號的'
+                            '一對一聊天室使用。請私訊此 LINE 官方帳號後再試一次。'
+                        )
+                        await InteractChannels.set_response(
+                            claim.event_id,
+                            response,
+                            0,
+                            'line-direct-chat-required',
+                        )
+                        await _send_line_reply(channel, event.get('replyToken'), response)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'directChatRequired': True})
+                        continue
+                    if parts:
+                        try:
+                            parts = await _hydrate_line_message_parts(channel, parts)
+                        except Exception as attachment_error:
+                            log.warning(
+                                'Unable to hydrate LINE attachment for channel=%s: %s',
+                                channel.id,
+                                attachment_error,
+                            )
+                            attachment_text = '附件無法讀取或超過允許大小，請重新上傳較小的檔案。'
+                            await InteractChannels.set_response(
+                                claim.event_id,
+                                attachment_text,
+                                0,
+                                'attachment-unavailable',
+                            )
+                            await _send_line_reply(
+                                channel,
+                                event.get('replyToken'),
+                                attachment_text,
+                            )
+                            await _mark_delivery(claim)
+                            results.append({'ok': True, 'queued': False, 'attachmentRejected': True})
+                            continue
+                    if postback_name == 'menu.account_link.v1':
+                        if source.get('type') != 'user' or not source.get('userId'):
+                            response = '請在與官方帳號的一對一聊天室中進行帳號綁定。'
+                            await _send_line_reply(channel, event.get('replyToken'), response)
+                        elif identity_binding and identity_binding.member_status == 'active':
+                            response = (
+                                f'目前已綁定 {identity_binding.member_email}。\n'
+                                '若要更換帳號，請先到主站台「AI 通訊渠道」解除綁定。'
+                            )
+                            await _send_line_reply(channel, event.get('replyToken'), response)
+                        else:
+                            response = '已發送安全綁定連結。'
+                            await _issue_line_account_link(
+                                channel,
+                                str(source['userId']),
+                                event.get('replyToken'),
+                            )
+                        await InteractChannels.set_response(claim.event_id, response, 0, None)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'accountLinkIssued': True})
+                        continue
+                    if postback_name == 'menu.account_status.v1':
+                        refreshed = await _line_refresh_identity(
+                            channel,
+                            external_user_id,
+                            force=True,
+                        )
+                        response = (
+                            f'已綁定帳號：{refreshed.member_email}\n企業角色：{refreshed.member_role}\n權限狀態：可使用'
+                            if refreshed and refreshed.member_status == 'active'
+                            else '目前尚未完成企業帳號綁定，請點選「綁定帳號」。'
+                        )
+                        await InteractChannels.set_response(claim.event_id, response, 0, None)
+                        await _send_line_reply(channel, event.get('replyToken'), response)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'accountStatus': True})
+                        continue
+                    if (identity_required or workflow_menu_requested) and (
+                        not identity_binding or identity_binding.member_status != 'active'
+                    ):
+                        response = (
+                            '無法確認您的企業身分，這次動作沒有執行。\n'
+                            '請先點選「綁定帳號」；若已綁定，請稍後重試或到主站台檢查帳號狀態。'
+                        )
+                        await InteractChannels.set_response(
+                            claim.event_id,
+                            response,
+                            0,
+                            'line-identity-required',
+                        )
+                        await _send_line_reply(channel, event.get('replyToken'), response)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'identityRequired': True})
+                        continue
+                    if workflow_menu_requested:
+                        category = (
+                            'instant'
+                            if postback_name == 'menu.workflows.instant.v1'
+                            else 'guided'
+                            if postback_name == 'menu.workflows.guided.v1'
+                            else 'file'
+                            if postback_name == 'menu.workflows.file.v1'
+                            else 'all'
+                        )
+                        options = await _line_workflow_options(
+                            channel,
+                            limit=0,
+                            binding=identity_binding,
+                        )
+                        filtered, title = _line_filter_workflow_options(options, category)
+                        await _send_line_messages(
+                            channel,
+                            event.get('replyToken'),
+                            [_line_workflow_menu_message(filtered, title=title)],
+                        )
+                        response = f'{title}工作流選單'
+                        await InteractChannels.set_response(claim.event_id, response, 0, None)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'workflowMenu': category})
+                        continue
+                    if postback_name == 'menu.resync.v1':
+                        if not identity_binding or identity_binding.member_role not in {'owner', 'admin'}:
+                            response = '只有企業擁有者或管理員可以重新同步選單。'
+                        else:
+                            await InteractChannels.mark_rich_menu_pending(channel.id)
+                            schedule_line_rich_menu_sync(channel.id, force=True)
+                            response = '選單已排入重新同步，完成後會自動更新。'
+                        await InteractChannels.set_response(claim.event_id, response, 0, None)
+                        await _send_line_reply(channel, event.get('replyToken'), response)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'menuResync': True})
+                        continue
+                    if postback_name == 'menu.history.v1':
+                        base_url = _line_portal_base_url()
+                        response = (
+                            f'請到主站台查看執行與 AI 使用紀錄：\n{base_url}/company-portal/history'
+                            if base_url
+                            else '主站台網址尚未設定，請聯繫管理員。'
+                        )
+                        await InteractChannels.set_response(claim.event_id, response, 0, None)
+                        await _send_line_reply(channel, event.get('replyToken'), response)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'history': True})
+                        continue
+                    if postback_name in {'menu.portal_required.v1', 'menu.tab.active.v1'}:
+                        response = (
+                            '主站台網址尚未設定，請聯繫管理員。'
+                            if postback_name == 'menu.portal_required.v1'
+                            else '您已經在這個分頁。'
+                        )
+                        await InteractChannels.set_response(claim.event_id, response, 0, None)
+                        await _send_line_reply(channel, event.get('replyToken'), response)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'menuNotice': True})
+                        continue
+                    if workflow_postback_requested and workflow_postback is None:
+                        unavailable_text = '這個快捷工作流已停用、更新或不再允許此渠道使用，選單正在重新整理。'
+                        await InteractChannels.set_response(claim.event_id, unavailable_text, 0, None)
+                        await _send_line_reply(
+                            channel,
+                            event.get('replyToken'),
+                            unavailable_text,
+                        )
+                        await InteractChannels.mark_rich_menu_pending(channel.id)
+                        schedule_line_rich_menu_sync(channel.id)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'workflowUnavailable': True})
+                        continue
+                    if postback_name in {'menu.ask.v1', 'menu.data.v1', 'menu.file.v1'}:
+                        active_session = await InteractChannels.get_workflow_session(
+                            channel_id=channel.id,
+                            external_user_id=external_user_id,
+                            conversation_id=line_recipient_id,
+                        )
+                        if active_session:
+                            await InteractChannels.delete_workflow_session(active_session.id)
+                        await InteractChannels.set_response(claim.event_id, '', 0, None)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'inputOpened': True})
+                        continue
+                    if postback_name == 'menu.help.v1':
+                        help_text = _line_rich_menu_help_text()
+                        await InteractChannels.set_response(claim.event_id, help_text, 0, None)
+                        await _send_line_reply(
+                            channel,
+                            event.get('replyToken'),
+                            help_text,
+                        )
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'help': True})
+                        continue
                     selected_workflow = workflow_postback
                     workflow_trigger = f'{channel_type}.quick_action' if workflow_postback else None
+                    workflow_input: dict[str, Any] | None = None
+                    completed_session_id: str | None = None
+
+                    if workflow_postback and workflow_postback.get('launchMode') != 'instant':
+                        guided_input = _line_guided_input(workflow_postback)
+                        next_field = _line_next_guided_field(workflow_postback, guided_input)
+                        session = await InteractChannels.start_workflow_session(
+                            channel_id=channel.id,
+                            external_user_id=external_user_id,
+                            conversation_id=line_recipient_id,
+                            workflow_id=str(workflow_postback['id']),
+                            workflow_version_id=str(workflow_postback['versionId']),
+                            session_input=guided_input,
+                            current_field=next_field,
+                        )
+                        if next_field:
+                            prompt = _line_guided_prompt(
+                                workflow_postback,
+                                guided_input,
+                                next_field,
+                            )
+                            await InteractChannels.set_response(claim.event_id, prompt, 0, None)
+                            await _send_line_reply(channel, event.get('replyToken'), prompt)
+                            await _mark_delivery(claim)
+                            results.append(
+                                {
+                                    'ok': True,
+                                    'queued': False,
+                                    'workflowInputPending': True,
+                                    'launchMode': workflow_postback.get('launchMode'),
+                                }
+                            )
+                            continue
+                        await InteractChannels.update_workflow_session(
+                            session.id,
+                            status='confirming',
+                            session_input=guided_input,
+                            current_field=None,
+                            expected_revision=session.revision,
+                        )
+                        prompt = (
+                            f'【需要確認】{workflow_postback.get("name") or "工作流"}\n\n'
+                            f'{workflow_postback.get("instruction") or "將使用目前預設值執行。"}\n\n'
+                            '請輸入「確認執行」繼續，或輸入「取消」。'
+                        )
+                        await InteractChannels.set_response(claim.event_id, prompt, 0, None)
+                        await _send_line_reply(channel, event.get('replyToken'), prompt)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': False, 'workflowInputPending': True})
+                        continue
+
+                    if (
+                        selected_workflow is None
+                        and supported_message
+                        and not workflow_menu_requested
+                        and not system_postback
+                    ):
+                        session = active_workflow_session
+                        if session:
+                            options = await _line_workflow_options(
+                                channel,
+                                limit=0,
+                                binding=identity_binding,
+                            )
+                            session_option = next(
+                                (
+                                    item
+                                    for item in options
+                                    if item.get('id') == session.workflow_id
+                                    and item.get('versionId') == session.workflow_version_id
+                                ),
+                                None,
+                            )
+                            if not session_option:
+                                await InteractChannels.delete_workflow_session(session.id)
+                                unavailable_text = (
+                                    '這個工作流在填寫期間已更新、停用或失去渠道權限，本次輸入已取消。請從選單重新開始。'
+                                )
+                                await InteractChannels.set_response(
+                                    claim.event_id,
+                                    unavailable_text,
+                                    0,
+                                    None,
+                                )
+                                await _send_line_reply(channel, event.get('replyToken'), unavailable_text)
+                                await _mark_delivery(claim)
+                                results.append({'ok': True, 'queued': False, 'workflowSessionExpired': True})
+                                continue
+                            advanced = await _line_advance_workflow_session(
+                                session_option,
+                                session,
+                                message_text,
+                                parts,
+                            )
+                            if advanced['status'] != 'execute':
+                                response_text = str(advanced.get('text') or '')
+                                await InteractChannels.set_response(
+                                    claim.event_id,
+                                    response_text,
+                                    0,
+                                    None,
+                                )
+                                await _send_line_reply(channel, event.get('replyToken'), response_text)
+                                await _mark_delivery(claim)
+                                results.append(
+                                    {
+                                        'ok': True,
+                                        'queued': False,
+                                        'workflowInputPending': advanced['status'] == 'prompt',
+                                        'workflowInputCancelled': advanced['status'] == 'cancelled',
+                                    }
+                                )
+                                continue
+                            selected_workflow = session_option
+                            workflow_trigger = f'{channel_type}.guided_input'
+                            workflow_input = advanced['input']
+                            completed_session_id = session.id
+                            execution_session = advanced.get('session')
+                        else:
+                            execution_session = None
+
+                    else:
+                        execution_session = None
+
                     if (
                         selected_workflow is None
                         and supported_message
                         and message_type == 'text'
                         and not workflow_menu_requested
                     ):
-                        selected_workflow = await _line_selected_workflow_request(channel, message_text)
+                        selected_workflow = await _line_selected_workflow_request(
+                            channel,
+                            message_text,
+                            identity_binding,
+                        )
                         if selected_workflow:
                             workflow_trigger = f'{channel_type}.message'
-                    await InteractChannels.enqueue_job(
-                        event_id=claim.event_id,
-                        channel_id=channel.id,
-                        external_user_id=external_user_id,
-                        platform='line',
-                        conversation_id=line_recipient_id,
-                        payload={
-                            'platformEventId': platform_event_id,
-                            'recipientId': line_recipient_id,
-                            'message': message_text,
-                            'parts': parts,
-                            **({'workflowMenu': True} if workflow_menu_requested else {}),
-                            **(
+                            selected_workflow = {
+                                'id': selected_workflow[0],
+                                'versionId': selected_workflow[1],
+                                'launchMode': 'text_input',
+                            }
+                    execution_message = str((workflow_input or {}).get('message') or message_text)
+                    execution_parts = list((workflow_input or {}).get('parts') or []) if workflow_input else parts
+                    if completed_session_id and execution_session:
+                        claimed_session = await InteractChannels.update_workflow_session(
+                            completed_session_id,
+                            status='executing',
+                            session_input=workflow_input or {},
+                            current_field=None,
+                            expected_revision=execution_session.revision,
+                        )
+                        if not claimed_session:
+                            conflict_text = '上一則輸入已經啟動工作流，這一則沒有重複執行。請等待結果。'
+                            await InteractChannels.set_response(
+                                claim.event_id,
+                                conflict_text,
+                                0,
+                                'workflow-session-conflict',
+                            )
+                            await _send_line_reply(
+                                channel,
+                                event.get('replyToken'),
+                                conflict_text,
+                            )
+                            await _mark_delivery(claim)
+                            results.append({'ok': True, 'queued': False, 'workflowSessionConflict': True})
+                            continue
+                        promoted = await InteractChannels.promote_event_quota(
+                            claim.event_id,
+                            channel,
+                            external_user_id,
+                            _estimated_reservation_tokens(execution_message),
+                            _taipei_day_start(),
+                        )
+                        if not promoted.allowed:
+                            await InteractChannels.update_workflow_session(
+                                completed_session_id,
+                                status='ready',
+                                session_input=workflow_input or {},
+                                current_field=None,
+                                expected_revision=claimed_session.revision,
+                            )
+                            limited_text = _rate_limit_text(channel, promoted.reason)
+                            await InteractChannels.set_response(
+                                claim.event_id,
+                                limited_text,
+                                0,
+                                promoted.reason,
+                            )
+                            await _send_line_reply(
+                                channel,
+                                event.get('replyToken'),
+                                limited_text,
+                            )
+                            await _mark_delivery(claim)
+                            results.append(
                                 {
-                                    'workflowId': selected_workflow[0],
-                                    'workflowVersionId': selected_workflow[1],
-                                    'workflowTrigger': workflow_trigger,
-                                    'workflowData': {},
+                                    'ok': True,
+                                    'queued': False,
+                                    'rateLimited': True,
+                                    'workflowReadyToRetry': True,
                                 }
-                                if selected_workflow
-                                else {}
+                            )
+                            continue
+                    try:
+                        await InteractChannels.enqueue_job(
+                            event_id=claim.event_id,
+                            channel_id=channel.id,
+                            external_user_id=external_user_id,
+                            platform='line',
+                            conversation_id=line_recipient_id,
+                            payload={
+                                'platformEventId': platform_event_id,
+                                'recipientId': line_recipient_id,
+                                'message': execution_message,
+                                'parts': execution_parts,
+                                **(
+                                    {
+                                        'companyIdentity': {
+                                            'companyUserId': identity_binding.company_user_id,
+                                            'companyMemberId': identity_binding.company_member_id,
+                                            'memberEmail': identity_binding.member_email,
+                                            'memberRole': identity_binding.member_role,
+                                            'groupIds': identity_binding.group_ids,
+                                        }
+                                    }
+                                    if identity_binding and identity_binding.member_status == 'active'
+                                    else {}
+                                ),
+                                **({'workflowMenu': True} if workflow_menu_requested else {}),
+                                **(
+                                    {
+                                        'workflowId': selected_workflow['id'],
+                                        'workflowVersionId': selected_workflow['versionId'],
+                                        'workflowTrigger': workflow_trigger,
+                                        'workflowData': dict((workflow_input or {}).get('data') or {}),
+                                    }
+                                    if selected_workflow
+                                    else {}
+                                ),
+                            },
+                        )
+                    except Exception:
+                        if completed_session_id and execution_session and claimed_session:
+                            try:
+                                await InteractChannels.update_workflow_session(
+                                    completed_session_id,
+                                    status='ready',
+                                    session_input=workflow_input or {},
+                                    current_field=None,
+                                    expected_revision=claimed_session.revision,
+                                )
+                            except Exception:
+                                log.exception('Failed to restore guided workflow session after enqueue error')
+                            try:
+                                await InteractChannels.release_event_quota(claim.event_id)
+                            except Exception:
+                                log.exception('Failed to release guided workflow quota after enqueue error')
+                        raise
+                    if completed_session_id:
+                        await InteractChannels.delete_workflow_session(
+                            completed_session_id,
+                            expected_revision=(
+                                claimed_session.revision if execution_session and claimed_session else None
                             ),
-                        },
-                    )
+                        )
                     wake_channel_job_workers()
                     if selected_workflow:
                         await _send_line_reply(channel, event.get('replyToken'), _line_progress_text(channel))
@@ -2976,8 +5259,7 @@ async def channel_health(
             'userVerified': False,
             'billingVerified': False,
             'accountRequired': True,
-            'workersReady': _channel_worker_expected > 0
-            and len(_channel_worker_tasks) == _channel_worker_expected,
+            'workersReady': _channel_worker_expected > 0 and len(_channel_worker_tasks) == _channel_worker_expected,
             'workerCount': len(_channel_worker_tasks),
             'expectedWorkerCount': _channel_worker_expected,
             'queue': {},
@@ -3055,8 +5337,8 @@ async def consume_sso_ticket(request: Request, ticket: str = Query(..., min_leng
         separator = '&' if '?' in target_path else '?'
         target_path = f'{target_path}{separator}{urlencode({"interact_return_to": claimed["return_url"]})}'
     response = RedirectResponse(target_path, status_code=303)
-    from open_webui.routers.auths import create_session_response
     from open_webui.internal.db import get_async_db_context
+    from open_webui.routers.auths import create_session_response
 
     async with get_async_db_context() as db:
         await create_session_response(

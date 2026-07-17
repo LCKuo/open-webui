@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from open_webui.utils.workflow_launch import (
+    add_guidance_node_to_legacy_graph,
     apply_launch_defaults,
     normalize_launch_contract,
     validate_launch_contract,
@@ -40,12 +41,97 @@ def _launch(mode, **overrides):
     }
 
 
+def test_legacy_guidance_upgrade_tolerates_non_numeric_canvas_positions():
+    graph = _graph()
+    graph['nodes'][0]['position'] = {'x': 'auto', 'y': float('nan')}
+
+    upgraded, changed = add_guidance_node_to_legacy_graph(
+        graph,
+        _launch('text_input'),
+    )
+
+    guidance = next(node for node in upgraded['nodes'] if node['data']['type'] == 'user_input')
+    assert changed is True
+    assert guidance['position'] == {'x': -340.0, 'y': 0.0}
+
+
 def test_legacy_workflows_infer_launch_mode_without_mutating_graph():
     graph = _graph(start='file_upload')
     contract = normalize_launch_contract({}, graph)
 
     assert contract['mode'] == 'file_input'
     assert graph['nodes'][0]['data']['type'] == 'file_upload'
+
+
+def test_guidance_node_is_the_launch_contract_source_of_truth():
+    graph = _graph(start='user_input')
+    graph['nodes'][0]['data']['config'] = {
+        'launch': {
+            'mode': 'form_input',
+            'instruction': '請輸入查詢月份。',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {'month': {'type': 'string', 'title': '月份'}},
+                'required': ['month'],
+                'additionalProperties': False,
+            },
+        }
+    }
+
+    contract = normalize_launch_contract(
+        {'launch': {'mode': 'instant', 'instruction': '舊設定'}},
+        graph,
+    )
+
+    assert contract['mode'] == 'form_input'
+    assert contract['instruction'] == '請輸入查詢月份。'
+    assert 'month' in contract['inputSchema']['properties']
+
+
+def test_publish_requires_exactly_one_guidance_node_for_guided_workflow():
+    meta = {'launch': {'mode': 'text_input'}}
+
+    missing = validate_launch_contract(meta, {'nodes': [], 'edges': []}, for_publish=True)
+    duplicate = validate_launch_contract(
+        meta,
+        {
+            'nodes': [
+                {'id': 'guide-1', 'data': {'type': 'user_input', 'config': {'launch': meta['launch']}}},
+                {'id': 'guide-2', 'data': {'type': 'user_input', 'config': {'launch': meta['launch']}}},
+            ],
+            'edges': [],
+        },
+        for_publish=True,
+    )
+
+    assert missing['ok'] is False
+    assert any('必須加入' in error for error in missing['errors'])
+    assert duplicate['ok'] is False
+    assert any('只能有一個' in error for error in duplicate['errors'])
+
+
+def test_legacy_guided_graph_is_upgraded_to_an_editable_guidance_node_once():
+    graph = _graph(start='form_input')
+    meta = _launch(
+        'form_input',
+        instruction='請輸入查詢條件。',
+        inputSchema={
+            'type': 'object',
+            'properties': {'limit': {'type': 'integer', 'title': '筆數'}},
+            'required': ['limit'],
+            'additionalProperties': False,
+        },
+    )
+
+    upgraded, changed = add_guidance_node_to_legacy_graph(graph, meta)
+    upgraded_again, changed_again = add_guidance_node_to_legacy_graph(upgraded, meta)
+    guidance_nodes = [node for node in upgraded_again['nodes'] if node['data']['type'] == 'user_input']
+
+    assert changed is True
+    assert changed_again is False
+    assert len(guidance_nodes) == 1
+    assert guidance_nodes[0]['data']['config']['launch']['instruction'] == '請輸入查詢條件。'
+    assert graph['nodes'][0]['data']['type'] == 'form_input'
 
 
 def test_instant_mode_requires_defaults_for_every_required_field():

@@ -14,6 +14,7 @@ from open_webui.routers.interact_channels import (
     _estimated_reservation_tokens,
     _generate_context_summary,
     _line_delivery_messages,
+    _line_filter_workflow_options,
     _line_workflow_menu_message,
     _line_workflow_menu_requested,
     _line_workflow_postback,
@@ -85,6 +86,19 @@ def _request(
             'server': ('testserver', 443),
         },
         receive,
+    )
+
+
+def _active_line_identity():
+    return SimpleNamespace(
+        id='binding-id',
+        company_user_id='company-id',
+        company_member_id='member-id',
+        member_email='member@example.com',
+        member_role='member',
+        member_status='active',
+        group_ids=[],
+        role_verified_at=9999999999,
     )
 
 
@@ -234,9 +248,7 @@ async def test_disabled_line_channel_replies_with_fallback(monkeypatch):
             ]
         }
     ).encode()
-    signature = base64.b64encode(
-        hmac.new(b'line-secret', body, hashlib.sha256).digest()
-    )
+    signature = base64.b64encode(hmac.new(b'line-secret', body, hashlib.sha256).digest())
     replies = []
 
     async def get_channel(*args):
@@ -290,7 +302,7 @@ async def test_enabled_line_webhook_queues_without_waiting_for_model(monkeypatch
                     'type': 'message',
                     'replyToken': 'reply-token',
                     'webhookEventId': 'event-id',
-                    'source': {'type': 'group', 'groupId': 'line-group', 'userId': 'line-user'},
+                    'source': {'type': 'user', 'userId': 'line-user'},
                     'message': {'type': 'text', 'text': 'hello'},
                 }
             ]
@@ -338,8 +350,8 @@ async def test_enabled_line_webhook_queues_without_waiting_for_model(monkeypatch
     assert result['results'][0]['queued'] is True
     assert queued[0]['event_id'] == 'claimed-event'
     assert queued[0]['external_user_id'] == 'line-user'
-    assert queued[0]['conversation_id'] == 'line-group'
-    assert queued[0]['payload']['recipientId'] == 'line-group'
+    assert queued[0]['conversation_id'] == 'line-user'
+    assert queued[0]['payload']['recipientId'] == 'line-user'
     assert 'workflowId' not in queued[0]['payload']
     assert replies == []
 
@@ -447,9 +459,24 @@ async def test_line_workflow_postback_queues_exact_published_version(monkeypatch
         queued.append(kwargs)
         return SimpleNamespace(id='job-id')
 
+    async def workflow_options(*args, **kwargs):
+        return [
+            {
+                'id': 'workflow-id',
+                'versionId': 'version-id',
+                'name': '立即查詢',
+                'launchMode': 'instant',
+            }
+        ]
+
+    async def refresh_identity(*args, **kwargs):
+        return _active_line_identity()
+
     monkeypatch.setattr('open_webui.routers.interact_channels._platform_channel', get_channel)
     monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.claim_event', claim_event)
     monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.enqueue_job', enqueue_job)
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_workflow_options', workflow_options)
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_refresh_identity', refresh_identity)
     monkeypatch.setattr('open_webui.routers.interact_channels._send_line_reply', _mark_delivery_noop)
     monkeypatch.setattr('open_webui.routers.interact_channels.wake_channel_job_workers', lambda: None)
 
@@ -465,6 +492,282 @@ async def test_line_workflow_postback_queues_exact_published_version(monkeypatch
     assert queued[0]['payload']['workflowTrigger'] == 'line.quick_action'
     assert queued[0]['payload']['message'] == '執行 LINE 快速工作流'
     assert _line_workflow_postback({'postback': {'data': 'not-json'}}) is None
+
+
+@pytest.mark.asyncio
+async def test_unbound_line_user_cannot_execute_workflow_postback(monkeypatch):
+    channel = SimpleNamespace(
+        id='channel-id',
+        enabled=True,
+        reply_mode='ai',
+        fallback_message='fallback',
+        channel_secret='line-secret',
+        channel_access_token='line-access-token',
+    )
+    body = json.dumps(
+        {
+            'events': [
+                {
+                    'type': 'postback',
+                    'replyToken': 'reply-token',
+                    'webhookEventId': 'unbound-workflow-event',
+                    'source': {'type': 'user', 'userId': 'unbound-line-user'},
+                    'postback': {'data': '{"a":"workflow.launch.v2","w":"workflow-id"}'},
+                }
+            ]
+        }
+    ).encode()
+    signature = base64.b64encode(hmac.new(b'line-secret', body, hashlib.sha256).digest())
+    replies = []
+    queued = []
+
+    async def get_channel(*args):
+        return channel
+
+    async def claim_event(*args, **kwargs):
+        return InteractEventClaim(allowed=True, duplicate=False, event_id='unbound-claim')
+
+    async def no_identity(*args, **kwargs):
+        return None
+
+    async def send_reply(channel, reply_token, text):
+        replies.append(text)
+
+    async def no_op(*args, **kwargs):
+        return None
+
+    async def enqueue_job(**kwargs):
+        queued.append(kwargs)
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._platform_channel', get_channel)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.claim_event', claim_event)
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_refresh_identity', no_identity)
+    monkeypatch.setattr('open_webui.routers.interact_channels._send_line_reply', send_reply)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.set_response', no_op)
+    monkeypatch.setattr('open_webui.routers.interact_channels._mark_delivery', no_op)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.enqueue_job', enqueue_job)
+
+    response = await platform_webhook(
+        _request(body, [(b'x-line-signature', signature)]),
+        'line',
+        'line-channel',
+    )
+
+    assert response.status_code == 200
+    assert queued == []
+    assert replies == [
+        '無法確認您的企業身分，這次動作沒有執行。\n請先點選「綁定帳號」；若已綁定，請稍後重試或到主站台檢查帳號狀態。'
+    ]
+    assert json.loads(response.body)['results'][0]['identityRequired'] is True
+
+
+@pytest.mark.asyncio
+async def test_line_account_link_text_command_issues_secure_link(monkeypatch):
+    channel = SimpleNamespace(
+        id='channel-id',
+        enabled=True,
+        reply_mode='silent',
+        fallback_message='fallback',
+        channel_secret='line-secret',
+        channel_access_token='line-access-token',
+    )
+    body = json.dumps(
+        {
+            'events': [
+                {
+                    'type': 'message',
+                    'replyToken': 'reply-token',
+                    'webhookEventId': 'account-link-command-event',
+                    'source': {'type': 'user', 'userId': 'line-user'},
+                    'message': {'type': 'text', 'text': '綁定帳號'},
+                }
+            ]
+        }
+    ).encode()
+    signature = base64.b64encode(hmac.new(b'line-secret', body, hashlib.sha256).digest())
+    issued = []
+    delivery_errors = []
+
+    async def get_channel(*args):
+        return channel
+
+    async def claim_event(*args, **kwargs):
+        return InteractEventClaim(allowed=True, duplicate=False, event_id='account-link-claim')
+
+    async def no_identity(*args, **kwargs):
+        return None
+
+    async def issue_link(channel, user_id, reply_token):
+        issued.append((user_id, reply_token))
+
+    async def no_op(*args, **kwargs):
+        return None
+
+    async def mark_delivery(claim, error=None):
+        delivery_errors.append(error)
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._platform_channel', get_channel)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.claim_event', claim_event)
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_refresh_identity', no_identity)
+    monkeypatch.setattr('open_webui.routers.interact_channels._issue_line_account_link', issue_link)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.set_response', no_op)
+    monkeypatch.setattr('open_webui.routers.interact_channels._mark_delivery', mark_delivery)
+
+    response = await platform_webhook(
+        _request(body, [(b'x-line-signature', signature)]),
+        'line',
+        'line-channel',
+    )
+
+    assert response.status_code == 200, (response.body, delivery_errors)
+    assert issued == [('line-user', 'reply-token')]
+    assert json.loads(response.body)['results'][0]['accountLinkIssued'] is True
+
+
+@pytest.mark.asyncio
+async def test_line_account_link_event_assigns_role_menu_once(monkeypatch):
+    channel = SimpleNamespace(
+        id='channel-id',
+        enabled=True,
+        reply_mode='ai',
+        channel_secret='line-secret',
+        channel_access_token='line-access-token',
+    )
+    account_link_event = {
+        'type': 'accountLink',
+        'replyToken': 'reply-token',
+        'source': {'type': 'user', 'userId': 'line-user'},
+        'link': {'result': 'ok', 'nonce': 'one-use-nonce'},
+    }
+    body = json.dumps({'events': [account_link_event, account_link_event]}).encode()
+    signature = base64.b64encode(hmac.new(b'line-secret', body, hashlib.sha256).digest())
+    replies = []
+    assignments = []
+    consume_count = 0
+
+    async def get_channel(*args):
+        return channel
+
+    async def consume(**kwargs):
+        nonlocal consume_count
+        consume_count += 1
+        return _active_line_identity() if consume_count == 1 else None
+
+    async def assign(channel, user_id, audience):
+        assignments.append((user_id, audience))
+
+    async def send_reply(channel, reply_token, text):
+        replies.append(text)
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._platform_channel', get_channel)
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.consume_line_identity_link',
+        consume,
+    )
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_assign_role_menu', assign)
+    monkeypatch.setattr('open_webui.routers.interact_channels._send_line_reply', send_reply)
+
+    response = await platform_webhook(
+        _request(body, [(b'x-line-signature', signature)]),
+        'line',
+        'line-channel',
+    )
+
+    assert response.status_code == 200
+    assert assignments == [('line-user', 'member')]
+    assert '帳號已綁定：member@example.com' in replies[0]
+    assert replies[1] == '綁定未完成或連結已失效，請從選單重新發起綁定。'
+    assert [item['accountLinked'] for item in json.loads(response.body)['results']] == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_line_guided_workflow_postback_prompts_without_execution(monkeypatch):
+    channel = SimpleNamespace(
+        id='channel-id',
+        enabled=True,
+        reply_mode='ai',
+        fallback_message='fallback',
+        channel_secret='line-secret',
+        channel_access_token='line-access-token',
+    )
+    body = json.dumps(
+        {
+            'events': [
+                {
+                    'type': 'postback',
+                    'replyToken': 'reply-token',
+                    'webhookEventId': 'guided-event',
+                    'source': {'type': 'user', 'userId': 'line-user'},
+                    'postback': {'data': '{"a":"workflow.launch.v2","w":"guided-id"}'},
+                }
+            ]
+        }
+    ).encode()
+    signature = base64.b64encode(hmac.new(b'line-secret', body, hashlib.sha256).digest())
+    replies = []
+    guided_option = {
+        'id': 'guided-id',
+        'versionId': 'guided-version',
+        'name': '建立月報',
+        'launchMode': 'form_input',
+        'instruction': '請設定報表月份。',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {'month': {'type': 'string', 'title': '月份'}},
+            'required': ['month'],
+            'additionalProperties': False,
+        },
+        'defaultInput': {},
+        'fileRules': {},
+    }
+
+    async def get_channel(*args):
+        return channel
+
+    async def claim_event(*args, **kwargs):
+        return InteractEventClaim(allowed=True, duplicate=False, event_id='guided-claim')
+
+    async def workflow_options(*args, **kwargs):
+        return [guided_option]
+
+    async def refresh_identity(*args, **kwargs):
+        return _active_line_identity()
+
+    async def start_session(**kwargs):
+        return SimpleNamespace(id='session-id', **kwargs)
+
+    async def send_reply(channel, reply_token, text):
+        replies.append(text)
+
+    async def no_op(*args, **kwargs):
+        return None
+
+    async def unexpected_enqueue(**kwargs):
+        raise AssertionError('guided workflow must wait for user input')
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._platform_channel', get_channel)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.claim_event', claim_event)
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_workflow_options', workflow_options)
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_refresh_identity', refresh_identity)
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.start_workflow_session',
+        start_session,
+    )
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.set_response', no_op)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.enqueue_job', unexpected_enqueue)
+    monkeypatch.setattr('open_webui.routers.interact_channels._send_line_reply', send_reply)
+    monkeypatch.setattr('open_webui.routers.interact_channels._mark_delivery', no_op)
+
+    response = await platform_webhook(
+        _request(body, [(b'x-line-signature', signature)]),
+        'line',
+        'line-channel',
+    )
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload['results'][0]['workflowInputPending'] is True
+    assert '第 1/1 項：月份（必填）' in replies[0]
 
 
 def test_line_workflow_menu_is_compact_accessible_flex_message():
@@ -487,13 +790,121 @@ def test_line_workflow_menu_is_compact_accessible_flex_message():
     serialized = json.dumps(message, ensure_ascii=False)
 
     assert message['type'] == 'flex'
-    assert message['altText'] == '快速工作流選單'
+    assert message['altText'] == '全部工作流選單'
     assert '簽約銷售額前 5 名' in serialized
     assert '跟進頻率前 5 名' in serialized
     assert serialized.count('workflow.run.v1') == 2
     assert '僅顯示此公司、模型與 LINE 渠道有權使用' in serialized
     assert _line_workflow_menu_requested(' 工作流選單！ ')
     assert not _line_workflow_menu_requested('請幫我執行工作流查詢銷售額')
+
+
+def test_line_workflow_menu_caps_carousel_and_omits_blank_descriptions():
+    options = [
+        {
+            'id': f'workflow-{index}',
+            'versionId': f'version-{index}',
+            'name': f'工作流 {index}',
+            'description': '   ',
+            'launchMode': 'file_input' if index % 3 == 0 else 'form_input',
+        }
+        for index in range(100)
+    ]
+
+    message = _line_workflow_menu_message(options)
+    serialized = json.dumps(message, ensure_ascii=False)
+
+    assert message['contents']['type'] == 'carousel'
+    assert len(message['contents']['contents']) == 12
+    assert serialized.count('workflow.run.v1') == 72
+    assert '顯示前 72 個，共 100 個可用工作流' in serialized
+    assert '"text": ""' not in serialized
+    assert '需要檔案' in serialized
+
+
+def test_line_workflow_categories_do_not_duplicate_file_workflows():
+    options = [
+        {'id': 'instant', 'launchMode': 'instant'},
+        {'id': 'guided', 'launchMode': 'form_input'},
+        {'id': 'file', 'launchMode': 'file_input'},
+    ]
+
+    guided, guided_title = _line_filter_workflow_options(options, 'guided')
+    files, file_title = _line_filter_workflow_options(options, 'file')
+
+    assert guided_title == '需要輸入'
+    assert [item['id'] for item in guided] == ['guided']
+    assert file_title == '需要檔案'
+    assert [item['id'] for item in files] == ['file']
+
+
+@pytest.mark.asyncio
+async def test_line_group_chat_is_blocked_before_identity_or_ai_execution(monkeypatch):
+    channel = SimpleNamespace(
+        id='channel-id',
+        channel_type='line',
+        enabled=True,
+        reply_mode='ai',
+        fallback_message='fallback',
+        channel_secret='line-secret',
+        channel_access_token='line-access-token',
+    )
+    body = json.dumps(
+        {
+            'events': [
+                {
+                    'type': 'message',
+                    'replyToken': 'reply-token',
+                    'webhookEventId': 'group-event',
+                    'source': {
+                        'type': 'group',
+                        'groupId': 'line-group',
+                        'userId': 'line-user',
+                    },
+                    'message': {'type': 'text', 'text': '查詢公司資料'},
+                }
+            ]
+        }
+    ).encode()
+    signature = base64.b64encode(hmac.new(b'line-secret', body, hashlib.sha256).digest())
+    replies = []
+    claims = []
+
+    async def get_channel(*args):
+        return channel
+
+    async def claim_event(*args, **kwargs):
+        claims.append((args, kwargs))
+        return InteractEventClaim(allowed=True, duplicate=False, event_id='event-id')
+
+    async def send_reply(channel, reply_token, text):
+        replies.append(text)
+
+    async def no_op(*args, **kwargs):
+        return None
+
+    async def unexpected(*args, **kwargs):
+        raise AssertionError('group chat must not resolve identity or enqueue AI work')
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._platform_channel', get_channel)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.claim_event', claim_event)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.set_response', no_op)
+    monkeypatch.setattr('open_webui.routers.interact_channels._send_line_reply', send_reply)
+    monkeypatch.setattr('open_webui.routers.interact_channels._mark_delivery', no_op)
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_refresh_identity', unexpected)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.enqueue_job', unexpected)
+
+    response = await platform_webhook(
+        _request(body, [(b'x-line-signature', signature)]),
+        'line',
+        'line-channel',
+    )
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload['results'][0]['directChatRequired'] is True
+    assert '一對一聊天室' in replies[0]
+    assert claims[0][1]['quota_exempt'] is True
 
 
 @pytest.mark.asyncio
@@ -521,19 +932,17 @@ async def test_line_workflow_menu_uses_carousel_without_quick_replies(monkeypatc
     monkeypatch.setattr('open_webui.routers.interact_channels._line_workflow_options', load_options)
 
     messages = await _line_delivery_messages(channel, {'lineWorkflowMenu': True})
-    serialized = json.dumps(messages[0], ensure_ascii=False)
 
-    assert messages[0]['type'] == 'flex'
-    assert messages[0]['contents']['type'] == 'carousel'
-    assert len(messages[0]['contents']['contents']) == 2
-    assert serialized.count('workflow.run.v1') == 8
-    assert '第 1/2 頁' in serialized
-    assert '第 2/2 頁' in serialized
-    assert 'quickReply' not in serialized
+    assert messages == [
+        {
+            'type': 'text',
+            'text': '工作流選單已更新，請重新點選 LINE 選單中的工作流分類。',
+        }
+    ]
 
 
 @pytest.mark.asyncio
-async def test_line_menu_command_queues_panel_without_progress_reply(monkeypatch):
+async def test_line_menu_command_replies_with_authorized_panel_without_queue(monkeypatch):
     channel = SimpleNamespace(
         id='channel-id',
         enabled=True,
@@ -572,10 +981,34 @@ async def test_line_menu_command_queues_panel_without_progress_reply(monkeypatch
     async def send_reply(*args):
         replies.append(args)
 
+    async def send_messages(channel, reply_token, messages):
+        replies.extend(messages)
+
+    async def refresh_identity(*args, **kwargs):
+        return _active_line_identity()
+
+    async def workflow_options(*args, **kwargs):
+        return [
+            {
+                'id': 'workflow-id',
+                'versionId': 'version-id',
+                'name': '立即查詢',
+                'launchMode': 'instant',
+            }
+        ]
+
+    async def no_op(*args, **kwargs):
+        return None
+
     monkeypatch.setattr('open_webui.routers.interact_channels._platform_channel', get_channel)
     monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.claim_event', claim_event)
     monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.enqueue_job', enqueue_job)
     monkeypatch.setattr('open_webui.routers.interact_channels._send_line_reply', send_reply)
+    monkeypatch.setattr('open_webui.routers.interact_channels._send_line_messages', send_messages)
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_refresh_identity', refresh_identity)
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_workflow_options', workflow_options)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.set_response', no_op)
+    monkeypatch.setattr('open_webui.routers.interact_channels._mark_delivery', no_op)
     monkeypatch.setattr('open_webui.routers.interact_channels.wake_channel_job_workers', lambda: None)
 
     response = await platform_webhook(
@@ -585,8 +1018,8 @@ async def test_line_menu_command_queues_panel_without_progress_reply(monkeypatch
     )
 
     assert response.status_code == 200
-    assert queued[0]['payload']['workflowMenu'] is True
-    assert replies == []
+    assert queued == []
+    assert replies[0]['type'] == 'flex'
 
 
 @pytest.mark.asyncio
@@ -654,8 +1087,9 @@ async def test_delivery_retry_reuses_saved_result_without_rerunning_model(monkey
     async def send_result(channel, recipient, result, retry_key=None):
         deliveries.append((recipient, result, retry_key))
 
-    async def complete_job(job_id):
+    async def complete_job(job_id, worker_id):
         completed.append(job_id)
+        return True
 
     async def unexpected_model_call(*args, **kwargs):
         raise AssertionError('delivery retry must not rerun the model or workflow')
@@ -703,12 +1137,14 @@ async def test_menu_job_builds_panel_result_without_calling_model(monkeypatch):
 
     async def save_result(*args):
         saved.append(args)
+        return True
 
     async def send_result(channel, recipient, result, retry_key=None):
         deliveries.append((recipient, result, retry_key))
 
-    async def complete_job(job_id):
+    async def complete_job(job_id, worker_id):
         completed.append(job_id)
+        return True
 
     async def unexpected_model_call(*args, **kwargs):
         raise AssertionError('workflow menu must not invoke the model')
@@ -724,7 +1160,8 @@ async def test_menu_job_builds_panel_result_without_calling_model(monkeypatch):
 
     assert responses == [('menu-event', '快速工作流選單', 0, None)]
     assert saved[0][0] == 'menu-job'
-    assert saved[0][1]['lineWorkflowMenu'] is True
+    assert saved[0][1] == 'worker'
+    assert saved[0][2]['lineWorkflowMenu'] is True
     assert deliveries[0][1]['lineWorkflowMenu'] is True
     assert completed == ['menu-job']
 
@@ -813,11 +1250,7 @@ async def test_disabled_wechat_channel_replies_with_fallback(monkeypatch):
     )
     timestamp = '123456'
     nonce = 'nonce'
-    signature = hashlib.sha1(
-        ''.join(
-            sorted(['wechat-verification-token', timestamp, nonce])
-        ).encode()
-    ).hexdigest()
+    signature = hashlib.sha1(''.join(sorted(['wechat-verification-token', timestamp, nonce])).encode()).hexdigest()
     query = f'signature={signature}&timestamp={timestamp}&nonce={nonce}'.encode()
 
     async def get_channel(*args):
@@ -1038,6 +1471,9 @@ async def test_channel_chat_awaits_model_features(monkeypatch):
     async def resolve_features(*args):
         return {'image_generation': True}
 
+    def resolve_tools(*args):
+        return ['private-company-tool']
+
     async def select_workflow(*args, **kwargs):
         return SimpleNamespace(decision='none', selected_workflow_id=None, selected_version_id=None)
 
@@ -1066,6 +1502,7 @@ async def test_channel_chat_awaits_model_features(monkeypatch):
     monkeypatch.setattr('open_webui.routers.interact_channels._ensure_channel_chat', ensure_chat)
     monkeypatch.setattr('open_webui.routers.interact_channels._prepare_channel_context', prepare_context)
     monkeypatch.setattr('open_webui.routers.interact_channels._resolve_model_features', resolve_features)
+    monkeypatch.setattr('open_webui.routers.interact_channels._resolve_model_tool_ids', resolve_tools)
     monkeypatch.setattr('open_webui.routers.interact_channels.Chats.get_message_by_id_and_message_id', get_message)
     monkeypatch.setattr('open_webui.routers.workflows.select_workflow_for_user_context', select_workflow)
 
@@ -1076,13 +1513,74 @@ async def test_channel_chat_awaits_model_features(monkeypatch):
                 MODELS={'model': {}},
                 CHAT_COMPLETION_HANDLER=handler,
             )
-        )
+        ),
     )
     response = await channel_chat(request, _payload(), None, None)
 
     assert captured['features'] == {'image_generation': True}
+    assert 'tool_ids' not in captured
     assert captured_runtime['trusted'] is True
     assert response['content'] == 'done'
+
+
+@pytest.mark.asyncio
+async def test_channel_chat_exposes_stored_billing_error_instead_of_fallback(monkeypatch):
+    user = SimpleNamespace(id='shared-user', role='user')
+    chat = SimpleNamespace(chat={'history': {'currentId': None}})
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._require_service_token', lambda *args: None)
+
+    async def get_user(email):
+        return user
+
+    async def ensure_chat(*args):
+        return chat
+
+    async def prepare_context(*args):
+        return [{'role': 'user', 'content': 'hello'}], 0
+
+    async def resolve_features(*args):
+        return {}
+
+    def resolve_tools(*args):
+        return []
+
+    async def select_workflow(*args, **kwargs):
+        return SimpleNamespace(decision='none', selected_workflow_id=None, selected_version_id=None)
+
+    async def get_message(*args):
+        return {
+            'content': '',
+            'done': False,
+            'error': {'content': 'Billing authorization failed: MEMBER_NOT_FOUND'},
+        }
+
+    async def handler(request, form_data, user):
+        return {}
+
+    monkeypatch.setattr('open_webui.routers.interact_channels.Users.get_user_by_email', get_user)
+    monkeypatch.setattr('open_webui.routers.interact_channels._ensure_channel_chat', ensure_chat)
+    monkeypatch.setattr('open_webui.routers.interact_channels._prepare_channel_context', prepare_context)
+    monkeypatch.setattr('open_webui.routers.interact_channels._resolve_model_features', resolve_features)
+    monkeypatch.setattr('open_webui.routers.interact_channels._resolve_model_tool_ids', resolve_tools)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Chats.get_message_by_id_and_message_id', get_message)
+    monkeypatch.setattr('open_webui.routers.workflows.select_workflow_for_user_context', select_workflow)
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                MODELS={'model': {}},
+                CHAT_COMPLETION_HANDLER=handler,
+            )
+        ),
+    )
+    response = await channel_chat(request, _payload(), None, None)
+
+    assert response['ok'] is False
+    assert response['reason'] == 'COMPANY-IDENTITY-NOT-FOUND'
+    assert 'COMPANY-IDENTITY-NOT-FOUND' in response['content']
+    assert '暫停服務' not in response['content']
 
 
 @pytest.mark.asyncio

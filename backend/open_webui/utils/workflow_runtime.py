@@ -18,6 +18,7 @@ RUNTIME_INPUT_TYPES = {
     'schedule_trigger',
     'file_upload',
     'form_input',
+    'user_input',
 }
 RUNTIME_MODEL_TYPES = {
     'agent',
@@ -94,9 +95,20 @@ def normalize_workflow_input(payload: dict[str, Any] | None) -> dict[str, Any]:
     source = payload if isinstance(payload, dict) else {}
     message = str(source.get('message') or source.get('text') or '')
     parts = []
+    media_keys: set[tuple[str, str]] = set()
     for part in source.get('parts') or []:
         if isinstance(part, dict) and part.get('type') in OUTPUT_TYPES | {'location', 'postback'}:
-            parts.append(dict(part))
+            normalized_part = dict(part)
+            media_id = str(
+                normalized_part.get('fileId')
+                or normalized_part.get('id')
+                or normalized_part.get('url')
+                or normalized_part.get('platformFileId')
+                or ''
+            )
+            if media_id:
+                media_keys.add((str(normalized_part.get('type') or ''), media_id))
+            parts.append(normalized_part)
 
     for file_item in source.get('files') or []:
         if not isinstance(file_item, dict):
@@ -111,16 +123,20 @@ def normalize_workflow_input(payload: dict[str, Any] | None) -> dict[str, Any]:
             if mime_type.startswith('video/')
             else 'file'
         )
-        parts.append(
-            {
-                'type': part_type,
-                'fileId': file_item.get('id') or file_item.get('fileId'),
-                'url': file_item.get('url'),
-                'filename': file_item.get('name') or file_item.get('filename'),
-                'mimeType': mime_type or None,
-                'size': file_item.get('size'),
-            }
-        )
+        normalized_file = {
+            'type': part_type,
+            'fileId': file_item.get('id') or file_item.get('fileId'),
+            'url': file_item.get('url'),
+            'filename': file_item.get('name') or file_item.get('filename'),
+            'mimeType': mime_type or None,
+            'size': file_item.get('size'),
+        }
+        media_id = str(normalized_file.get('fileId') or normalized_file.get('url') or '')
+        if media_id and (part_type, media_id) in media_keys:
+            continue
+        if media_id:
+            media_keys.add((part_type, media_id))
+        parts.append(normalized_file)
 
     if message and not any(part.get('type') == 'text' for part in parts):
         parts.insert(0, {'type': 'text', 'text': message})
@@ -362,7 +378,10 @@ async def execute_workflow_graph(
         sink_ids = {str(node.get('id')) for node in ordered_nodes}
         for sources in incoming_map.values():
             sink_ids.difference_update(sources)
+        nodes_by_id = {str(node.get('id')): node for node in ordered_nodes}
         for sink_id in sink_ids:
+            if node_semantic_type(nodes_by_id[sink_id]) == 'user_input':
+                continue
             outputs.extend(_value_parts(results.get(sink_id)))
 
     return {

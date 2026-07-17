@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 
+import pytest
+
+from open_webui.routers.workflows import _workflow_multimodal_content
 from open_webui.utils.workflows import (
     WorkflowAccessContext,
     decide_workflow_candidates,
@@ -51,6 +54,35 @@ def _context(company_id='company-a'):
     return WorkflowAccessContext(user_id='member', role='user', company_user_id=company_id)
 
 
+@pytest.mark.asyncio
+async def test_workflow_model_content_hydrates_stored_channel_media(monkeypatch, tmp_path):
+    image_path = tmp_path / 'line-image.png'
+    image_path.write_bytes(b'png-content')
+    file = SimpleNamespace(
+        id='file-a',
+        user_id='owner-a',
+        path='stored/path',
+        filename='line-image.png',
+        meta={'content_type': 'image/png'},
+    )
+
+    async def get_file(file_id):
+        return file if file_id == 'file-a' else None
+
+    monkeypatch.setattr('open_webui.routers.workflows.Files.get_file_by_id', get_file)
+    monkeypatch.setattr('open_webui.routers.workflows.Storage.get_file', lambda path: str(image_path))
+
+    content = await _workflow_multimodal_content(
+        '請分析附件',
+        [{'type': 'image', 'fileId': 'file-a', 'mimeType': 'image/png'}],
+        SimpleNamespace(id='owner-a', role='user'),
+    )
+
+    assert content[0] == {'type': 'text', 'text': '請分析附件'}
+    assert content[1]['type'] == 'image_url'
+    assert content[1]['image_url']['url'].startswith('data:image/png;base64,')
+
+
 def test_company_acl_blocks_another_company_before_intent_matching():
     workflow = _workflow()
 
@@ -87,6 +119,16 @@ def test_channel_acl_applies_to_owner_during_external_execution():
 
     assert workflow_channel_acl_allows(workflow, allowed)
     assert not workflow_channel_acl_allows(workflow, wrong_channel)
+    assert not workflow_channel_acl_allows(
+        _workflow(),
+        WorkflowAccessContext(
+            user_id='owner-a',
+            role='user',
+            company_user_id='company-a',
+            channel_id='line-a',
+            model_id='model-a',
+        ),
+    )
 
 
 def test_workflow_metadata_cannot_match_its_own_keywords():

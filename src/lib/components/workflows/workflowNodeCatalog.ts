@@ -89,6 +89,17 @@ export const WORKFLOW_NODE_DEFINITIONS: WorkflowNodeDefinition[] = [
 		recommended: true
 	},
 	{
+		type: 'user_input',
+		label: '使用者輸入引導',
+		category: 'start',
+		description: '定義工作流在聊天與通訊頻道中的啟動方式、提示、欄位與檔案限制。',
+		keywords: ['guide', 'launch', 'form', 'line', '引導', '欄位', '表單'],
+		inputType: 'none',
+		outputType: 'any',
+		recommended: true,
+		defaultConfig: { launch: null }
+	},
+	{
 		type: 'file_upload',
 		label: '檔案與多媒體輸入',
 		category: 'start',

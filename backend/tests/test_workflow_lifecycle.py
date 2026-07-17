@@ -95,6 +95,61 @@ async def test_archive_and_activate_preserve_history_and_restore_published_contr
 
 
 @pytest.mark.asyncio
+async def test_reactivate_legacy_guided_version_materializes_editable_input_node(monkeypatch):
+    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            lambda sync_connection: Base.metadata.create_all(
+                sync_connection,
+                tables=[Workflow.__table__, WorkflowVersion.__table__, WorkflowRun.__table__],
+            )
+        )
+
+    @asynccontextmanager
+    async def test_db_context(db=None):
+        if db is not None:
+            yield db
+            return
+        async with session_factory() as session:
+            yield session
+
+    monkeypatch.setattr(workflow_models, 'get_async_db_context', test_db_context)
+    monkeypatch.setattr(workflow_models, '_tables_ready', True)
+    workflows = WorkflowTable()
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'chat_input'}},
+            {'id': 'output', 'data': {'type': 'chat_output'}},
+        ],
+        'edges': [{'source': 'input', 'target': 'output'}],
+    }
+    meta = {'launch': {'mode': 'text_input'}}
+    workflow = await workflows.insert(
+        'owner-a',
+        WorkflowForm(name='Legacy guided workflow', graph=graph, meta=meta),
+    )
+    version = await workflows.publish_version(workflow.id, 'owner-a')
+    await workflows.archive(workflow.id)
+
+    activated = await workflows.activate_default_version(workflow.id)
+
+    assert activated.default_version_id == version.id
+    assert len(await workflows.get_versions(workflow.id)) == 1
+    assert any(
+        node.get('data', {}).get('type') == 'user_input'
+        for node in activated.graph['nodes']
+    )
+    immutable_version = await workflows.get_version_by_id(version.id)
+    assert not any(
+        node.get('data', {}).get('type') == 'user_input'
+        for node in immutable_version.graph['nodes']
+    )
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_line_instant_options_use_only_current_published_version(monkeypatch):
     graph = {
         'nodes': [
@@ -109,7 +164,14 @@ async def test_line_instant_options_use_only_current_published_version(monkeypat
         name='立即產生摘要',
         description='test',
         graph=graph,
-        meta={'launch': {'mode': 'instant', 'buttonLabel': '產生摘要'}},
+        meta={
+            'launch': {'mode': 'instant', 'buttonLabel': '產生摘要'},
+            'acl': {
+                'scope': 'private',
+                'allowed_channel_ids': ['line-channel'],
+                'allowed_model_ids': ['model'],
+            },
+        },
         visibility='private',
         status='published',
         default_version_id='version-current',
@@ -125,12 +187,49 @@ async def test_line_instant_options_use_only_current_published_version(monkeypat
             'updated_at': 3,
         }
     )
+    guided_graph = {
+        'nodes': [
+            {
+                'id': 'guide',
+                'data': {
+                    'type': 'user_input',
+                    'config': {
+                        'launch': {
+                            'mode': 'form_input',
+                            'instruction': '請輸入部門。',
+                            'inputSchema': {
+                                'type': 'object',
+                                'properties': {'department': {'type': 'string', 'title': '部門'}},
+                                'required': ['department'],
+                                'additionalProperties': False,
+                            },
+                        }
+                    },
+                },
+            },
+            {'id': 'output', 'data': {'type': 'chat_output'}},
+        ],
+        'edges': [{'source': 'guide', 'target': 'output'}],
+    }
+    guided = SimpleNamespace(
+        **{
+            **published.__dict__,
+            'id': 'guided',
+            'name': '部門報表',
+            'graph': guided_graph,
+            'default_version_id': 'version-guided',
+            'updated_at': 4,
+        }
+    )
     versions = {
         'version-current': SimpleNamespace(
             id='version-current', workflow_id='published', graph=graph, meta=published.meta
         ),
         'version-archived': SimpleNamespace(
             id='version-archived', workflow_id='archived', graph=graph, meta=archived.meta
+        ),
+        'version-guided': SimpleNamespace(
+            id='version-guided', workflow_id='guided', graph=guided_graph, meta=guided.meta
         ),
     }
 
@@ -145,7 +244,7 @@ async def test_line_instant_options_use_only_current_published_version(monkeypat
 
     async def search(*args, **kwargs):
         assert kwargs['workflow_status'] == 'published'
-        return SimpleNamespace(items=[archived, published])
+        return SimpleNamespace(items=[archived, published, guided])
 
     async def get_version(version_id):
         return versions.get(version_id)
@@ -156,6 +255,11 @@ async def test_line_instant_options_use_only_current_published_version(monkeypat
 
     user = SimpleNamespace(id='owner', role='user')
     options = await workflow_routes.list_instant_workflows_for_user_context(
+        user,
+        channel_id='line-channel',
+        model_id='model',
+    )
+    channel_options = await workflow_routes.list_channel_workflows_for_user_context(
         user,
         channel_id='line-channel',
         model_id='model',
@@ -176,6 +280,9 @@ async def test_line_instant_options_use_only_current_published_version(monkeypat
     )
 
     assert [option['id'] for option in options] == ['published']
+    assert [option['id'] for option in channel_options] == ['guided', 'published']
+    assert channel_options[0]['launchMode'] == 'form_input'
+    assert channel_options[0]['instruction'] == '請輸入部門。'
     assert current and current['versionId'] == 'version-current'
     assert stale is None
 

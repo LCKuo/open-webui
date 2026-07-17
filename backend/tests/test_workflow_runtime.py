@@ -107,6 +107,35 @@ async def test_system_prompt_is_forwarded_without_replacing_user_input():
 
 
 @pytest.mark.asyncio
+async def test_unconnected_guidance_node_is_not_echoed_as_fallback_output():
+    async def model_runner(prompt, system_prompt, model_id, parts):
+        return {'text': 'model result', 'model_id': model_id, 'usage': {}}
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'chat_input'}},
+            {'id': 'model', 'data': {'type': 'chat_model', 'config': {'model_id': 'model-a'}}},
+            {
+                'id': 'guidance',
+                'data': {
+                    'type': 'user_input',
+                    'config': {'launch': {'mode': 'text_input'}},
+                },
+            },
+        ],
+        'edges': [{'source': 'input', 'target': 'model'}],
+    }
+
+    result = await execute_workflow_graph(
+        graph,
+        {'message': 'private input'},
+        model_runner=model_runner,
+    )
+
+    assert result['outputs'] == [{'type': 'text', 'text': 'model result'}]
+
+
+@pytest.mark.asyncio
 async def test_prompt_template_serializes_structured_chat_context_as_json():
     captured = {}
 

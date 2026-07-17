@@ -7,7 +7,28 @@
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
 	import Wrench from '$lib/components/icons/Wrench.svelte';
 
-	type WorkflowNodeData = Record<string, any>;
+	type WorkflowNodeConfig = {
+		launch?: {
+			mode?: string;
+			inputSchema?: { properties?: Record<string, unknown> };
+		};
+		model_id?: string;
+		dataset_id?: string;
+		table?: string;
+		output_type?: string;
+		knowledge_ids?: unknown[];
+		[key: string]: unknown;
+	};
+	type WorkflowNodeData = {
+		type?: string;
+		label?: string;
+		category?: string;
+		description?: string;
+		inputType?: string;
+		outputType?: string;
+		config?: WorkflowNodeConfig;
+		[key: string]: unknown;
+	};
 	type $$Props = Omit<NodeProps, 'data'> & { data: WorkflowNodeData };
 	export let data: WorkflowNodeData = {};
 	export let selected: $$Props['selected'] = false;
@@ -25,6 +46,15 @@
 	$: hasOutput = data.outputType !== 'none';
 	$: config = data.config && typeof data.config === 'object' ? data.config : {};
 	$: summary =
+		(config.launch?.mode === 'instant'
+			? '立即執行'
+			: config.launch?.mode === 'text_input'
+				? '等待文字'
+				: config.launch?.mode === 'form_input'
+					? `${Object.keys(config.launch?.inputSchema?.properties ?? {}).length} 個欄位`
+					: config.launch?.mode === 'file_input'
+						? '等待檔案'
+						: '') ||
 		config.model_id ||
 		config.dataset_id ||
 		config.table ||

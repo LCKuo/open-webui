@@ -14,6 +14,7 @@ INPUT_TYPES = {
     'schedule_trigger',
     'file_upload',
     'form_input',
+    'user_input',
 }
 OUTPUT_TYPES = {
     'output',
@@ -282,7 +283,11 @@ def workflow_channel_acl_allows(
 
     acl = workflow_acl(workflow)
     allowed_channels = _as_set(acl.get('allowed_channel_ids'))
-    if allowed_channels and (not context.channel_id or context.channel_id not in allowed_channels):
+    # External channels are public-facing execution surfaces. Require an
+    # explicit grant even when the bound WebUI account owns the workflow.
+    if context.channel_id and context.channel_id not in allowed_channels:
+        return False
+    if allowed_channels and not context.channel_id:
         return False
 
     allowed_models = _as_set(acl.get('allowed_model_ids'))

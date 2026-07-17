@@ -11,6 +11,9 @@
 		Controls,
 		MiniMap,
 		SvelteFlow,
+		type Connection,
+		type Edge,
+		type Node,
 		type Viewport
 	} from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
@@ -91,6 +94,36 @@
 		}
 	];
 
+	type WorkflowAclMeta = {
+		scope?: string;
+		allow_agent_selection?: boolean;
+		intent_keywords?: unknown;
+		intent_examples?: unknown;
+		required_keywords?: unknown;
+		negative_keywords?: unknown;
+		agent_selection_threshold?: number;
+		agent_selection_priority?: number;
+		agent_ambiguity_margin?: number;
+		allowed_company_user_ids?: unknown;
+		allowed_member_ids?: unknown;
+		allowed_group_ids?: unknown;
+		allowed_channel_ids?: unknown;
+		allowed_model_ids?: unknown;
+	};
+	type WorkflowMeta = Record<string, unknown> & { acl?: WorkflowAclMeta };
+	type WorkflowNodeData = {
+		type?: string;
+		kind?: string;
+		label?: string;
+		category?: string;
+		description?: string;
+		inputType?: string;
+		outputType?: string;
+		config?: Record<string, unknown>;
+		[key: string]: unknown;
+	};
+	type WorkflowNode = Node<WorkflowNodeData>;
+
 	let loaded = false;
 	let saving = false;
 	let validating = false;
@@ -100,11 +133,11 @@
 	let name = '';
 	let description = '';
 	let visibility = 'private';
-	let meta: Record<string, any> = {};
+	let meta: WorkflowMeta = {};
 	let launchConfig: WorkflowLaunchConfig = normalizeWorkflowLaunch({
 		graph: { nodes: [], edges: [] },
 		meta: {}
-	} as any);
+	});
 	let aclScope = 'private';
 	let allowAgentSelection = false;
 	let intentKeywords = '';
@@ -142,8 +175,8 @@
 	let semanticDatasets: SemanticDataset[] = [];
 	let canvasElement: HTMLDivElement;
 
-	const nodes = writable<any[]>([]);
-	const edges = writable<any[]>([]);
+	const nodes = writable<WorkflowNode[]>([]);
+	const edges = writable<Edge[]>([]);
 	const viewport = writable<Viewport>({ x: 0, y: 0, zoom: 1 });
 	const nodeTypes = { workflow: WorkflowCanvasNode };
 
@@ -160,12 +193,13 @@
 		? WORKFLOW_NODE_BY_TYPE.get(selectedNode.data?.type ?? '')
 		: undefined;
 	$: selectedNodeFields = selectedNodeDefinition?.configFields ?? [];
+	$: guidanceNodePresent = $nodes.some((node) => node.data?.type === 'user_input');
 	$: visibilityDescription =
 		VISIBILITY_OPTIONS.find((option) => option.value === visibility)?.description ?? '';
 	$: aclScopeDescription =
 		ACL_SCOPE_OPTIONS.find((option) => option.value === aclScope)?.description ?? '';
 
-	const hydrateNode = (node: any) => {
+	const hydrateNode = (node: WorkflowNode): WorkflowNode => {
 		const semanticType = node.data?.type ?? node.data?.kind ?? node.type;
 		const definition =
 			WORKFLOW_NODE_BY_TYPE.get(semanticType) ??
@@ -221,7 +255,7 @@
 			.map((item) => item.trim())
 			.filter(Boolean);
 
-	const syncAclState = (workflowMeta: Record<string, any> | null | undefined) => {
+	const syncAclState = (workflowMeta: WorkflowMeta | null | undefined) => {
 		const acl = workflowMeta?.acl ?? {};
 		aclScope = acl.scope ?? (visibility === 'shared' ? 'company' : 'private');
 		allowAgentSelection = Boolean(acl.allow_agent_selection);
@@ -527,6 +561,42 @@
 		compactPanel = 'canvas';
 	};
 
+	const updateLaunchConfig = (next: WorkflowLaunchConfig) => {
+		launchConfig = next;
+		nodes.update((items) =>
+			items.map((node) =>
+				node.data?.type === 'user_input'
+					? {
+							...node,
+							data: {
+								...node.data,
+								config: { ...(node.data?.config ?? {}), launch: next }
+							}
+						}
+					: node
+			)
+		);
+		queueMicrotask(markDirty);
+	};
+
+	const addGuidanceNode = () => {
+		if (guidanceNodePresent) return;
+		addNode('user_input');
+		nodes.update((items) =>
+			items.map((node) =>
+				node.data?.type === 'user_input'
+					? {
+							...node,
+							data: {
+								...node.data,
+								config: { ...(node.data?.config ?? {}), launch: launchConfig }
+							}
+						}
+					: node
+			)
+		);
+	};
+
 	const handleCanvasDragOver = (event: DragEvent) => {
 		if (!canEdit) return;
 		event.preventDefault();
@@ -569,7 +639,7 @@
 
 	const edgeId = (source: string, target: string) => `${source}-${target}-${Date.now()}`;
 
-	const createEdge = (connection: any) => {
+	const createEdge = (connection: Connection) => {
 		if (!connection.source || !connection.target) return false;
 		return {
 			...connection,
@@ -579,7 +649,7 @@
 		};
 	};
 
-	const isValidConnection = (connection: any) => {
+	const isValidConnection = (connection: Connection) => {
 		if (!connection.source || !connection.target || connection.source === connection.target)
 			return false;
 		if (
@@ -676,6 +746,14 @@
 						: node
 				)
 			);
+			if (
+				selectedNodeDefinition?.type === 'user_input' &&
+				config.launch &&
+				typeof config.launch === 'object' &&
+				!Array.isArray(config.launch)
+			) {
+				updateLaunchConfig({ ...launchConfig, ...config.launch });
+			}
 			markDirty();
 			toast.success('節點設定已套用');
 		} catch (error) {
@@ -926,7 +1004,7 @@
 					>
 						<div class="text-xs font-semibold text-gray-800 dark:text-gray-100">建立方式</div>
 						<div class="mt-1 text-xs leading-5 text-gray-500">
-							1. 從左側新增節點　2. 從右側圓點拖線　3. 選取節點完成設定
+							1. 從左側新增節點 · 2. 從右側圓點拖線 · 3. 選取節點完成設定
 						</div>
 					</div>
 					{#if $nodes.length === 0}
@@ -1015,11 +1093,25 @@
 									<WorkflowLaunchSettings
 										value={launchConfig}
 										disabled={!canEdit}
-										onChange={(next) => {
-											launchConfig = next;
-											queueMicrotask(markDirty);
-										}}
+										onChange={updateLaunchConfig}
 									/>
+									{#if !guidanceNodePresent}
+										<div
+											class="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950/30"
+										>
+											<div class="text-xs font-semibold text-amber-900 dark:text-amber-100">
+												畫布尚未顯示輸入引導
+											</div>
+											<p class="mt-1 text-xs leading-5 text-amber-800 dark:text-amber-200">
+												加入後，這份啟動模式、說明與欄位會成為發布版本的正式引導節點。
+											</p>
+											<button
+												type="button"
+												class="mt-3 rounded-md bg-amber-900 px-3 py-2 text-xs font-semibold text-white hover:bg-amber-800"
+												on:click={addGuidanceNode}>加入使用者輸入引導節點</button
+											>
+										</div>
+									{/if}
 								</div>
 								<div class="border-t border-gray-200 pt-4 dark:border-gray-800">
 									<div class="mb-3 text-sm font-semibold text-gray-900 dark:text-gray-100">
@@ -1284,6 +1376,21 @@
 											placeholder={selectedNodeDefinition.label}
 										/>
 									</label>
+
+									{#if selectedNodeDefinition.type === 'user_input'}
+										<div
+											class="rounded-lg border border-blue-200 bg-blue-50/60 p-3 dark:border-blue-900 dark:bg-blue-950/20"
+										>
+											<div class="mb-3 text-xs font-semibold text-blue-900 dark:text-blue-100">
+												這些設定會直接供 LINE、主站聊天與正式 executor 使用
+											</div>
+											<WorkflowLaunchSettings
+												value={launchConfig}
+												disabled={!canEdit}
+												onChange={updateLaunchConfig}
+											/>
+										</div>
+									{/if}
 
 									{#each selectedNodeFields as field}
 										<label class="block space-y-1.5">

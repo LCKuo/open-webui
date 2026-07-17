@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import ipaddress
 import json
 import os
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
@@ -123,6 +123,8 @@ def _is_company_admin_for_connector(connector: InteractDataConnectorModel, ctx: 
     if not ctx.company_user_id or ctx.company_user_id != connector.company_user_id:
         return False
     if not ctx.company_member_id:
+        if _is_channel_request(ctx):
+            return False
         return True
     return (ctx.company_member_role or '').lower() in {'owner', 'admin'}
 
@@ -230,7 +232,8 @@ def _assert_not_internal_connector(connector: InteractDataConnectorModel) -> Non
         not in {'1', 'true', 'yes', 'on'}
     ):
         raise PermissionError(
-            'Synced SQLite connectors are disabled by default. Use a network database, or explicitly enable local SQLite connectors for a private WebUI node.'
+            'Synced SQLite connectors are disabled by default. Use a network database, '
+            'or explicitly enable local SQLite connectors for a private WebUI node.'
         )
 
     target = _connector_target(connector)
@@ -305,7 +308,7 @@ def _local_webui_connector() -> InteractDataConnectorModel:
 
 async def _resolve_default_connector(ctx: QueryContext) -> InteractDataConnectorModel:
     if not ctx.company_user_id:
-        if _is_admin(ctx):
+        if _is_admin(ctx) and not _is_channel_request(ctx):
             return _local_webui_connector()
         raise PermissionError('No company identity is available for this data connector request.')
 
@@ -343,8 +346,8 @@ async def _load_connector(connector_id: str | None, ctx: QueryContext) -> Intera
         connector_id = 'webui_local'
 
     if connector_id == 'webui_local':
-        if not _is_admin(ctx):
-            raise PermissionError('Only WebUI administrators can use the built-in local WebUI connector.')
+        if not _is_admin(ctx) or _is_channel_request(ctx):
+            raise PermissionError('Only interactive WebUI administrators can use the built-in local WebUI connector.')
         return _local_webui_connector()
 
     connector = await InteractDataConnectors.get_enabled_by_id(connector_id)
@@ -462,7 +465,11 @@ def _connector_context_allowed(connector: InteractDataConnectorModel, ctx: Query
             )
         )
     if connector.access_mode == 'all_company_members':
-        return bool(ctx.company_user_id and ctx.company_user_id == connector.company_user_id)
+        return bool(
+            ctx.company_user_id
+            and ctx.company_user_id == connector.company_user_id
+            and (not _is_channel_request(ctx) or bool(ctx.company_member_id))
+        )
     if connector.access_mode == 'selected_channels':
         return bool(
             ctx.company_user_id == connector.company_user_id
@@ -756,7 +763,7 @@ def _sqlite_scan_schema(connector: InteractDataConnectorModel, max_tables: int) 
     return {
         'connector_id': connector.id,
         'connector_type': connector.connector_type,
-        'scanned_at': datetime.now(timezone.utc).isoformat(),
+        'scanned_at': dt.datetime.now(dt.UTC).isoformat(),
         'tables': tables,
     }
 
@@ -1182,7 +1189,7 @@ def _pg_scan_schema(  # noqa: C901
     return {
         'connector_id': connector.id,
         'connector_type': connector.connector_type,
-        'scanned_at': datetime.now(timezone.utc).isoformat(),
+        'scanned_at': dt.datetime.now(dt.UTC).isoformat(),
         'database': {
             'description': (database_description_row or [None])[0] or '',
         },
@@ -1440,7 +1447,13 @@ def _mysql_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -
 
             cursor.execute(
                 """
-                SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+                SELECT
+                    CONSTRAINT_NAME,
+                    TABLE_NAME,
+                    COLUMN_NAME,
+                    REFERENCED_TABLE_SCHEMA,
+                    REFERENCED_TABLE_NAME,
+                    REFERENCED_COLUMN_NAME
                 FROM information_schema.KEY_COLUMN_USAGE
                 WHERE TABLE_SCHEMA = %s AND REFERENCED_TABLE_NAME IS NOT NULL
                 ORDER BY TABLE_NAME, ORDINAL_POSITION
@@ -1475,7 +1488,7 @@ def _mysql_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -
     return {
         'connector_id': connector.id,
         'connector_type': connector.connector_type,
-        'scanned_at': datetime.now(timezone.utc).isoformat(),
+        'scanned_at': dt.datetime.now(dt.UTC).isoformat(),
         'tables': tables,
     }
 
@@ -1795,7 +1808,7 @@ def _mssql_scan_schema(connector: InteractDataConnectorModel, max_tables: int) -
     return {
         'connector_id': connector.id,
         'connector_type': connector.connector_type,
-        'scanned_at': datetime.now(timezone.utc).isoformat(),
+        'scanned_at': dt.datetime.now(dt.UTC).isoformat(),
         'tables': tables,
     }
 
@@ -2097,7 +2110,8 @@ async def interact_database_schema(
     Only tables and columns allowed by the connector policy are returned.
     Relationship metadata is included when the database exposes primary keys and foreign keys.
 
-    :param connector_id: Optional data connector id from the company portal. When omitted, the only connector assigned to the current model is selected automatically.
+    :param connector_id: Optional data connector id from the company portal. When omitted,
+        the only connector assigned to the current model is selected automatically.
     :param table: Optional table name to inspect.
     :return: JSON with visible tables, columns, primary keys, and foreign keys.
     """
@@ -2136,12 +2150,15 @@ async def interact_database_query(
     For business metrics, rankings, or analytics, call interact_semantic_catalog first and use
     interact_semantic_query when a dataset is returned. Never use this raw table tool to bypass
     an empty or unauthorized semantic catalog result.
-    Supported operations are "select" and "count". Use operation="count" for "how many", totals, and grouped counts.
-    Example: table="crm.users", columns=["name","department","role","email"], filters={"active": true}, order_by=[{"column":"id","direction":"asc"}], limit=10.
+    Supported operations are "select" and "count". Use operation="count" for "how many",
+    totals, and grouped counts.
+    Example: table="crm.users", columns=["name","department","role","email"],
+    filters={"active": true}, order_by=[{"column":"id","direction":"asc"}], limit=10.
     Count example: table="v_customer_summary", operation="count".
     Grouped count example: table="crm.users", operation="count", group_by=["department"].
 
-    :param connector_id: Optional data connector id from the company portal. When omitted, the only connector assigned to the current model is selected automatically.
+    :param connector_id: Optional data connector id from the company portal. When omitted,
+        the only connector assigned to the current model is selected automatically.
     :param table: Allowed table name to read.
     :param operation: "select" to return rows, or "count" to return COUNT(*) with optional group_by.
     :param columns: Optional list of columns to return. Connector policy is always enforced.
@@ -2219,7 +2236,8 @@ async def _database_count_compat(
     Use this tool for questions asking how many records exist, such as "目前有幾間公司" or "count customers".
     This tool does not accept raw SQL and does not return row contents.
 
-    :param connector_id: Optional data connector id from the company portal. When omitted, the only connector assigned to the current model is selected automatically.
+    :param connector_id: Optional data connector id from the company portal. When omitted,
+        the only connector assigned to the current model is selected automatically.
     :param table: Allowed table or view name to count.
     :param filters: Optional equality/range filters, e.g. {"active": true} or {"created_at": {"$gte": "2026-01-01"}}.
     :return: JSON with the total count.

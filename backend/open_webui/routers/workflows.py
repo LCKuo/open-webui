@@ -1,16 +1,21 @@
+import asyncio
+import base64
 import hmac
 import json
 import logging
+import mimetypes
 import os
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.internal.db import get_async_session
-from open_webui.models.config import Config
-from open_webui.models.groups import Groups
 from open_webui.models.chats import Chats
+from open_webui.models.config import Config
+from open_webui.models.files import Files
+from open_webui.models.groups import Groups
 from open_webui.models.interact_data_connectors import InteractDataConnectors
 from open_webui.models.interact_semantic import InteractSemantic
 from open_webui.models.knowledge import Knowledges
@@ -30,21 +35,38 @@ from open_webui.semantic_query.contracts import QueryRuntimeContext
 from open_webui.semantic_query.errors import SemanticQueryError
 from open_webui.semantic_query.service import (
     _connector_allowed as semantic_connector_allowed,
+)
+from open_webui.semantic_query.service import (
     _dataset_allowed as semantic_dataset_allowed,
+)
+from open_webui.semantic_query.service import (
     execute_query as execute_semantic_query,
 )
+from open_webui.storage.provider import Storage
 from open_webui.tools.builtin import query_knowledge_files
 from open_webui.tools.interact_database import (
     QueryContext as DatabaseQueryContext,
+)
+from open_webui.tools.interact_database import (
     _connector_denial_reason,
     interact_database_query,
 )
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.access_control.files import has_access_to_file
 from open_webui.utils.auth import get_verified_user
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models, get_filtered_models
+from open_webui.utils.workflow_launch import (
+    add_guidance_node_to_legacy_graph,
+    apply_launch_defaults,
+    normalize_launch_contract,
+    validate_launch_contract,
+    validate_launch_input,
+    workflow_configured_model_ids,
+    workflow_requires_confirmation,
+)
 from open_webui.utils.workflow_runtime import (
     RUNTIME_MODEL_TYPES,
     WorkflowRuntimeError,
@@ -53,13 +75,6 @@ from open_webui.utils.workflow_runtime import (
     runtime_unsupported_node_types,
     workflow_outputs_text,
     workflow_outputs_to_response_items,
-)
-from open_webui.utils.workflow_launch import (
-    apply_launch_defaults,
-    normalize_launch_contract,
-    validate_launch_contract,
-    validate_launch_input,
-    workflow_configured_model_ids,
 )
 from open_webui.utils.workflows import (
     WorkflowAccessContext,
@@ -386,6 +401,30 @@ def _launch_check(code: str, check_status: str, message: str) -> WorkflowLaunchC
     return WorkflowLaunchCheck(code=code, status=check_status, message=message)
 
 
+async def _schedule_line_rich_menu_refresh(workflow: WorkflowModel) -> None:
+    from open_webui.routers.interact_channels import schedule_company_line_rich_menu_refresh
+
+    acl = workflow_acl(workflow)
+    company_user_id = str(acl.get('company_user_id') or '').strip() or None
+    channel_ids = [
+        str(item).strip()
+        for item in (acl.get('allowed_channel_ids') or [])
+        if str(item).strip()
+    ]
+    scheduled = await schedule_company_line_rich_menu_refresh(
+        company_user_id=company_user_id,
+        channel_ids=channel_ids or None,
+    )
+    if scheduled:
+        return
+    owner = await Users.get_user_by_id(workflow.user_id)
+    if owner and owner.email:
+        await schedule_company_line_rich_menu_refresh(
+            company_email=owner.email,
+            channel_ids=channel_ids or None,
+        )
+
+
 async def _archive_workflow(workflow: WorkflowModel, db: AsyncSession) -> WorkflowModel:
     if workflow.status == 'archived':
         return workflow
@@ -398,6 +437,7 @@ async def _archive_workflow(workflow: WorkflowModel, db: AsyncSession) -> Workfl
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if not archived:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    await _schedule_line_rich_menu_refresh(archived)
     return archived
 
 
@@ -417,7 +457,10 @@ async def _activate_workflow(
     if not version or version.workflow_id != workflow.id:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='最後發布版本不存在，無法重新啟用。')
 
-    published_workflow = workflow.model_copy(update={'graph': version.graph, 'meta': version.meta})
+    compatible_graph, _ = add_guidance_node_to_legacy_graph(version.graph, version.meta)
+    published_workflow = workflow.model_copy(
+        update={'graph': compatible_graph, 'meta': version.meta}
+    )
     validation = _validate_workflow_configuration(
         published_workflow.graph,
         published_workflow.visibility,
@@ -436,6 +479,7 @@ async def _activate_workflow(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if not activated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    await _schedule_line_rich_menu_refresh(activated)
     return activated
 
 
@@ -677,6 +721,78 @@ def _response_text(response_data: dict[str, Any]) -> str:
     return ''
 
 
+async def _workflow_part_data_url(part: dict[str, Any], user) -> str | None:
+    url = str(part.get('url') or '').strip()
+    if url:
+        return url
+    file_id = str(part.get('fileId') or part.get('id') or '').strip()
+    if not file_id:
+        return None
+    file = await Files.get_file_by_id(file_id)
+    if not file:
+        return None
+    if (
+        file.user_id != user.id
+        and user.role != 'admin'
+        and not await has_access_to_file(file.id, 'read', user)
+    ):
+        return None
+    file_path = await asyncio.to_thread(Storage.get_file, file.path)
+    payload = await asyncio.to_thread(Path(file_path).read_bytes)
+    mime_type = str(
+        part.get('mimeType')
+        or part.get('content_type')
+        or (file.meta or {}).get('content_type')
+        or mimetypes.guess_type(file.filename)[0]
+        or 'application/octet-stream'
+    ).split(';', 1)[0]
+    return f'data:{mime_type};base64,{base64.b64encode(payload).decode("ascii")}'
+
+
+async def _workflow_multimodal_content(
+    prompt: str,
+    parts: list[dict[str, Any]],
+    user,
+) -> str | list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [{'type': 'text', 'text': prompt}]
+    for part in parts:
+        if not isinstance(part, dict) or part.get('type') == 'text':
+            continue
+        data_url = await _workflow_part_data_url(part, user)
+        if not data_url:
+            continue
+        part_type = str(part.get('type') or 'file')
+        filename = str(part.get('filename') or part.get('name') or f'attachment-{part_type}')
+        if part_type == 'image':
+            content.append({'type': 'image_url', 'image_url': {'url': data_url}})
+        elif part_type == 'audio':
+            mime_type = data_url[5 : data_url.find(';')]
+            audio_format = mime_type.rsplit('/', 1)[-1].lower()
+            audio_format = {'mpeg': 'mp3', 'x-wav': 'wav', 'mp4': 'm4a'}.get(
+                audio_format,
+                audio_format,
+            )
+            content.append(
+                {
+                    'type': 'input_audio',
+                    'input_audio': {
+                        'data': data_url.split(',', 1)[1],
+                        'format': audio_format,
+                    },
+                }
+            )
+        elif part_type == 'video':
+            content.append({'type': 'video_url', 'video_url': {'url': data_url}})
+        else:
+            content.append(
+                {
+                    'type': 'file',
+                    'file': {'filename': filename, 'file_data': data_url},
+                }
+            )
+    return content if len(content) > 1 else prompt
+
+
 async def _execute_workflow(
     request: Request,
     user,
@@ -721,13 +837,7 @@ async def _execute_workflow(
             raise WorkflowRuntimeError(
                 'This workflow requires a model. Select one in chat or configure the model node.'
             )
-        content: str | list[dict[str, Any]] = prompt
-        image_parts = [part for part in parts if part.get('type') == 'image' and part.get('url')]
-        if image_parts:
-            content = [
-                {'type': 'text', 'text': prompt},
-                *[{'type': 'image_url', 'image_url': {'url': part['url']}} for part in image_parts],
-            ]
+        content = await _workflow_multimodal_content(prompt, parts, user)
         messages = []
         if system_prompt:
             messages.append({'role': 'system', 'content': system_prompt})
@@ -940,10 +1050,31 @@ async def execute_chat_workflow(
 
     user_message = metadata.get('user_message') if isinstance(metadata.get('user_message'), dict) else {}
     chat_context = await _workflow_chat_context(user, workflow_request, form_data, metadata)
+    workflow_parts = workflow_request.get('parts') if isinstance(workflow_request.get('parts'), list) else []
+    part_mime_defaults = {
+        'image': 'image/*',
+        'video': 'video/*',
+        'audio': 'audio/*',
+    }
+    part_files = [
+        {
+            'name': part.get('filename') or f"channel-{part.get('type') or 'file'}",
+            'filename': part.get('filename') or f"channel-{part.get('type') or 'file'}",
+            'content_type': part.get('content_type')
+            or part.get('mimeType')
+            or part_mime_defaults.get(str(part.get('type') or ''), ''),
+            'size': part.get('size') or 0,
+            'platformFileId': part.get('platformFileId'),
+            'id': part.get('fileId') or part.get('id'),
+            'fileId': part.get('fileId') or part.get('id'),
+        }
+        for part in workflow_parts
+        if isinstance(part, dict)
+    ]
     input_payload = {
         'message': user_message.get('content') or '',
-        'files': ([] if workflow_request.get('parts') else user_message.get('files') or metadata.get('files') or []),
-        'parts': workflow_request.get('parts') or [],
+        'files': part_files or user_message.get('files') or metadata.get('files') or [],
+        'parts': workflow_parts,
         'data': workflow_request.get('data') or {},
         'context': {
             'chat_id': metadata.get('chat_id'),
@@ -1040,14 +1171,17 @@ async def select_workflow_for_user_context(
     channel_id: str | None = None,
     model_id: str | None = None,
     max_items: int = 3,
+    access_context: WorkflowAccessContext | None = None,
 ) -> WorkflowAgentSelectorResponse:
     """Select an executable published workflow within the caller's ACL context."""
-    context = await _workflow_context_for_user(
+    context = access_context or await _workflow_context_for_user(
         user,
         None,
         channel_id=channel_id,
         model_id=model_id,
     )
+    context.channel_id = channel_id
+    context.model_id = model_id
     result = await Workflows.search(
         user_id=user.id,
         visibility='all',
@@ -1059,20 +1193,23 @@ async def select_workflow_for_user_context(
     return _selector_response(result.items, context, message, max_items)
 
 
-async def list_instant_workflows_for_user_context(
+async def list_channel_workflows_for_user_context(
     user,
     *,
     channel_id: str,
     model_id: str | None = None,
     limit: int = 13,
+    access_context: WorkflowAccessContext | None = None,
 ) -> list[dict[str, Any]]:
-    """Return immutable, executable instant workflows for an external channel."""
-    context = await _workflow_context_for_user(
+    """Return published workflows that are executable from an external channel."""
+    context = access_context or await _workflow_context_for_user(
         user,
         None,
         channel_id=channel_id,
         model_id=model_id,
     )
+    context.channel_id = channel_id
+    context.model_id = model_id
     result = await Workflows.search(
         user_id=user.id,
         visibility='all',
@@ -1095,8 +1232,6 @@ async def list_instant_workflows_for_user_context(
         if runtime_unsupported_node_types(version.graph):
             continue
         launch = normalize_launch_contract(version.meta, version.graph)
-        if launch.get('mode') != 'instant':
-            continue
         acl = workflow_acl(workflow)
         try:
             priority = max(-100, min(100, int(acl.get('agent_selection_priority') or 0)))
@@ -1109,6 +1244,12 @@ async def list_instant_workflows_for_user_context(
                 'name': workflow.name,
                 'description': workflow.description,
                 'buttonLabel': str(launch.get('buttonLabel') or workflow.name).strip() or workflow.name,
+                'launchMode': launch['mode'],
+                'instruction': launch['instruction'],
+                'inputSchema': launch['inputSchema'],
+                'defaultInput': launch['defaultInput'],
+                'fileRules': launch['fileRules'],
+                'requiresConfirmation': workflow_requires_confirmation(launch, version.graph),
                 'priority': priority,
                 'updatedAt': workflow.updated_at,
             }
@@ -1119,6 +1260,51 @@ async def list_instant_workflows_for_user_context(
         reverse=True,
     )
     return options[:limit] if limit > 0 else options
+
+
+async def list_instant_workflows_for_user_context(
+    user,
+    *,
+    channel_id: str,
+    model_id: str | None = None,
+    limit: int = 13,
+) -> list[dict[str, Any]]:
+    """Backward-compatible instant-only view of channel workflows."""
+    options = await list_channel_workflows_for_user_context(
+        user,
+        channel_id=channel_id,
+        model_id=model_id,
+        limit=0,
+    )
+    instant = [item for item in options if item.get('launchMode') == 'instant']
+    return instant[:limit] if limit > 0 else instant
+
+
+async def resolve_channel_workflow_for_user_context(
+    user,
+    workflow_id: str,
+    version_id: str,
+    *,
+    channel_id: str,
+    model_id: str | None = None,
+    access_context: WorkflowAccessContext | None = None,
+) -> dict[str, Any] | None:
+    """Resolve the current published channel workflow and recheck its ACL."""
+    options = await list_channel_workflows_for_user_context(
+        user,
+        channel_id=channel_id,
+        model_id=model_id,
+        limit=0,
+        access_context=access_context,
+    )
+    return next(
+        (
+            option
+            for option in options
+            if option['id'] == workflow_id and option['versionId'] == version_id
+        ),
+        None,
+    )
 
 
 async def resolve_instant_workflow_for_user_context(
@@ -1397,6 +1583,9 @@ async def service_publish_workflow(
     version = await Workflows.publish_version(id, service_user.id, db=db)
     if not version:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    published = await Workflows.get_by_id(id, db=db)
+    if published:
+        await _schedule_line_rich_menu_refresh(published)
     return version
 
 
@@ -1616,7 +1805,11 @@ async def update_workflow_by_id(
     if 'meta' in payload or 'visibility' in payload:
         payload['meta'] = normalized_meta
 
-    return await Workflows.update_by_id(id, WorkflowPatchForm(**payload), db=db)
+    updated = await Workflows.update_by_id(id, WorkflowPatchForm(**payload), db=db)
+    if updated:
+        await _schedule_line_rich_menu_refresh(workflow)
+        await _schedule_line_rich_menu_refresh(updated)
+    return updated
 
 
 @router.post('/{id}/validate', response_model=WorkflowValidateResponse)
@@ -1671,6 +1864,9 @@ async def publish_workflow_by_id(
     version = await Workflows.publish_version(id, user.id, db=db)
     if not version:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    published = await Workflows.get_by_id(id, db=db)
+    if published:
+        await _schedule_line_rich_menu_refresh(published)
     return version
 
 
@@ -1778,4 +1974,7 @@ async def delete_workflow_by_id(
     await check_workflows_permission(user)
     workflow = await Workflows.get_by_id(id, db=db)
     check_workflow_owner(workflow, user)
-    return {'success': await Workflows.delete(id, db=db)}
+    deleted = await Workflows.delete(id, db=db)
+    if deleted:
+        await _schedule_line_rich_menu_refresh(workflow)
+    return {'success': deleted}

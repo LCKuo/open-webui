@@ -307,11 +307,56 @@ class InteractBillingClient:
             f'/api/integrations/open-webui/companies/{clean_company_user_id}/semantic-entitlements',
         )
 
+    async def authorize_line_identity(
+        self,
+        *,
+        company_user_id: str,
+        company_member_id: str | None,
+        member_email: str,
+        channel_id: str,
+    ) -> dict[str, Any]:
+        return await self._request(
+            'POST',
+            '/api/integrations/open-webui/line-identities/authorize',
+            {
+                'company_user_id': company_user_id,
+                'company_member_id': company_member_id,
+                'member_email': member_email,
+                'channel_id': channel_id,
+            },
+        )
+
     async def authorize(self, user: Any, form_data: dict[str, Any], metadata: dict[str, Any]) -> BillingAuthorization:
         input_tokens, max_output_tokens, reserved_tokens = estimate_reserved_tokens(form_data)
-        identity = await self.resolve_identity(user)
-        company_user = identity.company_user
-        company_member = identity.company_member
+        channel_metadata = metadata.get('interact_channel') or {}
+        if (
+            isinstance(channel_metadata, dict)
+            and channel_metadata.get('identitySource') == 'line-binding'
+            and channel_metadata.get('companyUserId')
+            and channel_metadata.get('companyMemberEmail')
+            and channel_metadata.get('companyMemberRole')
+        ):
+            company_user = {'id': str(channel_metadata['companyUserId'])}
+            company_member_id = str(channel_metadata.get('companyMemberId') or '').strip()
+            company_member_role = str(channel_metadata['companyMemberRole']).strip().lower()
+            if company_member_id:
+                company_member = {
+                    'id': company_member_id,
+                    'email': str(channel_metadata['companyMemberEmail']),
+                    'role': company_member_role,
+                }
+            elif company_member_role == 'owner':
+                # The company owner is represented by CompanyUser, not CompanyMember.
+                company_member = None
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail='LINE company member binding is incomplete. Please relink the LINE account.',
+                )
+        else:
+            identity = await self.resolve_identity(user)
+            company_user = identity.company_user
+            company_member = identity.company_member
         metadata["interact_company"] = {
             "companyUserId": company_user.get("id"),
             **(
@@ -325,7 +370,6 @@ class InteractBillingClient:
             ),
         }
         request_id = f"{metadata.get('chat_id') or 'direct'}:{metadata.get('message_id') or uuid4()}"
-        channel_metadata = metadata.get("interact_channel") or {}
         workflow_metadata = billing_workflow_metadata(metadata)
 
         data = await self._request(

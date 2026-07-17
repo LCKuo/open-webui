@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import mimetypes
 from typing import Any
 
@@ -33,9 +34,30 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
         return default
 
 
+def _canvas_coordinate(value: Any, default: float = 0.0) -> float:
+    try:
+        coordinate = float(value)
+    except (TypeError, ValueError):
+        return default
+    return coordinate if math.isfinite(coordinate) else default
+
+
 def workflow_node_types(graph: dict[str, Any] | None) -> set[str]:
     nodes = graph.get('nodes') if isinstance(graph, dict) else []
     return {_node_type(node) for node in nodes or [] if isinstance(node, dict)}
+
+
+def _guidance_launch(graph: dict[str, Any] | None) -> dict[str, Any] | None:
+    nodes = graph.get('nodes') if isinstance(graph, dict) else []
+    for node in nodes or []:
+        if not isinstance(node, dict) or _node_type(node) != 'user_input':
+            continue
+        data = node.get('data') if isinstance(node.get('data'), dict) else {}
+        config = data.get('config') if isinstance(data.get('config'), dict) else {}
+        launch = config.get('launch') if isinstance(config.get('launch'), dict) else None
+        if launch:
+            return launch
+    return None
 
 
 def workflow_configured_model_ids(graph: dict[str, Any] | None) -> list[str]:
@@ -53,6 +75,9 @@ def workflow_configured_model_ids(graph: dict[str, Any] | None) -> list[str]:
 
 
 def infer_launch_mode(graph: dict[str, Any] | None) -> str:
+    guided = _guidance_launch(graph)
+    if guided and guided.get('mode') in LAUNCH_MODES:
+        return str(guided['mode'])
     node_types = workflow_node_types(graph)
     if 'file_upload' in node_types:
         return 'file_input'
@@ -83,7 +108,8 @@ def _default_schema(mode: str) -> dict[str, Any]:
 
 def normalize_launch_contract(meta: dict[str, Any] | None, graph: dict[str, Any] | None) -> dict[str, Any]:
     source_meta = meta if isinstance(meta, dict) else {}
-    source = source_meta.get('launch') if isinstance(source_meta.get('launch'), dict) else {}
+    meta_launch = source_meta.get('launch') if isinstance(source_meta.get('launch'), dict) else {}
+    source = _guidance_launch(graph) or meta_launch
     inferred_mode = infer_launch_mode(graph)
     mode = str(source.get('mode') or inferred_mode).strip()
     if mode not in LAUNCH_MODES:
@@ -140,6 +166,55 @@ def normalize_launch_contract(meta: dict[str, Any] | None, graph: dict[str, Any]
             'maxSizeMB': _bounded_int(file_rules.get('maxSizeMB'), 25, 1, 500),
         },
     }
+
+
+def add_guidance_node_to_legacy_graph(
+    graph: dict[str, Any] | None,
+    meta: dict[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Materialize legacy launch metadata as one editable canvas node."""
+    source_graph = copy.deepcopy(graph) if isinstance(graph, dict) else {'nodes': [], 'edges': []}
+    nodes = source_graph.get('nodes') if isinstance(source_graph.get('nodes'), list) else []
+    source_graph['nodes'] = nodes
+    if not isinstance(source_graph.get('edges'), list):
+        source_graph['edges'] = []
+    if any(isinstance(node, dict) and _node_type(node) == 'user_input' for node in nodes):
+        return source_graph, False
+
+    launch = normalize_launch_contract(meta, source_graph)
+    if launch['mode'] == 'instant':
+        return source_graph, False
+
+    positions = [
+        node.get('position')
+        for node in nodes
+        if isinstance(node, dict) and isinstance(node.get('position'), dict)
+    ]
+    min_x = min((_canvas_coordinate(position.get('x')) for position in positions), default=120.0)
+    min_y = min((_canvas_coordinate(position.get('y')) for position in positions), default=120.0)
+    existing_ids = {str(node.get('id') or '') for node in nodes if isinstance(node, dict)}
+    node_id = 'user-input-guidance'
+    suffix = 2
+    while node_id in existing_ids:
+        node_id = f'user-input-guidance-{suffix}'
+        suffix += 1
+    nodes.append(
+        {
+            'id': node_id,
+            'type': 'workflow',
+            'position': {'x': min_x - 340, 'y': min_y},
+            'data': {
+                'type': 'user_input',
+                'label': '使用者輸入引導',
+                'category': 'start',
+                'description': '定義聊天與通訊頻道如何逐步收集工作流輸入。',
+                'inputType': 'none',
+                'outputType': 'any',
+                'config': {'launch': launch},
+            },
+        }
+    )
+    return source_graph, True
 
 
 def normalize_launch_meta(
@@ -350,6 +425,16 @@ def validate_launch_contract(
             errors.append('立即執行模式必須為所有必要欄位提供預設值。')
     if contract['mode'] == 'form_input' and not properties:
         errors.append('填寫條件模式至少需要一個輸入欄位。')
+    guidance_node_count = sum(
+        1
+        for node in ((graph.get('nodes') or []) if isinstance(graph, dict) else [])
+        if isinstance(node, dict) and _node_type(node) == 'user_input'
+    )
+    if contract['mode'] != 'instant' and guidance_node_count == 0:
+        message = '非立即執行工作流必須加入「使用者輸入引導」節點，讓引導在畫布上清楚可見。'
+        (errors if for_publish else warnings).append(message)
+    if guidance_node_count > 1:
+        errors.append('工作流只能有一個「使用者輸入引導」節點。')
     if contract['mode'] == 'file_input' and 'file_upload' not in workflow_node_types(graph):
         warnings.append('檔案輸入模式建議加入「檔案／多媒體輸入」節點。')
     if contract['confirmation'] == 'never' and workflow_has_risky_nodes(graph):
