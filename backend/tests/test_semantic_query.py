@@ -250,6 +250,67 @@ def test_query_plan_rejects_raw_sql_and_unknown_properties():
         )
 
 
+def test_query_plan_normalizes_common_llm_filter_shapes():
+    plan = QueryPlan.model_validate(
+        {
+            'datasetId': 'contacts',
+            'dimensions': ['customer.name'],
+            'filters': [
+                {
+                    'fieldId': 'customer.name',
+                    'operator': 'equals',
+                    'value': '木綠森設計有限公司',
+                }
+            ],
+        }
+    )
+
+    assert plan.filters.operator == 'and'
+    assert plan.filters.conditions[0].operator == 'eq'
+    assert plan.filters.conditions[0].value == '木綠森設計有限公司'
+
+
+def test_query_plan_normalizes_filter_logic_alias():
+    plan = QueryPlan.model_validate(
+        {
+            'datasetId': 'contacts',
+            'dimensions': ['customer.name'],
+            'filters': {
+                'logic': 'or',
+                'conditions': [
+                    {
+                        'fieldId': 'customer.name',
+                        'operator': 'startsWith',
+                        'value': '木綠森',
+                    }
+                ],
+            },
+        }
+    )
+
+    assert plan.filters.operator == 'or'
+    assert plan.filters.conditions[0].operator == 'starts_with'
+
+
+def test_redact_plan_masks_values_from_llm_filter_list_shape():
+    plan = {
+        'datasetId': 'contacts',
+        'dimensions': ['customer.name'],
+        'filters': [
+            {
+                'fieldId': 'contact.email',
+                'operator': 'equals',
+                'value': 'private@example.com',
+            }
+        ],
+    }
+
+    redacted = _redact_plan(plan)
+
+    assert redacted['filters'][0]['value'] == {'redacted': True, 'valueType': 'str'}
+    assert plan['filters'][0]['value'] == 'private@example.com'
+
+
 def test_compiler_rejects_catalog_field_ids_from_agent_plan_filters():
     plan = plan_fixture()
     plan.filters.conditions[0].fieldId = 'employees.name'
@@ -837,6 +898,39 @@ async def test_execute_query_runs_read_only_sqlite_masks_results_and_returns_tot
     assert result['totals'] == {'sales.revenue': 350.0}
     assert events[0]['status'] == 'success'
     assert events[0]['row_count'] == 1
+
+    workflow_context = runtime_context(groups=['sales'])
+    workflow_context.workflow_id = 'workflow-email'
+    unmasked = await execute_query(
+        {
+            'version': '1',
+            'datasetId': 'sales',
+            'dimensions': ['salesperson.name'],
+            'limit': 5,
+        },
+        workflow_context,
+        unmasked_field_ids={'salesperson.name'},
+    )
+
+    assert unmasked['rows'] == [{'salesperson.name': 'Amy'}]
+    assert events[1]['policy_decision']['sensitiveFieldAccess'] == {
+        'purpose': 'workflow_email_delivery',
+        'fieldIds': ['salesperson.name'],
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_query_rejects_unmasked_fields_outside_workflow():
+    context = runtime_context(groups=['sales'])
+    context.workflow_id = None
+    with pytest.raises(SemanticQueryError) as captured:
+        await execute_query(
+            {'datasetId': 'sales', 'dimensions': ['salesperson.name']},
+            context,
+            unmasked_field_ids={'salesperson.name'},
+        )
+
+    assert captured.value.code == 'SEMANTIC-FIELD-NOT-ALLOWED'
 
 
 @pytest.mark.asyncio

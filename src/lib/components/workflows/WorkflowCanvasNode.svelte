@@ -44,6 +44,7 @@
 
 	$: hasInput = data.inputType !== 'none';
 	$: hasOutput = data.outputType !== 'none';
+	$: isCondition = data.type === 'condition';
 	$: config = data.config && typeof data.config === 'object' ? data.config : {};
 	$: summary =
 		(config.launch?.mode === 'instant'
@@ -98,6 +99,11 @@
 	</div>
 
 	<div class="node-description">{data.description || '尚未提供節點說明。'}</div>
+	{#if isCondition}
+		<div class="branch-labels" aria-label="條件分支出口">
+			<span>符合</span><span>不符合</span>
+		</div>
+	{/if}
 
 	<div class="node-footer">
 		<span class="port-label">{hasInput ? typeLabel(data.inputType) : '開始'}</span>
@@ -110,7 +116,22 @@
 	</div>
 </div>
 
-{#if hasOutput}
+{#if hasOutput && isCondition}
+	<Handle
+		id="true"
+		type="source"
+		position={Position.Right}
+		style="top: 38%;"
+		class="workflow-port workflow-port-true"
+	/>
+	<Handle
+		id="false"
+		type="source"
+		position={Position.Right}
+		style="top: 68%;"
+		class="workflow-port workflow-port-false"
+	/>
+{:else if hasOutput}
 	<Handle
 		type="source"
 		position={Position.Right}
@@ -203,6 +224,24 @@
 		color: #475569;
 	}
 
+	.branch-labels {
+		display: flex;
+		justify-content: flex-end;
+		gap: 14px;
+		padding: 0 13px 9px;
+		font-size: 10px;
+		font-weight: 700;
+		color: #475569;
+	}
+
+	.branch-labels span:first-child {
+		color: #047857;
+	}
+
+	.branch-labels span:last-child {
+		color: #b91c1c;
+	}
+
 	.node-footer {
 		display: grid;
 		grid-template-columns: auto minmax(0, 1fr) auto;
@@ -252,6 +291,14 @@
 
 	:global(.workflow-port-media) {
 		background: #0891b2 !important;
+	}
+
+	:global(.workflow-port-true) {
+		background: #059669 !important;
+	}
+
+	:global(.workflow-port-false) {
+		background: #dc2626 !important;
 	}
 
 	:global(.dark) .node-card {

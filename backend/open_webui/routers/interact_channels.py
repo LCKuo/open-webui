@@ -143,6 +143,81 @@ def _channel_worker_request(app) -> Request:
     )
 
 
+async def _complete_line_workflow_resume_job(
+    request: Request,
+    channel: InteractChannelModel,
+    job,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    identity = payload.get('companyIdentity') if isinstance(payload.get('companyIdentity'), dict) else {}
+    action = payload.get('workflowResume') if isinstance(payload.get('workflowResume'), dict) else {}
+    company_user_id = str(identity.get('companyUserId') or '').strip()
+    member_email = str(identity.get('memberEmail') or '').strip().lower()
+    if not company_user_id or not member_email or channel.company_user_id != company_user_id:
+        return {'ok': False, 'content': '企業身分已失效，這次動作沒有執行。請重新開啟選單後再試。', 'outputs': []}
+    authorization = await InteractBillingClient().authorize_line_identity(
+        company_user_id=company_user_id,
+        company_member_id=str(identity.get('companyMemberId') or '').strip() or None,
+        member_email=member_email,
+        channel_id=channel.id,
+    )
+    verified = authorization.get('identity')
+    if not isinstance(verified, dict):
+        return {'ok': False, 'content': '您的企業帳號已停用或權限已變更，這次動作沒有執行。', 'outputs': []}
+    user = await Users.get_user_by_email(channel.company_email)
+    if not user or user.role == 'pending':
+        return {'ok': False, 'content': '企業 AI 帳號目前不可用，請聯繫管理員。', 'outputs': []}
+    context = WorkflowAccessContext(
+        user_id=user.id if verified.get('memberRole') == 'owner' else None,
+        role=user.role if verified.get('memberRole') == 'owner' else 'user',
+        company_user_id=str(verified.get('companyUserId') or ''),
+        company_member_id=str(verified.get('companyMemberId') or '').strip() or None,
+        company_member_role=str(verified.get('memberRole') or '').strip().lower(),
+        group_ids={str(item) for item in verified.get('groupIds') or [] if str(item)},
+        channel_id=channel.id,
+        model_id=channel.model_id,
+    )
+    from open_webui.routers import workflows as workflow_routes
+
+    try:
+        run = await workflow_routes.resume_channel_workflow(
+            request,
+            user,
+            context,
+            str(action.get('workflowId') or ''),
+            str(action.get('runId') or ''),
+            str(action.get('decision') or ''),
+            action.get('value'),
+            int(action.get('revision') or 0),
+            f'line:{job.external_user_id}:{context.company_member_id or member_email}',
+        )
+    except HTTPException as error:
+        messages = {
+            400: '這個選項格式不正確，請重新開啟工作流後再試。',
+            403: '您的權限已變更，這次動作沒有執行。',
+            404: '找不到原工作流或等待中的操作，請重新執行工作流。',
+            409: '這個操作已處理、已過期或工作流已停用，沒有重複執行。',
+        }
+        return {'ok': False, 'content': messages.get(error.status_code, '工作流無法繼續，請稍後再試。'), 'outputs': []}
+    output = run.output if isinstance(run.output, dict) else {}
+    outputs = output.get('outputs') if isinstance(output.get('outputs'), list) else []
+    content = workflow_routes.workflow_outputs_text(outputs)
+    if output.get('status') in {'waiting_input', 'waiting_approval'}:
+        content = ''
+    return {
+        'ok': run.status not in {'error'},
+        'content': content,
+        'outputs': outputs,
+        'usage': output.get('usage') or {},
+        'workflow': {
+            'id': run.workflow_id,
+            'runId': run.id,
+            'versionId': run.workflow_version_id,
+            'status': run.status,
+        },
+    }
+
+
 async def _process_channel_job(app, worker_id: str, job, lease_seconds: int, max_attempts: int) -> None:
     done = asyncio.Event()
     heartbeat = asyncio.create_task(_channel_job_heartbeat(job.id, worker_id, lease_seconds, done))
@@ -154,7 +229,20 @@ async def _process_channel_job(app, worker_id: str, job, lease_seconds: int, max
         payload = job.payload
         result = job.result
         if result is None:
-            if payload.get('workflowMenu'):
+            if payload.get('workflowResume'):
+                result = await _complete_line_workflow_resume_job(
+                    _channel_worker_request(app),
+                    channel,
+                    job,
+                    payload,
+                )
+                await InteractChannels.set_response(
+                    job.event_id,
+                    str(result.get('content') or '工作流已繼續執行。'),
+                    int((result.get('usage') or {}).get('total_tokens') or 0),
+                    None if result.get('ok') else 'workflow-resume-rejected',
+                )
+            elif payload.get('workflowMenu'):
                 result = {
                     'ok': True,
                     'content': '',
@@ -790,10 +878,17 @@ def _tool_failure_from_items(items: Any) -> tuple[str, str] | None:
         for item in items
         if isinstance(item, dict) and item.get('type') == 'function_call'
     }
+    outcomes: dict[str, tuple[bool, tuple[str, str] | None]] = {}
+    outcome_order: list[str] = []
     for item in items:
         if not isinstance(item, dict) or item.get('type') != 'function_call_output':
             continue
-        tool_name = calls.get(str(item.get('call_id') or ''), '')
+        call_id = str(item.get('call_id') or '')
+        tool_name = calls.get(call_id, '')
+        outcome_key = tool_name or call_id
+        if not outcome_key:
+            continue
+        outcome_order.append(outcome_key)
         for part in item.get('output') or []:
             if not isinstance(part, dict) or part.get('type') not in ('input_text', 'output_text', 'text'):
                 continue
@@ -805,18 +900,45 @@ def _tool_failure_from_items(items: Any) -> tuple[str, str] | None:
             except json.JSONDecodeError:
                 payload = None
             if isinstance(payload, dict) and payload.get('ok') is False:
-                code = str(payload.get('error_code') or 'TOOL-EXECUTION-FAILED')
-                message = str(payload.get('message') or '工具執行失敗，請聯繫管理員。')
-                return code, f'{message}（錯誤代碼：{code}）'
+                error = payload.get('error') if isinstance(payload.get('error'), dict) else {}
+                code = str(payload.get('error_code') or error.get('code') or 'TOOL-EXECUTION-FAILED')
+                message = str(payload.get('message') or error.get('message') or '工具執行失敗，請聯繫管理員。')
+                outcomes[outcome_key] = (False, (code, f'{message}（錯誤代碼：{code}）'))
+                continue
+            if isinstance(payload, dict) and payload.get('ok') is True:
+                outcomes[outcome_key] = (True, None)
+                continue
             if raw.startswith('Error: Tool call arguments could not be parsed'):
-                return (
-                    'TOOL-ARGUMENTS-INVALID',
-                    '模型產生的工具參數格式不正確，請重新描述需求。（錯誤代碼：TOOL-ARGUMENTS-INVALID）',
+                outcomes[outcome_key] = (
+                    False,
+                    (
+                        'TOOL-ARGUMENTS-INVALID',
+                        '模型產生的工具參數格式不正確，請重新描述需求。（錯誤代碼：TOOL-ARGUMENTS-INVALID）',
+                    ),
                 )
+                continue
             if raw.startswith('Error: Tool "') and raw.endswith('not found.'):
-                return 'TOOL-NOT-AVAILABLE', '模型要求的工具目前不可用或未獲授權。（錯誤代碼：TOOL-NOT-AVAILABLE）'
+                outcomes[outcome_key] = (
+                    False,
+                    (
+                        'TOOL-NOT-AVAILABLE',
+                        '模型要求的工具目前不可用或未獲授權。（錯誤代碼：TOOL-NOT-AVAILABLE）',
+                    ),
+                )
+                continue
             if tool_name.startswith('interact_database') and raw.lower().startswith('error:'):
-                return 'DB-INTERNAL-ERROR', '資料庫工具執行失敗，請聯繫管理員。（錯誤代碼：DB-INTERNAL-ERROR）'
+                outcomes[outcome_key] = (
+                    False,
+                    (
+                        'DB-INTERNAL-ERROR',
+                        '資料庫工具執行失敗，請聯繫管理員。（錯誤代碼：DB-INTERNAL-ERROR）',
+                    ),
+                )
+
+    for outcome_key in reversed(outcome_order):
+        succeeded, failure = outcomes.get(outcome_key, (True, None))
+        if not succeeded and failure:
+            return failure
     return None
 
 
@@ -1514,7 +1636,12 @@ async def _complete_claimed_result(
         workflow_data,
         company_identity,
     )
-    content = str(result.get('content') or _fallback_text(channel)).strip()
+    outputs = result.get('outputs') if isinstance(result.get('outputs'), list) else []
+    content = str(result.get('content') or '').strip()
+    # A workflow may intentionally return no plain text while presenting an
+    # approval/input card. Treat that structured output as a valid response.
+    if not content and not outputs:
+        content = _fallback_text(channel)
     usage = result.get('usage') if isinstance(result.get('usage'), dict) else {}
     context_summary_tokens = max(0, int(result.get('contextSummaryTokens') or 0))
     await InteractChannels.set_response(
@@ -1523,7 +1650,7 @@ async def _complete_claimed_result(
         (_usage_tokens(usage) or reserved_tokens) + context_summary_tokens,
         result.get('reason'),
     )
-    return {**result, 'content': content, 'outputs': result.get('outputs') or []}
+    return {**result, 'content': content, 'outputs': outputs}
 
 
 async def _claim_and_respond_result(
@@ -2608,6 +2735,35 @@ def _line_postback_action(event: dict[str, Any]) -> dict[str, Any] | None:
     return parse_line_postback_data(postback.get('data'))
 
 
+def _line_workflow_resume_action(action: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not action or action.get('a') != 'workflow.resume.v1':
+        return None
+    workflow_id = str(action.get('w') or '')
+    run_id = str(action.get('r') or '')
+    decision = str(action.get('d') or '')
+    try:
+        revision = int(action.get('n') or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', workflow_id)
+        or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', run_id)
+        or decision not in {'approved', 'rejected', 'selected', 'cancelled'}
+        or revision < 1
+    ):
+        return None
+    value = action.get('v')
+    if value is not None and (not str(value) or len(str(value)) > 120):
+        return None
+    return {
+        'workflowId': workflow_id,
+        'runId': run_id,
+        'decision': decision,
+        'revision': revision,
+        'value': value,
+    }
+
+
 async def _line_resolve_workflow_postback(
     channel: InteractChannelModel,
     action: dict[str, Any] | None,
@@ -3275,6 +3431,8 @@ def _line_filter_workflow_options(
 
 
 def _channel_output_text(output: dict[str, Any]) -> str:
+    if output.get('type') == 'text':
+        return str(output.get('text') or output.get('content') or '').strip()
     label = str(output.get('title') or output.get('filename') or output.get('alt') or output.get('type') or '')
     url = str(output.get('url') or '')
     if output.get('type') == 'handoff':
@@ -3282,6 +3440,121 @@ def _channel_output_text(output: dict[str, Any]) -> str:
     if output.get('type') == 'card':
         return '\n'.join(filter(None, [str(output.get('title') or ''), str(output.get('body') or ''), url]))
     return f'{label}: {url}' if url else label
+
+
+def _line_workflow_resume_data(card: dict[str, Any], action: dict[str, Any]) -> str | None:
+    data = card.get('data') if isinstance(card.get('data'), dict) else {}
+    workflow_id = str(data.get('workflow_id') or '').strip()
+    run_id = str(data.get('run_id') or '').strip()
+    decision = str(action.get('decision') or '').strip()
+    try:
+        revision = int(data.get('revision') or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', workflow_id)
+        or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', run_id)
+        or decision not in {'approved', 'rejected', 'selected', 'cancelled'}
+        or revision < 1
+    ):
+        return None
+    payload = {
+        'a': 'workflow.resume.v1',
+        'w': workflow_id,
+        'r': run_id,
+        'n': revision,
+        'd': decision,
+    }
+    if action.get('value') is not None:
+        value = str(action.get('value'))
+        if not value or len(value) > 120:
+            return None
+        payload['v'] = value
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+    return encoded if len(encoded.encode('utf-8')) <= 300 else None
+
+
+def _line_workflow_card_message(card: dict[str, Any]) -> dict[str, Any] | None:
+    actions = [action for action in card.get('actions') or [] if isinstance(action, dict)]
+    line_actions = []
+    for action in actions:
+        data = _line_workflow_resume_data(card, action)
+        if not data:
+            continue
+        label = str(action.get('label') or '繼續')[:20]
+        line_actions.append(
+            {
+                'type': 'button',
+                'height': 'sm',
+                'style': 'primary' if action.get('decision') in {'approved', 'selected'} else 'secondary',
+                'action': {
+                    'type': 'postback',
+                    'label': label,
+                    'data': data,
+                    'displayText': label,
+                },
+            }
+        )
+    if not line_actions:
+        return None
+    prompt = (card.get('data') or {}).get('prompt') if isinstance(card.get('data'), dict) else {}
+    prompt = prompt if isinstance(prompt, dict) else {}
+    preview = prompt.get('preview') if isinstance(prompt.get('preview'), dict) else {}
+    preview_rows = [
+        {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'xs',
+            'contents': [
+                {'type': 'text', 'text': str(label)[:30], 'size': 'xs', 'color': '#64748B'},
+                {
+                    'type': 'text',
+                    'text': ', '.join(str(item) for item in value)[:180]
+                    if isinstance(value, list)
+                    else str(value)[:180],
+                    'size': 'sm',
+                    'color': '#111827',
+                    'wrap': True,
+                },
+            ],
+        }
+        for label, value in list(preview.items())[:4]
+        if value not in (None, '', [])
+    ]
+    title = str(card.get('title') or '工作流需要確認')[:60]
+    body = str(card.get('body') or '')[:240]
+    pages = [line_actions[index : index + 4] for index in range(0, len(line_actions), 4)]
+    bubbles = []
+    for page_index, page_actions in enumerate(pages[:12]):
+        contents: list[dict[str, Any]] = [
+            {'type': 'text', 'text': title, 'weight': 'bold', 'size': 'lg', 'wrap': True},
+        ]
+        if body:
+            contents.append({'type': 'text', 'text': body, 'size': 'sm', 'color': '#475569', 'wrap': True})
+        if preview_rows:
+            contents.extend(preview_rows)
+        if len(pages) > 1:
+            contents.append(
+                {
+                    'type': 'text',
+                    'text': f'選項 {page_index * 4 + 1}-{page_index * 4 + len(page_actions)}',
+                    'size': 'xs',
+                    'color': '#64748B',
+                }
+            )
+        bubbles.append(
+            {
+                'type': 'bubble',
+                'size': 'kilo',
+                'body': {'type': 'box', 'layout': 'vertical', 'spacing': 'md', 'contents': contents},
+                'footer': {'type': 'box', 'layout': 'vertical', 'spacing': 'sm', 'contents': page_actions},
+            }
+        )
+    return {
+        'type': 'flex',
+        'altText': title,
+        'contents': bubbles[0] if len(bubbles) == 1 else {'type': 'carousel', 'contents': bubbles},
+    }
 
 
 def _line_result_messages(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3307,9 +3580,17 @@ def _line_result_messages(result: dict[str, Any]) -> list[dict[str, Any]]:
             messages.append({'type': 'video', 'originalContentUrl': url, 'previewImageUrl': output['thumbnailUrl']})
         elif output_type == 'audio' and url.startswith('https://') and output.get('duration'):
             messages.append({'type': 'audio', 'originalContentUrl': url, 'duration': int(output['duration'])})
+        elif output_type == 'card':
+            card_message = _line_workflow_card_message(output)
+            if card_message:
+                messages.append(card_message)
+            else:
+                fallback = _channel_output_text(output)
+                if fallback:
+                    messages.extend(_line_text_messages(fallback))
         else:
             fallback = _channel_output_text(output)
-            if fallback:
+            if fallback and not (output_type == 'text' and fallback in content):
                 messages.extend(_line_text_messages(fallback))
     return messages[:5] or _line_text_messages(' ')
 
@@ -3463,7 +3744,7 @@ async def _send_telegram_result(
             )
         else:
             fallback = _channel_output_text(output)
-            if fallback:
+            if fallback and not (output.get('type') == 'text' and fallback in content):
                 await _send_telegram_reply(channel, chat_id, fallback)
 
 
@@ -4488,6 +4769,8 @@ async def platform_webhook(  # noqa: C901
             message_type = str(message.get('type') or '')
             postback_action = _line_postback_action(event) if event_type == 'postback' else None
             postback_name = str((postback_action or {}).get('a') or '')
+            workflow_resume = _line_workflow_resume_action(postback_action)
+            workflow_resume_requested = postback_name == 'workflow.resume.v1'
             if (
                 event_type == 'message'
                 and message_type == 'text'
@@ -4500,6 +4783,7 @@ async def platform_webhook(  # noqa: C901
                 in {
                     'workflow.run.v1',
                     'workflow.launch.v2',
+                    'workflow.resume.v1',
                     'menu.data.v1',
                     'menu.file.v1',
                     'menu.history.v1',
@@ -4522,6 +4806,7 @@ async def platform_webhook(  # noqa: C901
             )
             workflow_postback_requested = postback_name in {'workflow.run.v1', 'workflow.launch.v2'}
             system_postback = postback_name in {
+                'workflow.resume.v1',
                 'menu.workflows.v1',
                 'menu.workflows.instant.v1',
                 'menu.workflows.guided.v1',
@@ -4563,6 +4848,8 @@ async def platform_webhook(  # noqa: C901
             message_text = (
                 '執行 LINE 快速工作流'
                 if workflow_postback_requested
+                else '繼續 LINE 工作流'
+                if workflow_resume_requested
                 else '開啟 LINE 工作流選單'
                 if postback_name.startswith('menu.workflows')
                 else '開啟 LINE AI 輸入'
@@ -4588,6 +4875,7 @@ async def platform_webhook(  # noqa: C901
                 not is_direct_line_chat
                 or system_postback
                 or workflow_menu_requested
+                or workflow_resume_requested
                 or active_workflow_session
                 or (
                     workflow_postback_requested
@@ -4701,6 +4989,45 @@ async def platform_webhook(  # noqa: C901
                         await _send_line_reply(channel, event.get('replyToken'), response)
                         await _mark_delivery(claim)
                         results.append({'ok': True, 'queued': False, 'identityRequired': True})
+                        continue
+                    if workflow_resume_requested:
+                        if not workflow_resume:
+                            response = '這個工作流操作已失效或格式不正確，請重新執行工作流。'
+                            await InteractChannels.set_response(
+                                claim.event_id,
+                                response,
+                                0,
+                                'workflow-resume-invalid',
+                            )
+                            await _send_line_reply(channel, event.get('replyToken'), response)
+                            await _mark_delivery(claim)
+                            results.append({'ok': True, 'queued': False, 'workflowResumeInvalid': True})
+                            continue
+                        await InteractChannels.enqueue_job(
+                            event_id=claim.event_id,
+                            channel_id=channel.id,
+                            external_user_id=external_user_id,
+                            platform='line',
+                            conversation_id=line_recipient_id,
+                            payload={
+                                'platformEventId': platform_event_id,
+                                'recipientId': line_recipient_id,
+                                'workflowResume': workflow_resume,
+                                'companyIdentity': {
+                                    'companyUserId': identity_binding.company_user_id,
+                                    'companyMemberId': identity_binding.company_member_id,
+                                    'memberEmail': identity_binding.member_email,
+                                    'memberRole': identity_binding.member_role,
+                                    'groupIds': identity_binding.group_ids,
+                                },
+                            },
+                        )
+                        wake_channel_job_workers()
+                        response = '已確認，工作流正在繼續執行。完成後會直接回傳結果。'
+                        await InteractChannels.set_response(claim.event_id, response, 0, None)
+                        await _send_line_reply(channel, event.get('replyToken'), response)
+                        await _mark_delivery(claim)
+                        results.append({'ok': True, 'queued': True, 'workflowResume': True})
                         continue
                     if workflow_menu_requested:
                         category = (
@@ -5221,7 +5548,11 @@ async def platform_webhook(  # noqa: C901
             media_type='application/xml',
         )
     media_fallbacks = [
-        _channel_output_text(output) for output in result.get('outputs') or [] if isinstance(output, dict)
+        output_text
+        for output in result.get('outputs') or []
+        if isinstance(output, dict)
+        and (output_text := _channel_output_text(output))
+        and not (output.get('type') == 'text' and output_text in content)
     ]
     if media_fallbacks:
         content = '\n\n'.join(filter(None, [content, *media_fallbacks]))

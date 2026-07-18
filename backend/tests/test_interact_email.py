@@ -1,0 +1,218 @@
+import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+import open_webui.models.interact_email as email_models
+import pytest
+import pytest_asyncio
+from fastapi import HTTPException
+from open_webui.routers.interact_email import (
+    _apply_recipient_policy,
+    _resend_error_response,
+    ensure_email_connector_allowed,
+)
+from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+
+@pytest_asyncio.fixture
+async def email_table(monkeypatch):
+    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def session_context(db=None):
+        if db is not None:
+            yield db
+            return
+        async with sessions() as session:
+            yield session
+
+    monkeypatch.setattr(email_models, 'async_engine', engine)
+    monkeypatch.setattr(email_models, 'get_async_db_context', session_context)
+    monkeypatch.setattr(email_models, '_tables_ready', False)
+    monkeypatch.setattr(email_models, '_encrypt_json', lambda value: json.dumps(value))
+    monkeypatch.setattr(email_models, '_decrypt_json', lambda value: json.loads(value))
+    table = email_models.InteractEmailTable()
+    await table.ensure_tables()
+    yield table
+    await engine.dispose()
+
+
+def delivery_values():
+    return {
+        'company_user_id': 'company-1',
+        'connector_id': 'connector-1',
+        'workflow_id': 'workflow-1',
+        'workflow_run_id': 'run-1',
+        'requested_by': 'member-1',
+        'channel_id': 'line-1',
+        'idempotency_key': 'workflow-run-1-send',
+        'status': 'sending',
+        'recipient_count': 1,
+        'recipient_domains': ['example.com'],
+        'to_encrypted': 'encrypted-to',
+        'cc_encrypted': None,
+        'subject_encrypted': 'encrypted-subject',
+        'content_encrypted': 'encrypted-content',
+        'payload_hash': 'a' * 64,
+    }
+
+
+@pytest.mark.asyncio
+async def test_delivery_idempotency_returns_existing_without_provider_resend(email_table):
+    first, first_created = await email_table.create_delivery(**delivery_values())
+    duplicate, duplicate_created = await email_table.create_delivery(**delivery_values())
+
+    assert first_created is True
+    assert duplicate_created is False
+    assert duplicate.id == first.id
+
+
+@pytest.mark.asyncio
+async def test_delivery_daily_limit_is_reserved_atomically(email_table):
+    first_values = delivery_values()
+    await email_table.create_delivery(daily_limit=1, **first_values)
+    second_values = {**first_values, 'idempotency_key': 'workflow-run-2-send'}
+
+    with pytest.raises(email_models.EmailDailyLimitExceeded):
+        await email_table.create_delivery(daily_limit=1, **second_values)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_revision_advances_across_multiple_pauses(email_table):
+    first = await email_table.save_checkpoint(
+        workflow_run_id='run-1',
+        company_user_id='company-1',
+        workflow_id='workflow-1',
+        node_id='choice',
+        wait_type='input',
+        state={'step': 1},
+        prompt={'choices': []},
+        payload_hash=None,
+    )
+    consumed = await email_table.consume_checkpoint(
+        workflow_run_id='run-1',
+        company_user_id='company-1',
+        actor_id='member-1',
+        decision='selected',
+        expected_revision=first['revision'],
+    )
+    second = await email_table.save_checkpoint(
+        workflow_run_id='run-1',
+        company_user_id='company-1',
+        workflow_id='workflow-1',
+        node_id='approval',
+        wait_type='approval',
+        state={'step': 2},
+        prompt={'preview': {}},
+        payload_hash='b' * 64,
+    )
+
+    assert consumed is not None
+    assert first['revision'] == 1
+    assert second['revision'] == 2
+
+
+def test_connector_rejects_email_header_injection():
+    with pytest.raises(ValidationError):
+        email_models.EmailConnectorUpsertForm(
+            name='Customer mail',
+            from_name='Support\r\nBcc: attacker@example.com',
+            from_address='support@example.com',
+        )
+
+
+def test_connector_secrets_are_trimmed_and_selected_access_requires_targets():
+    form = email_models.EmailConnectorUpsertForm(
+        name='Customer mail',
+        from_address='support@example.com',
+        api_key='  re_test_key  ',
+    )
+    assert form.api_key == 're_test_key'
+
+    with pytest.raises(ValidationError):
+        email_models.EmailConnectorUpsertForm(
+            name='Customer mail',
+            from_address='support@example.com',
+            access_mode='selected_groups',
+        )
+
+
+def test_connector_acl_checks_member_group_workflow_and_channel_together():
+    connector = SimpleNamespace(
+        company_user_id='company-1',
+        enabled=True,
+        status='ready',
+        allowed_workflow_ids=['workflow-1'],
+        allowed_channel_ids=['line-1'],
+        access_mode='selected_groups',
+        allowed_member_ids=[],
+        allowed_group_ids=['sales'],
+    )
+    context = {
+        'company_user_id': 'company-1',
+        'company_member_id': 'member-1',
+        'company_member_role': 'member',
+        'group_ids': ['sales'],
+    }
+
+    ensure_email_connector_allowed(connector, context, 'workflow-1', 'line-1')
+    with pytest.raises(HTTPException):
+        ensure_email_connector_allowed(connector, context, 'workflow-1', 'line-2')
+
+
+def test_recipient_policy_accepts_legacy_combined_domain_values():
+    connector = SimpleNamespace(
+        recipient_policy={
+            'allowed_domains': ['customer.com、partner.com'],
+            'blocked_domains': [],
+        },
+        cc_policy={
+            'allow_runtime_cc': True,
+            'default_cc': ['asdfg6311@gmail.com'],
+            'allowed_domains': ['gmail.com、interact-vision.com.tw'],
+            'max_cc': 10,
+        },
+        max_recipients_per_send=20,
+    )
+
+    to, cc = _apply_recipient_policy(connector, ['buyer@customer.com'], [])
+
+    assert to == ['buyer@customer.com']
+    assert cc == ['asdfg6311@gmail.com']
+
+
+def test_resend_unverified_domain_error_is_actionable_and_not_a_gateway_error():
+    status, detail = _resend_error_response(
+        403,
+        'validation_error',
+        'The interact-vision.com.tw domain is not verified. Please add and verify it.',
+    )
+
+    assert status == 422
+    assert 'interact-vision.com.tw' in detail
+    assert 'DNS 驗證' in detail
+
+
+def test_resend_server_error_is_reported_as_service_unavailable():
+    status, detail = _resend_error_response(502, 'application_error', '<html>Bad gateway</html>')
+
+    assert status == 503
+    assert detail == 'Resend 服務目前暫時無法完成寄送，請稍後再試。'
+
+
+@pytest.mark.asyncio
+async def test_email_events_are_idempotent(email_table):
+    values = {
+        'company_user_id': 'company-1',
+        'delivery_id': None,
+        'provider_event_id': 'evt-1',
+        'provider_message_id': 'email-1',
+        'event_type': 'email.delivered',
+        'occurred_at': 1,
+        'payload': {'type': 'email.delivered'},
+    }
+
+    assert await email_table.insert_event(**values) is True
+    assert await email_table.insert_event(**values) is False

@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import operator
 import re
@@ -61,9 +62,18 @@ SUPPORTED_RUNTIME_NODE_TYPES = (
         'calculator',
         'transform_json',
         'extract_fields',
+        'structured_extract',
         'knowledge_query',
         'database_query',
         'semantic_query',
+        'customer_contact_lookup',
+        'condition',
+        'user_choice',
+        'approval_gate',
+        'email_compose',
+        'email_send',
+        'email_delivery_status',
+        'email_result',
     }
 )
 
@@ -73,6 +83,23 @@ OUTPUT_TYPES = MEDIA_TYPES | {'text', 'card', 'handoff', 'json'}
 
 class WorkflowRuntimeError(RuntimeError):
     pass
+
+
+class WorkflowPause(RuntimeError):
+    def __init__(
+        self,
+        node_id: str,
+        wait_type: str,
+        prompt: dict[str, Any],
+        state: dict[str, Any],
+        payload_hash: str | None = None,
+    ):
+        super().__init__(f'Workflow is waiting for {wait_type}.')
+        self.node_id = node_id
+        self.wait_type = wait_type
+        self.prompt = prompt
+        self.state = state
+        self.payload_hash = payload_hash
 
 
 def node_semantic_type(node: dict[str, Any]) -> str:
@@ -199,6 +226,60 @@ def _render_template(template: str, workflow_input: dict[str, Any], incoming: An
     return re.sub(r'\{\{\s*([^{}]+?)\s*\}\}', replace, template)
 
 
+def _extract_path(value: Any, path: str) -> Any:
+    current = value
+    for part in str(path or '').split('.'):
+        if not part:
+            continue
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
+            current = current[int(part)]
+        else:
+            return None
+    return current
+
+
+def _condition_matches(incoming: Any, config: dict[str, Any]) -> bool:
+    left = _extract_path(incoming, str(config.get('field') or '')) if config.get('field') else incoming
+    right = config.get('value')
+    operator_name = str(config.get('operator') or 'truthy')
+    if operator_name == 'truthy':
+        return bool(left)
+    if operator_name == 'falsy':
+        return not left
+    if operator_name == 'exists':
+        return left is not None
+    if operator_name == 'not_exists':
+        return left is None
+    if operator_name == 'eq':
+        return left == right
+    if operator_name == 'neq':
+        return left != right
+    if operator_name == 'contains':
+        return str(right).lower() in str(left or '').lower()
+    if operator_name == 'starts_with':
+        return str(left or '').lower().startswith(str(right).lower())
+    if operator_name in {'gt', 'gte', 'lt', 'lte'}:
+        try:
+            left_number = float(left)
+            right_number = float(right)
+        except (TypeError, ValueError):
+            return False
+        return {
+            'gt': left_number > right_number,
+            'gte': left_number >= right_number,
+            'lt': left_number < right_number,
+            'lte': left_number <= right_number,
+        }[operator_name]
+    raise WorkflowRuntimeError(f'Unsupported condition operator: {operator_name}.')
+
+
+def _stable_hash(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)
+    return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+
 _BINARY_OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -285,6 +366,8 @@ async def execute_workflow_graph(
     model_runner: WorkflowModelRunner | None = None,
     node_runner: WorkflowNodeRunner | None = None,
     default_model_id: str | None = None,
+    resume_state: dict[str, Any] | None = None,
+    resume: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     nodes = graph.get('nodes') if isinstance(graph.get('nodes'), list) else []
     edges = graph.get('edges') if isinstance(graph.get('edges'), list) else []
@@ -297,18 +380,55 @@ async def execute_workflow_graph(
         raise WorkflowRuntimeError('Workflow contains nodes without runtime handlers: ' + ', '.join(unsupported))
 
     workflow_input = normalize_workflow_input(payload)
-    ordered_nodes, incoming_map = _topological_order(graph)
-    results: dict[str, Any] = {}
+    ordered_nodes, incoming_sources = _topological_order(graph)
+    by_id = {str(node.get('id')): node for node in ordered_nodes}
+    incoming_map: dict[str, list[dict[str, Any]]] = {node_id: [] for node_id in by_id}
+    outgoing_map: dict[str, list[dict[str, Any]]] = {node_id: [] for node_id in by_id}
+    for index, raw_edge in enumerate(edges):
+        if not isinstance(raw_edge, dict):
+            continue
+        source = str(raw_edge.get('source') or '')
+        target = str(raw_edge.get('target') or '')
+        if source not in by_id or target not in by_id:
+            continue
+        edge = {**raw_edge, '_runtime_id': str(raw_edge.get('id') or f'edge-{index}-{source}-{target}')}
+        incoming_map[target].append(edge)
+        outgoing_map[source].append(edge)
+    state = resume_state if isinstance(resume_state, dict) else {}
+    results: dict[str, Any] = dict(state.get('results') or {})
+    active_edges: dict[str, bool] = {str(key): bool(value) for key, value in (state.get('active_edges') or {}).items()}
     outputs: list[dict[str, Any]] = []
-    node_results = []
-    total_usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
-    used_model_ids = []
+    node_results = list(state.get('node_results') or [])
+    total_usage = dict(state.get('usage') or {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0})
+    used_model_ids = list(state.get('model_ids') or [])
+
+    def checkpoint_state() -> dict[str, Any]:
+        return {
+            'results': results,
+            'active_edges': active_edges,
+            'node_results': node_results,
+            'usage': total_usage,
+            'model_ids': used_model_ids,
+            'input': workflow_input,
+        }
 
     for node in ordered_nodes:
         node_id = str(node.get('id'))
         node_type = node_semantic_type(node)
         config = _node_config(node)
-        incoming_values = [results[source] for source in incoming_map[node_id] if source in results]
+        if node_id in results:
+            continue
+        node_edges = incoming_map[node_id]
+        incoming_values = [
+            results[str(edge.get('source'))]
+            for edge in node_edges
+            if str(edge.get('source')) in results and active_edges.get(edge['_runtime_id'], True)
+        ]
+        if node_edges and not incoming_values:
+            for edge in outgoing_map[node_id]:
+                active_edges[edge['_runtime_id']] = False
+            node_results.append({'node_id': node_id, 'node_type': node_type, 'status': 'skipped'})
+            continue
         incoming = incoming_values[0] if len(incoming_values) == 1 else incoming_values
 
         if node_type in RUNTIME_INPUT_TYPES:
@@ -347,10 +467,121 @@ async def execute_workflow_graph(
             fields = config.get('fields') if isinstance(config.get('fields'), list) else []
             value = {field: None for field in fields}
             value['_text'] = text
-        elif node_type in {'knowledge_query', 'database_query', 'semantic_query'}:
+        elif node_type == 'condition':
+            matched = _condition_matches(incoming, config)
+            value = incoming
+            for edge in outgoing_map[node_id]:
+                handle = str(edge.get('sourceHandle') or edge.get('source_handle') or '').lower()
+                if handle in {'false', 'no', 'unmatched'}:
+                    edge_is_active = not matched
+                else:
+                    edge_is_active = matched
+                active_edges[edge['_runtime_id']] = edge_is_active
+            value = {'matched': matched, 'value': incoming}
+        elif node_type == 'user_choice':
+            choices = config.get('choices') if isinstance(config.get('choices'), list) else []
+            dynamic_path = str(config.get('choices_from_path') or '').strip()
+            dynamic_items = _extract_path(incoming, dynamic_path) if dynamic_path else None
+            if isinstance(dynamic_items, list):
+                label_path = str(config.get('choice_label_path') or 'label')
+                value_path = str(config.get('choice_value_path') or 'value')
+                choices = [
+                    {
+                        'label': str(_extract_path(item, label_path) or _extract_path(item, value_path) or ''),
+                        'value': _extract_path(item, value_path),
+                        'data': item,
+                    }
+                    for item in dynamic_items[:20]
+                    if isinstance(item, dict) and _extract_path(item, value_path) is not None
+                ]
+            if resume and str(resume.get('node_id') or '') == node_id:
+                if str(resume.get('decision') or '') in {'cancelled', 'rejected'}:
+                    raise WorkflowRuntimeError('Workflow was cancelled by the user.')
+                selected = resume.get('value')
+                allowed = {
+                    str(item.get('value'))
+                    for item in choices
+                    if isinstance(item, dict) and item.get('value') is not None
+                }
+                if allowed and str(selected) not in allowed:
+                    raise WorkflowRuntimeError('Selected workflow option is no longer available.')
+                selected_option = next(
+                    (item for item in choices if isinstance(item, dict) and str(item.get('value')) == str(selected)),
+                    None,
+                )
+                value = {
+                    'choice': selected,
+                    'selected': selected_option.get('data') if isinstance(selected_option, dict) else None,
+                    'value': incoming,
+                }
+            else:
+                prompt = {
+                    'title': str(config.get('title') or '請選擇下一步'),
+                    'message': _render_template(str(config.get('message') or ''), workflow_input, incoming),
+                    'choices': choices,
+                }
+                raise WorkflowPause(node_id, 'input', prompt, checkpoint_state())
+        elif node_type == 'approval_gate':
+            payload_hash = _stable_hash(incoming)
+            if resume and str(resume.get('node_id') or '') == node_id:
+                if str(resume.get('decision') or '') != 'approved':
+                    raise WorkflowRuntimeError('Workflow approval was rejected.')
+                if str(resume.get('payload_hash') or '') != payload_hash:
+                    raise WorkflowRuntimeError('Approval payload changed and must be reviewed again.')
+                value = {
+                    'value': incoming,
+                    '_approval': {
+                        'approved': True,
+                        'payload_hash': payload_hash,
+                        'approved_by': resume.get('actor_id'),
+                        'approved_at': resume.get('decided_at'),
+                    },
+                }
+            else:
+                fields = config.get('preview_fields') if isinstance(config.get('preview_fields'), list) else []
+                preview = {
+                    str(field.get('label') or field.get('path')): _extract_path(incoming, str(field.get('path') or ''))
+                    for field in fields
+                    if isinstance(field, dict) and field.get('path')
+                }
+                if not preview:
+                    preview = incoming if isinstance(incoming, dict) else {'內容': _value_text(incoming)}
+                prompt = {
+                    'title': str(config.get('title') or '確認後執行'),
+                    'message': str(config.get('message') or '請確認收件人與內容。核准後才會執行。'),
+                    'preview': preview,
+                    'confirm_label': str(config.get('confirm_label') or '確認寄送'),
+                    'cancel_label': str(config.get('cancel_label') or '取消'),
+                }
+                raise WorkflowPause(node_id, 'approval', prompt, checkpoint_state(), payload_hash)
+        elif node_type in {
+            'knowledge_query',
+            'database_query',
+            'semantic_query',
+            'structured_extract',
+            'customer_contact_lookup',
+            'email_compose',
+            'email_send',
+            'email_delivery_status',
+        }:
             if node_runner is None:
                 raise WorkflowRuntimeError(f'Node {node_id} requires a secure tool runtime.')
-            value = await node_runner(node_type, config, incoming, workflow_input)
+            value = await node_runner(
+                node_type,
+                {**config, '_runtime_node_id': node_id},
+                incoming,
+                workflow_input,
+            )
+        elif node_type == 'email_result':
+            delivery = incoming.get('value') if isinstance(incoming, dict) and 'value' in incoming else incoming
+            status_value = delivery.get('status') if isinstance(delivery, dict) else None
+            value = {
+                'type': 'text',
+                'text': str(config.get('success_text') or '郵件已送出。')
+                if status_value in {'sent', 'delivered', 'opened', 'clicked'}
+                else str(config.get('pending_text') or '郵件已交由寄送服務處理。'),
+                'delivery': delivery,
+            }
         elif node_type in RUNTIME_PASSTHROUGH_TYPES:
             value = incoming
         elif node_type in RUNTIME_OUTPUT_TYPES:
@@ -376,7 +607,7 @@ async def execute_workflow_graph(
 
     if not outputs and ordered_nodes:
         sink_ids = {str(node.get('id')) for node in ordered_nodes}
-        for sources in incoming_map.values():
+        for sources in incoming_sources.values():
             sink_ids.difference_update(sources)
         nodes_by_id = {str(node.get('id')): node for node in ordered_nodes}
         for sink_id in sink_ids:
@@ -390,6 +621,7 @@ async def execute_workflow_graph(
         'usage': total_usage,
         'model_ids': used_model_ids,
         'input': workflow_input,
+        'status': 'success',
     }
 
 

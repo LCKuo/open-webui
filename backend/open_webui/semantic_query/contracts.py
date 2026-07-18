@@ -97,6 +97,62 @@ class QueryPlan(StrictModel):
     includeTotals: bool = False
     intentSummary: str | None = Field(default=None, max_length=500)
 
+    @model_validator(mode='before')
+    @classmethod
+    def normalize_common_tool_shapes(cls, value: Any):
+        if not isinstance(value, dict):
+            return value
+
+        normalized = dict(value)
+        filters = normalized.get('filters')
+        if isinstance(filters, list):
+            filters = {'operator': 'and', 'conditions': filters}
+        elif isinstance(filters, dict) and filters.get('fieldId'):
+            filters = {'operator': 'and', 'conditions': [filters]}
+        elif isinstance(filters, dict):
+            filters = dict(filters)
+            logic = filters.pop('logic', None)
+            if 'operator' not in filters and logic is not None:
+                filters['operator'] = logic
+
+        if isinstance(filters, dict):
+            aliases = {
+                '=': 'eq',
+                'equal': 'eq',
+                'equals': 'eq',
+                '!=': 'ne',
+                '<>': 'ne',
+                'not_equal': 'ne',
+                'not_equals': 'ne',
+                'greater_than': 'gt',
+                'greater_than_or_equal': 'gte',
+                'less_than': 'lt',
+                'less_than_or_equal': 'lte',
+                'one_of': 'in',
+                'not_one_of': 'not_in',
+                'includes': 'contains',
+                'startswith': 'starts_with',
+            }
+            group_operator = filters.get('operator')
+            if isinstance(group_operator, str) and group_operator.strip().lower() in {'and', 'or'}:
+                filters['operator'] = group_operator.strip().lower()
+            conditions = filters.get('conditions')
+            if isinstance(conditions, list):
+                normalized_conditions = []
+                for condition in conditions:
+                    if not isinstance(condition, dict):
+                        normalized_conditions.append(condition)
+                        continue
+                    condition = dict(condition)
+                    operator = condition.get('operator')
+                    if isinstance(operator, str):
+                        token = operator.strip()
+                        condition['operator'] = aliases.get(token, aliases.get(token.lower(), token.lower()))
+                    normalized_conditions.append(condition)
+                filters['conditions'] = normalized_conditions
+            normalized['filters'] = filters
+        return normalized
+
     @model_validator(mode='after')
     def validate_selection(self):
         if not self.measures and not self.metrics and not self.dimensions:

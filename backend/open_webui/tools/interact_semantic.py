@@ -70,10 +70,12 @@ async def interact_semantic_query(
     Execute an authorized semantic Query Plan. Call interact_semantic_catalog first.
     Never submit SQL, physical table names, column names, or join expressions. The plan may
     use only IDs returned by the catalog tool. Example:
-    {"version":"1","datasetId":"sales","dimensions":["salesperson"],
-     "measures":["revenue"],"timeRange":{"dimensionId":"closed_at",
-     "preset":"this_month","timezone":"Asia/Taipei"},
-     "orderBy":[{"fieldId":"revenue","direction":"desc"}],"limit":5}
+     {"version":"1","datasetId":"sales","dimensions":["salesperson"],
+      "measures":["revenue"],"timeRange":{"dimensionId":"closed_at",
+      "preset":"this_month","timezone":"Asia/Taipei"},
+      "filters":{"operator":"and","conditions":[{"fieldId":"region",
+      "operator":"eq","value":"north"}]},
+      "orderBy":[{"fieldId":"revenue","direction":"desc"}],"limit":5}
 
     :param plan: Strict Query Plan v1 using published semantic IDs only.
     :return: JSON result rows or a stable error code with corrective guidance.

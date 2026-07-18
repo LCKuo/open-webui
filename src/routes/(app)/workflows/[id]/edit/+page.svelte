@@ -19,11 +19,13 @@
 	import '@xyflow/svelte/dist/style.css';
 	import { models, showSidebar, user } from '$lib/stores';
 	import { getSemanticDatasets, type SemanticDataset } from '$lib/apis/interact-semantic';
+	import { getEmailConnectors, type EmailConnector } from '$lib/apis/interact-email';
 	import {
 		getWorkflowById,
 		getWorkflowRuns,
 		publishWorkflowById,
 		runWorkflowById,
+		resumeWorkflowRun,
 		selectAgentWorkflows,
 		updateWorkflowById,
 		validateWorkflowById,
@@ -172,8 +174,14 @@
 	let compactPanel: 'library' | 'canvas' | 'inspector' = 'canvas';
 	let pendingTemplateId = '';
 	let showTemplateConfirm = false;
+	let showImportConfirm = false;
+	let pendingImportPackage: Record<string, unknown> | null = null;
+	let importSummary = '';
 	let semanticDatasets: SemanticDataset[] = [];
+	let emailConnectors: EmailConnector[] = [];
+	let resumingRunId = '';
 	let canvasElement: HTMLDivElement;
+	let workflowImportInput: HTMLInputElement;
 
 	const nodes = writable<WorkflowNode[]>([]);
 	const edges = writable<Edge[]>([]);
@@ -404,10 +412,13 @@
 				(res.graph?.edges ?? []).map((edge) => ({ ...edge, type: edge.type ?? 'smoothstep' }))
 			);
 			syncJson();
-			[runs, semanticDatasets] = await Promise.all([
+			[runs, semanticDatasets, emailConnectors] = await Promise.all([
 				getWorkflowRuns(localStorage.token, workflowId, 10).catch(() => []),
 				getSemanticDatasets(localStorage.token)
 					.then((result) => result.datasets.filter((dataset) => dataset.status === 'published'))
+					.catch(() => []),
+				getEmailConnectors(localStorage.token)
+					.then((items) => items.filter((connector) => connector.enabled && connector.has_api_key))
 					.catch(() => [])
 			]);
 			lastSavedSignature = graphSignature();
@@ -532,6 +543,38 @@
 			toast.error(`${err}`);
 		} finally {
 			running = false;
+		}
+	};
+
+	const resumeRun = async (
+		run: WorkflowRunResponse,
+		decision: 'approved' | 'rejected' | 'selected' | 'cancelled',
+		value?: unknown
+	) => {
+		const checkpoint = run.output?.checkpoint;
+		if (!checkpoint?.revision) {
+			toast.error('找不到可恢復的工作流狀態，請重新執行。');
+			return;
+		}
+		resumingRunId = run.id;
+		try {
+			const updated = await resumeWorkflowRun(localStorage.token, workflowId, run.id, {
+				decision,
+				value,
+				revision: checkpoint.revision
+			});
+			runs = runs.map((item) => (item.id === updated.id ? updated : item));
+			toast.success(
+				updated.status === 'success'
+					? '工作流已完成'
+					: updated.status === 'cancelled'
+						? '已取消，沒有執行寄送'
+						: '已保存選擇，等待下一步'
+			);
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : `${error}`);
+		} finally {
+			resumingRunId = '';
 		}
 	};
 
@@ -725,6 +768,247 @@
 		}
 	};
 
+	const workflowDependencies = (workflowGraph = graph()) => {
+		const datasetIds = new Set<string>();
+		const emailConnectorIds = new Set<string>();
+		const databaseConnectorIds = new Set<string>();
+		const knowledgeIds = new Set<string>();
+		const modelIds = new Set<string>();
+		for (const node of workflowGraph.nodes ?? []) {
+			const config = (node.data?.config ?? {}) as Record<string, unknown>;
+			const datasetId = String(
+				config.dataset_id ??
+					(config.plan && typeof config.plan === 'object'
+						? (config.plan as Record<string, unknown>).datasetId
+						: '') ??
+					''
+			).trim();
+			const connectorId = String(config.connector_id ?? '').trim();
+			if (datasetId) datasetIds.add(datasetId);
+			if (node.data?.type === 'email_send' && connectorId) emailConnectorIds.add(connectorId);
+			if (node.data?.type === 'database_query' && connectorId && connectorId !== 'webui_local') {
+				databaseConnectorIds.add(connectorId);
+			}
+			for (const id of Array.isArray(config.knowledge_ids) ? config.knowledge_ids : []) {
+				if (String(id ?? '').trim()) knowledgeIds.add(String(id).trim());
+			}
+			const modelId = String(config.model_id ?? '').trim();
+			if (modelId) modelIds.add(modelId);
+		}
+		return {
+			semanticDatasets: [...datasetIds].map((id) => {
+				const dataset = semanticDatasets.find((item) => item.id === id);
+				return { id, name: dataset?.name ?? null, required: true };
+			}),
+			emailConnectors: [...emailConnectorIds].map((id) => {
+				const connector = emailConnectors.find((item) => item.id === id);
+				return {
+					id,
+					name: connector?.name ?? null,
+					fromAddress: connector?.from_address ?? null,
+					required: true
+				};
+			}),
+			databaseConnectors: [...databaseConnectorIds].map((id) => ({ id, required: true })),
+			knowledgeBases: [...knowledgeIds].map((id) => ({ id, required: true })),
+			models: [...modelIds].map((id) => {
+				const model = ($models ?? []).find((item) => item.id === id);
+				return { id, name: model?.name ?? null, required: true };
+			})
+		};
+	};
+
+	$: dependencySummary = workflowDependencies({ nodes: $nodes, edges: $edges });
+
+	const exportWorkflowPackage = () => {
+		const workflowGraph = normalizeGraph();
+		const payload = {
+			format: 'interact-workflow',
+			version: 1,
+			exportedAt: new Date().toISOString(),
+			workflow: {
+				name,
+				description,
+				visibility,
+				meta: buildWorkflowMeta(),
+				graph: workflowGraph
+			},
+			dependencies: workflowDependencies(workflowGraph),
+			importGuidance: {
+				security:
+					'匯入時不攜帶企業 ACL、密鑰或寄信憑證；資料集、模型與 Connector 只會對應目前帳號可存取的資源。',
+				missingDependencies:
+					'找不到的資料集、模型、知識庫或 Connector 會保持未設定，必須由使用者在節點設定完成後才能發布。',
+				validation: '匯入後請執行「驗證」並測試所有分支，再發布新版本。'
+			}
+		};
+		const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+		const url = URL.createObjectURL(blob);
+		const anchor = document.createElement('a');
+		anchor.href = url;
+		anchor.download = `${(name || 'workflow').replace(/[\\/:*?"<>|]+/g, '-')}.interact-workflow.json`;
+		anchor.click();
+		URL.revokeObjectURL(url);
+		toast.success('已匯出完整工作流套件，不包含任何密鑰');
+	};
+
+	const prepareWorkflowImport = async (event: Event) => {
+		const input = event.currentTarget as HTMLInputElement;
+		const file = input.files?.[0];
+		input.value = '';
+		if (!file) return;
+		if (file.size > 5 * 1024 * 1024) {
+			toast.error('工作流 JSON 不可超過 5 MB。');
+			return;
+		}
+		try {
+			const parsed = JSON.parse(await file.text());
+			const packageWorkflow =
+				parsed?.format === 'interact-workflow' && Number(parsed?.version) === 1
+					? parsed.workflow
+					: Array.isArray(parsed?.nodes) && Array.isArray(parsed?.edges)
+						? { graph: parsed }
+						: null;
+			if (
+				!packageWorkflow?.graph ||
+				!Array.isArray(packageWorkflow.graph.nodes) ||
+				!Array.isArray(packageWorkflow.graph.edges)
+			) {
+				throw new Error('檔案不是 Interact Workflow v1，也不是有效的 Graph JSON。');
+			}
+			pendingImportPackage = parsed;
+			importSummary = `將以 ${packageWorkflow.graph.nodes.length} 個節點、${packageWorkflow.graph.edges.length} 條連線取代目前畫布。企業存取權限不會從檔案帶入。`;
+			showImportConfirm = true;
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : '無法讀取工作流 JSON。');
+		}
+	};
+
+	const applyWorkflowImport = () => {
+		if (!pendingImportPackage) return;
+		const imported = pendingImportPackage as Record<string, any>;
+		const packageWorkflow =
+			imported.format === 'interact-workflow' ? imported.workflow : { graph: imported };
+		const dependencies = imported.dependencies ?? {};
+		const importedDatasets = Array.isArray(dependencies.semanticDatasets)
+			? dependencies.semanticDatasets
+			: [];
+		const importedConnectors = Array.isArray(dependencies.emailConnectors)
+			? dependencies.emailConnectors
+			: [];
+		const importedModels = Array.isArray(dependencies.models) ? dependencies.models : [];
+		const missing: string[] = [];
+		const remappedNodes = packageWorkflow.graph.nodes.map((rawNode: WorkflowNode) => {
+			const node = hydrateNode(rawNode);
+			const config = { ...(node.data?.config ?? {}) } as Record<string, any>;
+			const datasetId = String(config.dataset_id ?? config.plan?.datasetId ?? '').trim();
+			if (datasetId) {
+				const dependency = importedDatasets.find((item: any) => item?.id === datasetId);
+				const local =
+					semanticDatasets.find((item) => item.id === datasetId) ??
+					semanticDatasets.find(
+						(item) =>
+							dependency?.name && item.name.toLowerCase() === String(dependency.name).toLowerCase()
+					);
+				if (local) {
+					if (config.dataset_id !== undefined) config.dataset_id = local.id;
+					if (config.plan?.datasetId) config.plan = { ...config.plan, datasetId: local.id };
+				} else {
+					if (config.dataset_id !== undefined) config.dataset_id = '';
+					if (config.plan?.datasetId) config.plan = { ...config.plan, datasetId: '' };
+					missing.push(`資料集：${dependency?.name || datasetId}`);
+				}
+			}
+			if (node.data?.type === 'email_send' && config.connector_id) {
+				const connectorId = String(config.connector_id);
+				const dependency = importedConnectors.find((item: any) => item?.id === connectorId);
+				const local =
+					emailConnectors.find((item) => item.id === connectorId) ??
+					emailConnectors.find(
+						(item) =>
+							dependency?.name && item.name.toLowerCase() === String(dependency.name).toLowerCase()
+					);
+				config.connector_id = local?.id ?? '';
+				if (!local) missing.push(`寄信 Connector：${dependency?.name || connectorId}`);
+			}
+			if (
+				node.data?.type === 'database_query' &&
+				config.connector_id &&
+				config.connector_id !== 'webui_local'
+			) {
+				missing.push(`資料庫 Connector：${String(config.connector_id)}`);
+				config.connector_id = '';
+			}
+			if (Array.isArray(config.knowledge_ids) && config.knowledge_ids.length) {
+				for (const id of config.knowledge_ids) missing.push(`知識庫：${String(id)}`);
+				config.knowledge_ids = [];
+			}
+			if (config.model_id) {
+				const modelId = String(config.model_id);
+				const dependency = importedModels.find((item: any) => item?.id === modelId);
+				const local =
+					($models ?? []).find((item) => item.id === modelId) ??
+					($models ?? []).find(
+						(item) =>
+							dependency?.name &&
+							String(item.name ?? '').toLowerCase() === String(dependency.name).toLowerCase()
+					);
+				config.model_id = local?.id ?? '';
+				if (!local) missing.push(`模型：${dependency?.name || modelId}`);
+			}
+			delete config.company_user_id;
+			delete config.company_id;
+			return { ...node, data: { ...(node.data ?? {}), config } };
+		});
+		const importedMeta =
+			packageWorkflow.meta && typeof packageWorkflow.meta === 'object' ? packageWorkflow.meta : {};
+		const importedAcl =
+			importedMeta.acl && typeof importedMeta.acl === 'object' ? importedMeta.acl : {};
+		const safeImportedMeta = { ...importedMeta } as Record<string, any>;
+		delete safeImportedMeta.company_user_id;
+		delete safeImportedMeta.company_id;
+		delete safeImportedMeta.owner_id;
+		const safeImportedAcl = { ...importedAcl } as Record<string, any>;
+		delete safeImportedAcl.company_user_id;
+		delete safeImportedAcl.company_id;
+		delete safeImportedAcl.owner_id;
+		delete safeImportedAcl.allowed_user_ids;
+		meta = {
+			...safeImportedMeta,
+			acl: {
+				...safeImportedAcl,
+				scope: 'private',
+				allow_agent_selection: false,
+				allowed_company_user_ids: [],
+				allowed_member_ids: [],
+				allowed_group_ids: [],
+				allowed_channel_ids: [],
+				allowed_model_ids: []
+			}
+		};
+		visibility = 'private';
+		name = packageWorkflow.name ? `${String(packageWorkflow.name)}（匯入）` : name;
+		description = String(packageWorkflow.description ?? description);
+		nodes.set(remappedNodes);
+		edges.set(
+			packageWorkflow.graph.edges.map((edge: Edge) => ({
+				...edge,
+				type: edge.type ?? 'smoothstep'
+			}))
+		);
+		launchConfig = normalizeWorkflowLaunch({ graph: graph(), meta });
+		syncAclState(meta);
+		jsonMode = false;
+		syncJson();
+		markDirty();
+		pendingImportPackage = null;
+		toast.success(
+			missing.length
+				? `工作流已匯入；尚有 ${new Set(missing).size} 個依賴需要重新選擇。`
+				: '工作流已匯入，企業權限已安全重設為私人。'
+		);
+	};
+
 	const applyNodeConfig = () => {
 		if (!selectedNode) return;
 		try {
@@ -862,6 +1146,24 @@
 	</div>
 </ConfirmDialog>
 
+<ConfirmDialog
+	bind:show={showImportConfirm}
+	title="匯入並取代目前工作流？"
+	confirmLabel="確認匯入"
+	on:confirm={applyWorkflowImport}
+	on:cancel={() => (pendingImportPackage = null)}
+>
+	<div class="space-y-3 text-sm leading-6 text-gray-600 dark:text-gray-300">
+		<p>{importSummary}</p>
+		<div
+			class="rounded-lg border border-blue-200 bg-blue-50 p-3 text-blue-900 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100"
+		>
+			匯入只會變更尚未儲存的編輯內容。跨企業的成員、群組、渠道與模型 ACL
+			會清除，資料依賴只會對應到目前可存取的資源。
+		</div>
+	</div>
+</ConfirmDialog>
+
 {#if !loaded || !workflow}
 	<div
 		class="flex h-screen max-h-[100dvh] w-full items-center justify-center transition-width duration-200 ease-in-out {$showSidebar
@@ -910,6 +1212,28 @@
 
 			{#if canEdit}
 				<div class="flex flex-wrap items-center gap-2">
+					<input
+						class="sr-only"
+						type="file"
+						accept="application/json,.json"
+						bind:this={workflowImportInput}
+						on:change={prepareWorkflowImport}
+						aria-label="匯入工作流 JSON"
+					/>
+					<button
+						class="rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
+						on:click={() => workflowImportInput?.click()}
+						title="匯入完整工作流 JSON；企業權限會安全重設"
+					>
+						匯入
+					</button>
+					<button
+						class="rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
+						on:click={exportWorkflowPackage}
+						title="匯出節點、設定與依賴說明，不包含密鑰"
+					>
+						匯出
+					</button>
 					<button
 						class="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
 						on:click={() => {
@@ -1110,6 +1434,74 @@
 												class="mt-3 rounded-md bg-amber-900 px-3 py-2 text-xs font-semibold text-white hover:bg-amber-800"
 												on:click={addGuidanceNode}>加入使用者輸入引導節點</button
 											>
+										</div>
+									{/if}
+								</div>
+								<div class="border-t border-gray-200 pt-4 dark:border-gray-800">
+									<div class="text-sm font-semibold text-gray-900 dark:text-gray-100">外部依賴</div>
+									<p class="mt-1 text-xs leading-5 text-gray-500">
+										發布前必須完成所有資料、模型與 Connector 對應；匯入不會帶入密鑰或跨企業權限。
+									</p>
+									{#if !dependencySummary.semanticDatasets.length && !dependencySummary.emailConnectors.length && !dependencySummary.databaseConnectors.length && !dependencySummary.knowledgeBases.length && !dependencySummary.models.length}
+										<div
+											class="mt-3 rounded-lg bg-gray-50 px-3 py-2 text-xs text-gray-500 dark:bg-gray-900"
+										>
+											此工作流沒有固定的外部資源依賴。
+										</div>
+									{:else}
+										<div class="mt-3 space-y-2">
+											{#each dependencySummary.semanticDatasets as dependency}
+												<div
+													class="flex items-center justify-between gap-3 rounded-lg border border-gray-200 px-3 py-2 text-xs dark:border-gray-800"
+												>
+													<span class="min-w-0 truncate"
+														>資料集 · {dependency.name ?? dependency.id}</span
+													>
+													<span class={dependency.name ? 'text-emerald-600' : 'text-red-600'}>
+														{dependency.name ? '可使用' : '需重新選擇'}
+													</span>
+												</div>
+											{/each}
+											{#each dependencySummary.emailConnectors as dependency}
+												<div
+													class="flex items-center justify-between gap-3 rounded-lg border border-gray-200 px-3 py-2 text-xs dark:border-gray-800"
+												>
+													<span class="min-w-0 truncate"
+														>寄信 · {dependency.name ?? dependency.id}</span
+													>
+													<span class={dependency.name ? 'text-emerald-600' : 'text-red-600'}>
+														{dependency.name ? '可使用' : '需重新選擇'}
+													</span>
+												</div>
+											{/each}
+											{#each dependencySummary.databaseConnectors as dependency}
+												<div
+													class="flex items-center justify-between gap-3 rounded-lg border border-gray-200 px-3 py-2 text-xs dark:border-gray-800"
+												>
+													<span class="min-w-0 truncate">資料庫 Connector · {dependency.id}</span>
+													<span class="text-amber-600">發布前驗證</span>
+												</div>
+											{/each}
+											{#each dependencySummary.knowledgeBases as dependency}
+												<div
+													class="flex items-center justify-between gap-3 rounded-lg border border-gray-200 px-3 py-2 text-xs dark:border-gray-800"
+												>
+													<span class="min-w-0 truncate">知識庫 · {dependency.id}</span>
+													<span class="text-amber-600">發布前驗證</span>
+												</div>
+											{/each}
+											{#each dependencySummary.models as dependency}
+												<div
+													class="flex items-center justify-between gap-3 rounded-lg border border-gray-200 px-3 py-2 text-xs dark:border-gray-800"
+												>
+													<span class="min-w-0 truncate"
+														>模型 · {dependency.name ?? dependency.id}</span
+													>
+													<span class={dependency.name ? 'text-emerald-600' : 'text-red-600'}>
+														{dependency.name ? '可使用' : '需重新選擇'}
+													</span>
+												</div>
+											{/each}
 										</div>
 									{/if}
 								</div>
@@ -1424,6 +1816,12 @@
 														{#each semanticDatasets as dataset}
 															<option value={dataset.id}>{dataset.name}</option>
 														{/each}
+													{:else if field.key === 'connector_id'}
+														{#each emailConnectors as connector}
+															<option value={connector.id}
+																>{connector.name} · {connector.from_address}</option
+															>
+														{/each}
 													{:else}
 														{#each field.options ?? [] as option}
 															<option value={option.value}>{option.label}</option>
@@ -1583,6 +1981,52 @@
 												</div>
 												{#if run.error}
 													<div class="mt-2 text-red-600">{run.error}</div>
+												{:else if run.status === 'waiting_approval' || run.status === 'waiting_input'}
+													<div
+														class="mt-3 space-y-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-gray-800 dark:border-amber-900 dark:bg-amber-950/20 dark:text-gray-100"
+													>
+														<div class="font-semibold">
+															{run.output?.checkpoint?.prompt?.title ?? '等待操作'}
+														</div>
+														{#if run.output?.checkpoint?.prompt?.message}
+															<p class="leading-5">{run.output.checkpoint.prompt.message}</p>
+														{/if}
+														{#if run.output?.checkpoint?.prompt?.preview}
+															<dl class="space-y-2 rounded-lg bg-white p-3 dark:bg-gray-900">
+																{#each Object.entries(run.output.checkpoint.prompt.preview) as [label, value]}
+																	<div>
+																		<dt class="font-semibold text-gray-500">{label}</dt>
+																		<dd class="mt-0.5 whitespace-pre-wrap break-words">
+																			{Array.isArray(value) ? value.join(', ') : `${value ?? '-'}`}
+																		</dd>
+																	</div>
+																{/each}
+															</dl>
+														{/if}
+														<div class="flex flex-wrap gap-2">
+															{#if run.status === 'waiting_approval'}
+																<button
+																	class="rounded-lg bg-blue-600 px-3 py-2 font-semibold text-white disabled:opacity-50"
+																	disabled={resumingRunId === run.id}
+																	on:click={() => resumeRun(run, 'approved')}>確認寄送</button
+																>
+																<button
+																	class="rounded-lg border border-gray-300 px-3 py-2 font-semibold disabled:opacity-50 dark:border-gray-700"
+																	disabled={resumingRunId === run.id}
+																	on:click={() => resumeRun(run, 'rejected')}>取消</button
+																>
+															{:else}
+																{#each run.output?.checkpoint?.prompt?.choices ?? [] as choice}
+																	<button
+																		class="rounded-lg border border-gray-300 bg-white px-3 py-2 font-semibold disabled:opacity-50 dark:border-gray-700 dark:bg-gray-900"
+																		disabled={resumingRunId === run.id}
+																		on:click={() => resumeRun(run, 'selected', choice.value)}
+																		>{choice.label}</button
+																	>
+																{/each}
+															{/if}
+														</div>
+													</div>
 												{:else if run.output}
 													<pre
 														class="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-gray-50 p-2 text-gray-600 dark:bg-gray-900 dark:text-gray-300">{JSON.stringify(

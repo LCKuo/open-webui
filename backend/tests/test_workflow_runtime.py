@@ -6,12 +6,15 @@ from open_webui.routers.interact_channels import (
     ProvisionAccountRequest,
     _line_mobile_text,
     _line_result_messages,
+    _line_workflow_resume_action,
     _wechat_media_response,
     channel_health,
     provision_account,
 )
 from open_webui.utils.interact_billing import estimate_reserved_tokens
+from open_webui.utils.line_rich_menu import parse_line_postback_data
 from open_webui.utils.workflow_runtime import (
+    WorkflowPause,
     WorkflowRuntimeError,
     execute_workflow_graph,
     normalize_workflow_input,
@@ -308,6 +311,112 @@ def test_line_adapter_uses_native_image_and_falls_back_for_files():
         'type': 'text',
         'text': 'report.pdf: https://example.test/report.pdf',
     }
+
+
+def test_line_adapter_renders_workflow_approval_as_signed_resume_actions():
+    messages = _line_result_messages(
+        {
+            'outputs': [
+                {
+                    'type': 'card',
+                    'title': '確認寄送郵件',
+                    'body': '核准後才會寄送。',
+                    'data': {
+                        'workflow_id': 'workflow-1',
+                        'run_id': 'run-1',
+                        'revision': 2,
+                        'prompt': {'preview': {'收件人': ['client@example.com'], '主旨': '通知'}},
+                    },
+                    'actions': [
+                        {'label': '確認寄送', 'decision': 'approved'},
+                        {'label': '取消', 'decision': 'rejected'},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert messages[0]['type'] == 'flex'
+    buttons = messages[0]['contents']['footer']['contents']
+    assert buttons[0]['action']['label'] == '確認寄送'
+    parsed = _line_workflow_resume_action(parse_line_postback_data(buttons[0]['action']['data']))
+    assert parsed == {
+        'workflowId': 'workflow-1',
+        'runId': 'run-1',
+        'decision': 'approved',
+        'revision': 2,
+        'value': None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_user_choice_checkpoint_resumes_with_original_candidate_data():
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'chat_input'}},
+            {
+                'id': 'choice',
+                'data': {
+                    'type': 'user_choice',
+                    'config': {
+                        'choices_from_path': 'data.candidates',
+                        'choice_label_path': 'name',
+                        'choice_value_path': 'id',
+                    },
+                },
+            },
+            {'id': 'output', 'data': {'type': 'chat_output'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'choice'},
+            {'source': 'choice', 'target': 'output'},
+        ],
+    }
+    payload = {'data': {'candidates': [{'id': 'customer-1', 'name': '第一公司'}]}}
+
+    with pytest.raises(WorkflowPause) as paused:
+        await execute_workflow_graph(graph, payload)
+
+    result = await execute_workflow_graph(
+        graph,
+        payload,
+        resume_state=paused.value.state,
+        resume={'node_id': 'choice', 'decision': 'selected', 'value': 'customer-1'},
+    )
+
+    choice = result['outputs'][0]['value']
+    assert choice['choice'] == 'customer-1'
+    assert choice['selected']['name'] == '第一公司'
+
+
+@pytest.mark.asyncio
+async def test_approval_checkpoint_rejects_changed_payload_hash():
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'chat_input'}},
+            {'id': 'approval', 'data': {'type': 'approval_gate'}},
+            {'id': 'output', 'data': {'type': 'chat_output'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'approval'},
+            {'source': 'approval', 'target': 'output'},
+        ],
+    }
+
+    with pytest.raises(WorkflowPause) as paused:
+        await execute_workflow_graph(graph, {'message': 'send this'})
+
+    with pytest.raises(WorkflowRuntimeError, match='changed'):
+        await execute_workflow_graph(
+            graph,
+            {'message': 'send this'},
+            resume_state=paused.value.state,
+            resume={
+                'node_id': 'approval',
+                'decision': 'approved',
+                'payload_hash': 'tampered',
+            },
+        )
 
 
 def test_line_adapter_converts_generic_markdown_table_to_mobile_list():

@@ -1,10 +1,13 @@
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import logging
 import mimetypes
 import os
+import re
+import time
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -17,6 +20,7 @@ from open_webui.models.config import Config
 from open_webui.models.files import Files
 from open_webui.models.groups import Groups
 from open_webui.models.interact_data_connectors import InteractDataConnectors
+from open_webui.models.interact_email import InteractEmail
 from open_webui.models.interact_semantic import InteractSemantic
 from open_webui.models.knowledge import Knowledges
 from open_webui.models.users import Users
@@ -30,6 +34,11 @@ from open_webui.models.workflows import (
     Workflows,
     WorkflowValidateResponse,
     WorkflowVersionModel,
+)
+from open_webui.routers.interact_email import (
+    EmailSendRequest,
+    ensure_email_connector_allowed,
+    send_resend_email,
 )
 from open_webui.semantic_query.contracts import QueryRuntimeContext
 from open_webui.semantic_query.errors import SemanticQueryError
@@ -69,6 +78,7 @@ from open_webui.utils.workflow_launch import (
 )
 from open_webui.utils.workflow_runtime import (
     RUNTIME_MODEL_TYPES,
+    WorkflowPause,
     WorkflowRuntimeError,
     execute_workflow_graph,
     node_semantic_type,
@@ -253,6 +263,13 @@ class WorkflowLaunchPreflightRequest(BaseModel):
     confirmed: bool = False
 
 
+class WorkflowResumeRequest(BaseModel):
+    decision: Literal['approved', 'rejected', 'selected', 'cancelled']
+    value: Any = None
+    revision: int = Field(..., ge=1)
+    reason: Optional[str] = Field(default=None, max_length=1000)
+
+
 class WorkflowLaunchCheck(BaseModel):
     code: str
     status: Literal['pass', 'warning', 'fail']
@@ -365,6 +382,45 @@ def _validate_workflow_configuration(
             errors.append(message)
         else:
             warnings.append(message)
+    nodes = graph.get('nodes') if isinstance(graph.get('nodes'), list) else []
+    edges = graph.get('edges') if isinstance(graph.get('edges'), list) else []
+    node_types = {str(node.get('id')): node_semantic_type(node) for node in nodes if isinstance(node, dict)}
+    incoming = {
+        node_id: [
+            str(edge.get('source') or '')
+            for edge in edges
+            if isinstance(edge, dict) and str(edge.get('target') or '') == node_id
+        ]
+        for node_id in node_types
+    }
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get('id') or '')
+        node_type = node_semantic_type(node)
+        data = node.get('data') if isinstance(node.get('data'), dict) else {}
+        config = data.get('config') if isinstance(data.get('config'), dict) else {}
+        if node_type == 'condition':
+            handles = {
+                str(edge.get('sourceHandle') or edge.get('source_handle') or '').lower()
+                for edge in edges
+                if isinstance(edge, dict) and str(edge.get('source') or '') == node_id
+            }
+            if not {'true', 'false'}.issubset(handles):
+                errors.append(f'Condition node {node_id} requires true and false output connections.')
+        elif node_type == 'user_choice' and not config.get('choices') and not config.get('choices_from_path'):
+            errors.append(f'User choice node {node_id} requires at least one choice.')
+        elif node_type == 'email_send':
+            predecessors = [node_types.get(source) for source in incoming.get(node_id, [])]
+            if predecessors != ['approval_gate']:
+                errors.append(f'Email send node {node_id} must have exactly one approval gate directly before it.')
+            if not str(config.get('connector_id') or '').strip():
+                errors.append(f'Email send node {node_id} requires an email connector.')
+        elif node_type == 'customer_contact_lookup':
+            required = ['dataset_id', 'customer_name_field', 'customer_email_field']
+            missing = [key for key in required if not str(config.get(key) or '').strip()]
+            if missing:
+                errors.append(f'Customer contact lookup node {node_id} is missing: {", ".join(missing)}.')
     return {'ok': len(errors) == 0, 'errors': errors, 'warnings': warnings}
 
 
@@ -375,11 +431,23 @@ async def _validate_semantic_nodes_for_publish(
     errors: list[str] = []
     nodes = workflow.graph.get('nodes') if isinstance(workflow.graph, dict) else []
     for node in nodes or []:
-        if not isinstance(node, dict) or node_semantic_type(node) != 'semantic_query':
+        if not isinstance(node, dict):
             continue
         node_id = str(node.get('id') or 'unknown')
         data = node.get('data') if isinstance(node.get('data'), dict) else {}
         config = data.get('config') if isinstance(data.get('config'), dict) else {}
+        if node_semantic_type(node) == 'email_send':
+            connector_id = str(config.get('connector_id') or '').strip()
+            connector = await InteractEmail.get_connector(connector_id) if connector_id else None
+            if not connector or connector.company_user_id != company_user_id:
+                errors.append(f'Email send node {node_id} cannot access connector {connector_id or "(missing)"}.')
+            elif not connector.enabled or not connector.api_key_encrypted:
+                errors.append(f'Email send node {node_id} requires an enabled connector with an API key.')
+            elif connector.allowed_workflow_ids and workflow.id not in connector.allowed_workflow_ids:
+                errors.append(f'Email connector {connector_id} does not allow workflow {workflow.id}.')
+            continue
+        if node_semantic_type(node) not in {'semantic_query', 'customer_contact_lookup'}:
+            continue
         plan = config.get('plan') if isinstance(config.get('plan'), dict) else {}
         dataset_id = str(config.get('dataset_id') or plan.get('datasetId') or '').strip()
         dataset = await InteractSemantic.get_dataset(dataset_id) if dataset_id else None
@@ -406,11 +474,7 @@ async def _schedule_line_rich_menu_refresh(workflow: WorkflowModel) -> None:
 
     acl = workflow_acl(workflow)
     company_user_id = str(acl.get('company_user_id') or '').strip() or None
-    channel_ids = [
-        str(item).strip()
-        for item in (acl.get('allowed_channel_ids') or [])
-        if str(item).strip()
-    ]
+    channel_ids = [str(item).strip() for item in (acl.get('allowed_channel_ids') or []) if str(item).strip()]
     scheduled = await schedule_company_line_rich_menu_refresh(
         company_user_id=company_user_id,
         channel_ids=channel_ids or None,
@@ -458,18 +522,14 @@ async def _activate_workflow(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='最後發布版本不存在，無法重新啟用。')
 
     compatible_graph, _ = add_guidance_node_to_legacy_graph(version.graph, version.meta)
-    published_workflow = workflow.model_copy(
-        update={'graph': compatible_graph, 'meta': version.meta}
-    )
+    published_workflow = workflow.model_copy(update={'graph': compatible_graph, 'meta': version.meta})
     validation = _validate_workflow_configuration(
         published_workflow.graph,
         published_workflow.visibility,
         published_workflow.meta,
         for_publish=True,
     )
-    validation['errors'].extend(
-        await _validate_semantic_nodes_for_publish(published_workflow, company_user_id)
-    )
+    validation['errors'].extend(await _validate_semantic_nodes_for_publish(published_workflow, company_user_id))
     if validation['errors']:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=validation['errors'])
 
@@ -556,9 +616,7 @@ async def _workflow_dependency_preflight(
                     )
                 )
             else:
-                checks.append(
-                    _launch_check('model_access', 'pass', f'模型「{effective_model_id}」可供目前帳號使用。')
-                )
+                checks.append(_launch_check('model_access', 'pass', f'模型「{effective_model_id}」可供目前帳號使用。'))
         except Exception as exc:
             log.warning('Workflow model preflight failed for %s: %s', workflow.id, exc)
             checks.append(
@@ -598,7 +656,7 @@ async def _workflow_dependency_preflight(
                     checks.append(
                         _launch_check('knowledge_access', 'pass', f'知識庫「{knowledge.name}」允許目前帳號讀取。')
                     )
-        elif node_type == 'semantic_query':
+        elif node_type in {'semantic_query', 'customer_contact_lookup'}:
             plan = config.get('plan') if isinstance(config.get('plan'), dict) else {}
             dataset_id = str(config.get('dataset_id') or plan.get('datasetId') or '').strip()
             if not dataset_id or dataset_id in seen_datasets:
@@ -618,7 +676,50 @@ async def _workflow_dependency_preflight(
             except SemanticQueryError as error:
                 checks.append(_launch_check(error.code.lower().replace('_', '-'), 'fail', error.public()['message']))
                 continue
-            checks.append(_launch_check('semantic_access', 'pass', f'資料集「{dataset.get("name") or dataset_id}」已發布且允許本次執行。'))
+            checks.append(
+                _launch_check(
+                    'semantic_access', 'pass', f'資料集「{dataset.get("name") or dataset_id}」已發布且允許本次執行。'
+                )
+            )
+        elif node_type == 'email_send':
+            connector_id = str(config.get('connector_id') or '').strip()
+            connector = await InteractEmail.get_connector(connector_id) if connector_id else None
+            if not connector:
+                checks.append(
+                    _launch_check('email_connector_not_found', 'fail', '寄信 Connector 不存在或屬於其他企業。')
+                )
+            else:
+                try:
+                    ensure_email_connector_allowed(
+                        connector,
+                        {
+                            'company_user_id': context.company_user_id,
+                            'company_member_id': context.company_member_id,
+                            'company_member_role': context.company_member_role,
+                            'group_ids': list(context.group_ids),
+                            'user_id': context.user_id,
+                        },
+                        workflow.id,
+                        context.channel_id,
+                    )
+                    if not connector.api_key_encrypted:
+                        raise HTTPException(status_code=409, detail='寄信 Connector 尚未設定 API Key。')
+                except HTTPException as error:
+                    checks.append(
+                        _launch_check(
+                            'email_connector_access_denied',
+                            'fail',
+                            str(error.detail or '寄信 Connector 不允許本次執行。'),
+                        )
+                    )
+                else:
+                    checks.append(
+                        _launch_check(
+                            'email_connector_access',
+                            'pass',
+                            f'寄信 Connector「{connector.name}」允許目前成員與渠道使用。',
+                        )
+                    )
         elif node_type == 'database_query':
             connector_id = str(config.get('connector_id') or '').strip()
             if not connector_id or connector_id == 'webui_local' or connector_id in seen_connectors:
@@ -636,7 +737,9 @@ async def _workflow_dependency_preflight(
             if table and connector.allowed_tables and table not in connector.allowed_tables:
                 checks.append(_launch_check('table_not_allowed', 'fail', f'資料表 {table} 未列入連接器授權。'))
                 continue
-            checks.append(_launch_check('database_access', 'pass', f'資料庫連接器「{connector.name}」已啟用並允許本次執行。'))
+            checks.append(
+                _launch_check('database_access', 'pass', f'資料庫連接器「{connector.name}」已啟用並允許本次執行。')
+            )
     if not checks:
         checks.append(_launch_check('dependencies', 'pass', '工作流沒有需要額外預檢的資料來源。'))
     return checks
@@ -721,6 +824,183 @@ def _response_text(response_data: dict[str, Any]) -> str:
     return ''
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or '').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def _email_draft_contact_context(source: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: source.get(key)
+        for key in ('customer_id', 'customer_name', 'contact_name', 'source')
+        if source.get(key) is not None
+    }
+
+
+def _customer_request_context(source: Any, original_message: str = '') -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+    context: dict[str, Any] = {}
+    request = str(source.get('request') or '').strip()
+    if request:
+        context['request'] = request
+    cc = source.get('cc')
+    if isinstance(cc, str):
+        cc = [item.strip() for item in cc.split(',') if item.strip()]
+    if isinstance(cc, list):
+        normalized_message = original_message.casefold()
+        context['cc'] = [
+            address
+            for item in cc
+            if (address := str(item).strip().lower())
+            and (not original_message or address.casefold() in normalized_message)
+        ]
+    return context
+
+
+def _email_knowledge_context(value: Any, limit: int = 5) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    chunks: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get('content') or '').strip()
+        if not content:
+            continue
+        chunks.append(
+            {
+                'content': content[:4000],
+                'source': str(item.get('source') or '知識庫')[:200],
+            }
+        )
+        if len(chunks) >= max(1, min(10, limit)):
+            break
+    return chunks
+
+
+def _email_compose_context(incoming: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    knowledge = _email_knowledge_context(incoming.get('knowledge') if isinstance(incoming, dict) else None)
+    current = incoming
+    for _ in range(8):
+        if not isinstance(current, dict):
+            break
+        selected = current.get('selected')
+        if isinstance(selected, dict):
+            return (
+                {
+                    'status': 'found',
+                    'customer_id': selected.get('id'),
+                    'customer_name': selected.get('name'),
+                    'contact_name': selected.get('contact_name'),
+                    'email': selected.get('email'),
+                    'request': selected.get('request'),
+                    'cc': selected.get('cc'),
+                    'source': {'selected_by_user': True},
+                },
+                knowledge,
+            )
+        if current.get('status'):
+            return current, knowledge
+        if 'value' not in current:
+            break
+        current = current.get('value')
+    return {}, knowledge
+
+
+def _normalize_email_draft_text(value: Any) -> str:
+    return re.sub(r'\s+', ' ', str(value or '')).strip().casefold()
+
+
+def _validate_email_draft_content(subject: Any, text: Any, request: Any = '') -> tuple[str, str]:
+    normalized_subject = str(subject or '').strip()
+    normalized_text = str(text or '').strip()
+    if not normalized_subject or not normalized_text:
+        raise WorkflowRuntimeError('AI 信件草稿缺少主旨或正文，已停止寄送。')
+    if len(normalized_subject) > 300 or len(normalized_text) > 50000:
+        raise WorkflowRuntimeError('AI 信件草稿長度不合理，已停止寄送。')
+
+    request_text = _normalize_email_draft_text(request)
+    body_text = _normalize_email_draft_text(normalized_text)
+    if request_text and (
+        body_text == request_text or (body_text.startswith(request_text) and len(body_text) <= len(request_text) + 80)
+    ):
+        raise WorkflowRuntimeError('AI 未能產生信件正文，系統已阻止將操作指令當成郵件寄出。')
+    return normalized_subject, normalized_text
+
+
+def _parse_email_draft(raw: Any, request: Any = '') -> tuple[str, str]:
+    cleaned = re.sub(
+        r'^```(?:json)?\s*|\s*```$',
+        '',
+        str(raw or '').strip(),
+        flags=re.IGNORECASE,
+    )
+    try:
+        generated = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise WorkflowRuntimeError('AI 信件草稿不是有效的 JSON，已停止寄送。') from exc
+    if not isinstance(generated, dict):
+        raise WorkflowRuntimeError('AI 信件草稿格式不正確，已停止寄送。')
+
+    candidates = [generated]
+    for key in ('email', 'draft', 'message'):
+        nested = generated.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+    subject = next(
+        (
+            value
+            for candidate in candidates
+            for key in ('subject', 'title', '主旨')
+            if isinstance((value := candidate.get(key)), str) and value.strip()
+        ),
+        '',
+    )
+    text = next(
+        (
+            value
+            for candidate in candidates
+            for key in ('text', 'body', 'content', '正文', '內容')
+            if isinstance((value := candidate.get(key)), str) and value.strip()
+        ),
+        '',
+    )
+    return _validate_email_draft_content(subject, text, request)
+
+
+def _customer_contact_query_plan(
+    dataset_id: str,
+    dimensions: list[str],
+    customer_name_field: str,
+    customer_name: str,
+    limit: int,
+) -> dict[str, Any]:
+    return {
+        'version': '1',
+        'datasetId': dataset_id,
+        'dimensions': dimensions,
+        'measures': [],
+        'metrics': [],
+        'filters': {
+            'operator': 'and',
+            'conditions': [
+                {
+                    'fieldId': customer_name_field,
+                    'operator': 'contains',
+                    'value': customer_name,
+                }
+            ],
+        },
+        'orderBy': [],
+        'limit': limit,
+    }
+
+
 async def _workflow_part_data_url(part: dict[str, Any], user) -> str | None:
     url = str(part.get('url') or '').strip()
     if url:
@@ -731,11 +1011,7 @@ async def _workflow_part_data_url(part: dict[str, Any], user) -> str | None:
     file = await Files.get_file_by_id(file_id)
     if not file:
         return None
-    if (
-        file.user_id != user.id
-        and user.role != 'admin'
-        and not await has_access_to_file(file.id, 'read', user)
-    ):
+    if file.user_id != user.id and user.role != 'admin' and not await has_access_to_file(file.id, 'read', user):
         return None
     file_path = await asyncio.to_thread(Storage.get_file, file.path)
     payload = await asyncio.to_thread(Path(file_path).read_bytes)
@@ -798,6 +1074,10 @@ async def _execute_workflow(
     user,
     workflow: WorkflowModel,
     form_data: WorkflowRunForm,
+    run_id: str | None = None,
+    resume_state: dict[str, Any] | None = None,
+    resume: dict[str, Any] | None = None,
+    access_context_override: WorkflowAccessContext | None = None,
 ) -> dict[str, Any]:
     version_id = form_data.workflow_version_id
     use_draft = form_data.trigger_type in {'manual_test', 'test.editor'} and not version_id
@@ -825,6 +1105,12 @@ async def _execute_workflow(
         raise WorkflowRuntimeError(' '.join(launch_input['errors']))
     form_data.input = launch_input['input']
     form_data.model_id = _effective_workflow_model_id(graph, form_data.model_id)
+    runtime_context = access_context_override or await _workflow_context_for_user(
+        user,
+        None,
+        channel_id=form_data.channel_id,
+        model_id=form_data.model_id,
+    )
 
     async def model_runner(
         prompt: str,
@@ -862,8 +1148,302 @@ async def _execute_workflow(
         incoming: Any,
         workflow_input: dict[str, Any],
     ) -> Any:
-        if node_type not in {'knowledge_query', 'database_query', 'semantic_query'}:
+        if node_type not in {
+            'knowledge_query',
+            'database_query',
+            'semantic_query',
+            'structured_extract',
+            'customer_contact_lookup',
+            'email_compose',
+            'email_send',
+            'email_delivery_status',
+        }:
             raise WorkflowRuntimeError(f'No secure runtime is registered for {node_type}.')
+        if node_type == 'structured_extract':
+            schema = config.get('schema') if isinstance(config.get('schema'), dict) else {}
+            properties = schema.get('properties') if isinstance(schema.get('properties'), dict) else {}
+            required = schema.get('required') if isinstance(schema.get('required'), list) else []
+            extraction_prompt = (
+                str(config.get('instruction') or 'Extract the requested fields from the user message.')
+                + '\nReturn one JSON object only. Do not add fields.\nJSON schema:\n'
+                + json.dumps({'type': 'object', 'properties': properties, 'required': required}, ensure_ascii=False)
+                + '\nInput:\n'
+                + (
+                    json.dumps(incoming, ensure_ascii=False, default=str)
+                    if incoming is not None
+                    else str(workflow_input.get('message') or '')
+                )
+            )
+            extracted = await model_runner(
+                extraction_prompt,
+                'You are a strict JSON extraction engine. Never infer an email address that is not present.',
+                str(config.get('model_id') or form_data.model_id or '') or None,
+                [],
+            )
+            raw = str(extracted.get('text') or '').strip()
+            if raw.startswith('```'):
+                raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.IGNORECASE)
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise WorkflowRuntimeError('Structured extraction did not return valid JSON.') from exc
+            if not isinstance(value, dict):
+                raise WorkflowRuntimeError('Structured extraction must return a JSON object.')
+            value = {key: value.get(key) for key in properties}
+            missing = [key for key in required if value.get(key) in (None, '', [])]
+            if missing:
+                raise WorkflowRuntimeError('Missing required extracted fields: ' + ', '.join(missing))
+            return value
+
+        if node_type == 'customer_contact_lookup':
+            dataset_id = str(config.get('dataset_id') or '').strip()
+            name_field = str(config.get('customer_name_field') or '').strip()
+            email_field = str(config.get('customer_email_field') or '').strip()
+            if not dataset_id or not name_field or not email_field:
+                raise WorkflowRuntimeError('Customer contact lookup requires a dataset, name field, and email field.')
+            query_path = str(config.get('query_path') or 'customer_name')
+            query_source = incoming.get('value') if isinstance(incoming, dict) and 'value' in incoming else incoming
+            request_context = _customer_request_context(
+                query_source,
+                str(workflow_input.get('message') or ''),
+            )
+            customer_name = query_source
+            for part in query_path.split('.'):
+                customer_name = customer_name.get(part) if isinstance(customer_name, dict) else None
+            customer_name = str(customer_name or workflow_input.get('data', {}).get(query_path) or '').strip()
+            if not customer_name:
+                raise WorkflowRuntimeError('Customer name is required before contact lookup.')
+            dimensions = list(
+                dict.fromkeys(
+                    [
+                        str(config.get('customer_id_field') or '').strip(),
+                        name_field,
+                        str(config.get('contact_name_field') or '').strip(),
+                        email_field,
+                        str(config.get('primary_field') or '').strip(),
+                        str(config.get('opt_out_field') or '').strip(),
+                    ]
+                )
+            )
+            dimensions = [item for item in dimensions if item]
+            access_context = runtime_context
+            try:
+                query_result = await execute_semantic_query(
+                    _customer_contact_query_plan(
+                        dataset_id,
+                        dimensions,
+                        name_field,
+                        customer_name,
+                        max(2, min(20, int(config.get('max_candidates') or 10))),
+                    ),
+                    QueryRuntimeContext(
+                        user_id=user.id,
+                        user_role=user.role,
+                        company_user_id=str(access_context.company_user_id or ''),
+                        company_member_id=access_context.company_member_id,
+                        company_member_role=access_context.company_member_role,
+                        group_ids=list(access_context.group_ids),
+                        model_id=form_data.model_id,
+                        channel_id=form_data.channel_id,
+                        channel_source='channel' if form_data.channel_id else 'workflow',
+                        workflow_id=workflow.id,
+                    ),
+                    unmasked_field_ids={email_field},
+                )
+            except SemanticQueryError as error:
+                raise WorkflowRuntimeError(error.public()['message']) from error
+            rows = query_result.get('rows') if isinstance(query_result, dict) else []
+            if not isinstance(rows, list):
+                rows = []
+            exact = [row for row in rows if str(row.get(name_field) or '').strip().lower() == customer_name.lower()]
+            candidates = exact or rows
+            valid = []
+            for row in candidates:
+                email = str(row.get(email_field) or '').strip().lower()
+                opted_out = (
+                    _as_bool(row.get(str(config.get('opt_out_field') or ''))) if config.get('opt_out_field') else False
+                )
+                if email and '@' in email and not opted_out:
+                    valid.append(row)
+            if not rows:
+                return {
+                    'status': 'not_found',
+                    'query': customer_name,
+                    'candidates': [],
+                    **request_context,
+                }
+            if not valid:
+                return {
+                    'status': 'email_missing',
+                    'query': customer_name,
+                    'candidates': rows,
+                    **request_context,
+                }
+            if len(valid) > 1:
+                return {
+                    'status': 'ambiguous',
+                    'query': customer_name,
+                    **request_context,
+                    'candidates': [
+                        {
+                            'id': row.get(str(config.get('customer_id_field') or '')) or row.get(email_field),
+                            'name': row.get(name_field),
+                            'contact_name': row.get(str(config.get('contact_name_field') or '')),
+                            'email': row.get(email_field),
+                            **request_context,
+                        }
+                        for row in valid
+                    ],
+                }
+            row = valid[0]
+            return {
+                'status': 'found',
+                'query': customer_name,
+                'customer_id': row.get(str(config.get('customer_id_field') or '')),
+                'customer_name': row.get(name_field),
+                'contact_name': row.get(str(config.get('contact_name_field') or '')),
+                'email': str(row.get(email_field) or '').lower(),
+                'source': {'dataset_id': dataset_id},
+                **request_context,
+            }
+
+        if node_type == 'email_compose':
+            source, knowledge_context = _email_compose_context(incoming)
+            if not source:
+                raise WorkflowRuntimeError('Customer contact lookup result is missing before email drafting.')
+            if config.get('require_knowledge') and not knowledge_context:
+                raise WorkflowRuntimeError('找不到足夠的授權知識庫資料，本次沒有產生或寄送郵件。')
+            if source.get('status') and source.get('status') != 'found':
+                raise WorkflowRuntimeError(f'Customer contact lookup is not ready: {source.get("status")}.')
+
+            def render(template: str) -> str:
+                values = {**workflow_input.get('data', {}), **source, 'message': workflow_input.get('message', '')}
+                return re.sub(
+                    r'\{\{\s*([^{}]+?)\s*\}\}',
+                    lambda match: str(values.get(match.group(1).strip(), match.group(0))),
+                    template,
+                )
+
+            to = [str(source.get('email') or '').strip().lower()]
+            cc_values = (
+                source.get('cc')
+                or workflow_input.get('data', {}).get(str(config.get('cc_input_key') or 'cc'))
+                or config.get('default_cc')
+                or []
+            )
+            if isinstance(cc_values, str):
+                cc_values = [item.strip() for item in cc_values.split(',') if item.strip()]
+            subject = render(str(config.get('subject_template') or '關於 {{customer_name}} 的通知'))
+            text_body = render(str(config.get('text_template') or workflow_input.get('message') or ''))
+            if config.get('use_model'):
+                request_text = source.get('request') or workflow_input.get('message') or ''
+                compose_prompt = (
+                    str(config.get('instruction') or 'Draft a concise professional email.')
+                    + '\nReturn exactly one JSON object with two non-empty string fields: '
+                    + '{"subject":"...","text":"..."}. '
+                    + 'The text field must be the finished recipient-facing email, never the user instruction. '
+                    + 'Recipient data must not be changed.\nContext:\n'
+                    + json.dumps(
+                        {
+                            'request': request_text,
+                            'contact': _email_draft_contact_context(source),
+                            'knowledge': knowledge_context,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                draft_error: WorkflowRuntimeError | None = None
+                for attempt in range(2):
+                    draft = await model_runner(
+                        compose_prompt
+                        + (
+                            '\nYour previous response was invalid. Return only the required JSON object; '
+                            + 'do not echo the request.'
+                            if attempt
+                            else ''
+                        ),
+                        'Return strict JSON. Do not add recipients, promises, prices, or facts absent from context.',
+                        str(config.get('model_id') or form_data.model_id or '') or None,
+                        [],
+                    )
+                    try:
+                        subject, text_body = _parse_email_draft(draft.get('text'), request_text)
+                        draft_error = None
+                        break
+                    except WorkflowRuntimeError as exc:
+                        draft_error = exc
+                if draft_error:
+                    raise WorkflowRuntimeError(
+                        'AI 連續兩次未能產生安全且完整的信件草稿，本次工作流已停止，沒有寄出郵件。'
+                    ) from draft_error
+            subject, text_body = _validate_email_draft_content(
+                subject,
+                text_body,
+                source.get('request') or workflow_input.get('message'),
+            )
+            if not to[0] or '@' not in to[0]:
+                raise WorkflowRuntimeError('Resolved customer contact does not contain a valid email address.')
+            return {
+                'to': to,
+                'cc': cc_values,
+                'subject': subject,
+                'text': text_body,
+                'html': None,
+                'customer': source,
+            }
+
+        if node_type == 'email_send':
+            if not isinstance(incoming, dict) or not isinstance(incoming.get('_approval'), dict):
+                raise WorkflowRuntimeError('Email send requires an approval gate immediately before it.')
+            approval = incoming['_approval']
+            email_payload = incoming.get('value')
+            if not approval.get('approved') or not isinstance(email_payload, dict):
+                raise WorkflowRuntimeError('Email approval is missing or invalid.')
+            customer = email_payload.get('customer') if isinstance(email_payload.get('customer'), dict) else {}
+            _validate_email_draft_content(
+                email_payload.get('subject'),
+                email_payload.get('text'),
+                customer.get('request'),
+            )
+            connector_id = str(config.get('connector_id') or '').strip()
+            connector = await InteractEmail.get_connector(connector_id)
+            access_context = runtime_context
+            if not connector:
+                raise WorkflowRuntimeError('Email connector was not found.')
+            delivery = await send_resend_email(
+                connector,
+                {
+                    'company_user_id': access_context.company_user_id,
+                    'company_member_id': access_context.company_member_id,
+                    'company_member_role': access_context.company_member_role,
+                    'group_ids': list(access_context.group_ids),
+                    'user_id': user.id,
+                },
+                EmailSendRequest(
+                    connector_id=connector_id,
+                    to=email_payload.get('to') or [],
+                    cc=email_payload.get('cc') or [],
+                    subject=str(email_payload.get('subject') or ''),
+                    text=email_payload.get('text'),
+                    html=email_payload.get('html'),
+                    workflow_id=workflow.id,
+                    workflow_run_id=run_id,
+                    channel_id=form_data.channel_id,
+                    idempotency_key='wf-'
+                    + hashlib.sha256(
+                        (
+                            f'{workflow.id}|{run_id or "adhoc"}|'
+                            f'{config.get("_runtime_node_id") or "email"}|'
+                            f'{config.get("idempotency_scope") or "send"}'
+                        ).encode()
+                    ).hexdigest(),
+                    payload_hash=str(approval.get('payload_hash') or ''),
+                ),
+            )
+            return delivery.model_dump()
+
+        if node_type == 'email_delivery_status':
+            return incoming
         if node_type == 'knowledge_query':
             query = str(config.get('query') or '').strip()
             incoming_text = ''
@@ -897,14 +1477,11 @@ async def _execute_workflow(
                 raise WorkflowRuntimeError('Knowledge query returned an invalid response.') from exc
             if isinstance(result, dict) and result.get('error'):
                 raise WorkflowRuntimeError(str(result['error']))
+            if config.get('preserve_input'):
+                return {'value': incoming, 'knowledge': result}
             return result
 
-        access_context = await _workflow_context_for_user(
-            user,
-            None,
-            channel_id=form_data.channel_id,
-            model_id=form_data.model_id,
-        )
+        access_context = runtime_context
         if node_type == 'semantic_query':
             configured_plan = config.get('plan') if isinstance(config.get('plan'), dict) else {}
             incoming_plan: dict[str, Any] = {}
@@ -977,6 +1554,8 @@ async def _execute_workflow(
         model_runner=model_runner,
         node_runner=node_runner,
         default_model_id=form_data.model_id,
+        resume_state=resume_state,
+        resume=resume,
     )
     result['workflow_id'] = workflow.id
     result['workflow_name'] = workflow.name
@@ -1003,6 +1582,101 @@ async def _hydrate_workflow_run_form(
             'input': apply_launch_defaults(launch, form_data.input),
             'model_id': _effective_workflow_model_id(graph, form_data.model_id),
         }
+    )
+
+
+async def _save_workflow_pause(
+    run: WorkflowRunModel,
+    workflow: WorkflowModel,
+    context: WorkflowAccessContext,
+    pause: WorkflowPause,
+    db: AsyncSession | None = None,
+) -> WorkflowRunModel:
+    checkpoint = await InteractEmail.save_checkpoint(
+        workflow_run_id=run.id,
+        company_user_id=str(context.company_user_id or ''),
+        workflow_id=workflow.id,
+        node_id=pause.node_id,
+        wait_type=pause.wait_type,
+        state=pause.state,
+        prompt=pause.prompt,
+        payload_hash=pause.payload_hash,
+    )
+    wait_status = 'waiting_approval' if pause.wait_type == 'approval' else 'waiting_input'
+    card = {
+        'type': 'card',
+        'title': pause.prompt.get('title') or ('等待核准' if pause.wait_type == 'approval' else '等待輸入'),
+        'body': pause.prompt.get('message') or '',
+        'data': {
+            'checkpoint_id': checkpoint['id'],
+            'workflow_id': workflow.id,
+            'run_id': run.id,
+            'wait_type': pause.wait_type,
+            'revision': checkpoint['revision'],
+            'prompt': pause.prompt,
+        },
+        'actions': (
+            [
+                {
+                    'type': 'workflow_resume',
+                    'label': pause.prompt.get('confirm_label') or '確認',
+                    'decision': 'approved',
+                },
+                {
+                    'type': 'workflow_resume',
+                    'label': pause.prompt.get('cancel_label') or '取消',
+                    'decision': 'rejected',
+                },
+            ]
+            if pause.wait_type == 'approval'
+            else [
+                {
+                    'type': 'workflow_resume',
+                    'label': str(choice.get('label') or choice.get('value')),
+                    'decision': 'selected',
+                    'value': choice.get('value'),
+                }
+                for choice in pause.prompt.get('choices') or []
+                if isinstance(choice, dict)
+            ]
+        ),
+    }
+    output = {
+        'workflow_id': workflow.id,
+        'workflow_name': workflow.name,
+        'workflow_version_id': run.workflow_version_id,
+        'status': wait_status,
+        'checkpoint': card['data'],
+        'outputs': [card],
+        'usage': pause.state.get('usage') or {},
+    }
+    return await Workflows.complete_run(run.id, wait_status, output=output, db=db)
+
+
+def _verified_channel_access_context(
+    request: Request,
+    user,
+    channel_context: dict[str, Any],
+    channel_id: str | None,
+    model_id: str | None,
+) -> WorkflowAccessContext | None:
+    if not getattr(request.state, 'interact_channel_runtime', False):
+        return None
+    if channel_context.get('identitySource') != 'line-binding':
+        return None
+    company_user_id = str(channel_context.get('companyUserId') or '').strip()
+    member_role = str(channel_context.get('companyMemberRole') or '').strip().lower()
+    if not company_user_id or member_role not in {'owner', 'admin', 'member'}:
+        return None
+    return WorkflowAccessContext(
+        user_id=user.id if member_role == 'owner' else None,
+        role=user.role if member_role == 'owner' else 'user',
+        company_user_id=company_user_id,
+        company_member_id=str(channel_context.get('companyMemberId') or '').strip() or None,
+        company_member_role=member_role,
+        group_ids={str(item) for item in channel_context.get('groupIds') or [] if str(item)},
+        channel_id=channel_id,
+        model_id=model_id,
     )
 
 
@@ -1034,7 +1708,13 @@ async def execute_chat_workflow(
     if not isinstance(channel_context, dict):
         channel_context = {}
     channel_id = str(channel_context.get('channelId') or channel_context.get('channel_id') or '').strip() or None
-    context = await _workflow_context_for_user(
+    context = _verified_channel_access_context(
+        request,
+        user,
+        channel_context,
+        channel_id,
+        model_id,
+    ) or await _workflow_context_for_user(
         user,
         None,
         channel_id=channel_id,
@@ -1058,8 +1738,8 @@ async def execute_chat_workflow(
     }
     part_files = [
         {
-            'name': part.get('filename') or f"channel-{part.get('type') or 'file'}",
-            'filename': part.get('filename') or f"channel-{part.get('type') or 'file'}",
+            'name': part.get('filename') or f'channel-{part.get("type") or "file"}',
+            'filename': part.get('filename') or f'channel-{part.get("type") or "file"}',
             'content_type': part.get('content_type')
             or part.get('mimeType')
             or part_mime_defaults.get(str(part.get('type') or ''), ''),
@@ -1094,8 +1774,18 @@ async def execute_chat_workflow(
     run_form = await _hydrate_workflow_run_form(workflow, run_form)
     run = await Workflows.insert_run(workflow.id, user.id, run_form)
     try:
-        result = await _execute_workflow(request, user, workflow, run_form)
+        result = await _execute_workflow(
+            request,
+            user,
+            workflow,
+            run_form,
+            run_id=run.id,
+            access_context_override=context,
+        )
         completed = await Workflows.complete_run(run.id, 'success', output=result)
+    except WorkflowPause as pause:
+        completed = await _save_workflow_pause(run, workflow, context, pause)
+        result = completed.output or {}
     except Exception as exc:
         await Workflows.complete_run(run.id, 'error', error=str(exc))
         raise
@@ -1103,7 +1793,9 @@ async def execute_chat_workflow(
     outputs = result.get('outputs') if isinstance(result.get('outputs'), list) else []
     text_outputs = [output for output in outputs if isinstance(output, dict) and output.get('type') == 'text']
     content = workflow_outputs_text(text_outputs)
-    if not content and outputs:
+    if result.get('status') in {'waiting_input', 'waiting_approval'}:
+        content = ''
+    elif not content and outputs:
         content = '工作流已完成，結果如下。'
     metadata['workflow'] = {
         'id': workflow.id,
@@ -1298,11 +1990,7 @@ async def resolve_channel_workflow_for_user_context(
         access_context=access_context,
     )
     return next(
-        (
-            option
-            for option in options
-            if option['id'] == workflow_id and option['versionId'] == version_id
-        ),
+        (option for option in options if option['id'] == workflow_id and option['versionId'] == version_id),
         None,
     )
 
@@ -1323,11 +2011,7 @@ async def resolve_instant_workflow_for_user_context(
         limit=0,
     )
     return next(
-        (
-            option
-            for option in options
-            if option['id'] == workflow_id and option['versionId'] == version_id
-        ),
+        (option for option in options if option['id'] == workflow_id and option['versionId'] == version_id),
         None,
     )
 
@@ -1392,9 +2076,7 @@ async def _preflight_workflow_launch(
         form_data.input,
         confirmed=form_data.confirmed,
     )
-    non_confirmation_errors = [
-        error for error in input_check['errors'] if '需要先確認' not in error
-    ]
+    non_confirmation_errors = [error for error in input_check['errors'] if '需要先確認' not in error]
     if non_confirmation_errors:
         checks.append(_launch_check('input_invalid', 'fail', ' '.join(non_confirmation_errors)))
     else:
@@ -1655,8 +2337,10 @@ async def service_run_workflow(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
     try:
-        output = await _execute_workflow(request, service_user, workflow, run_form)
+        output = await _execute_workflow(request, service_user, workflow, run_form, run_id=run.id)
         return await Workflows.complete_run(run.id, 'success', output=output, db=db)
+    except WorkflowPause as pause:
+        return await _save_workflow_pause(run, workflow, context, pause, db=db)
     except Exception as exc:
         completed = await Workflows.complete_run(run.id, 'error', error=str(exc), db=db)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=completed.error)
@@ -1943,11 +2627,155 @@ async def run_workflow_by_id(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
     try:
-        output = await _execute_workflow(request, user, workflow, run_form)
+        output = await _execute_workflow(request, user, workflow, run_form, run_id=run.id)
         return await Workflows.complete_run(run.id, 'success', output=output, db=db)
+    except WorkflowPause as pause:
+        return await _save_workflow_pause(run, workflow, context, pause, db=db)
     except Exception as exc:
         completed = await Workflows.complete_run(run.id, 'error', error=str(exc), db=db)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=completed.error)
+
+
+async def _resume_workflow_run_internal(
+    request: Request,
+    workflow: WorkflowModel,
+    run: WorkflowRunModel,
+    form_data: WorkflowResumeRequest,
+    user,
+    context: WorkflowAccessContext,
+    actor_id: str,
+    db: AsyncSession | None = None,
+) -> WorkflowRunModel:
+    run_id = run.id
+    checkpoint = await InteractEmail.get_checkpoint(run_id)
+    if not checkpoint or checkpoint.get('company_user_id') != str(context.company_user_id or ''):
+        raise HTTPException(status_code=404, detail='Workflow checkpoint not found.')
+    if checkpoint.get('workflow_id') != workflow.id or run.workflow_id != workflow.id:
+        raise HTTPException(status_code=404, detail='Workflow checkpoint not found.')
+    wait_type = str(checkpoint.get('wait_type') or '')
+    if wait_type == 'approval' and form_data.decision not in {'approved', 'rejected', 'cancelled'}:
+        raise HTTPException(status_code=400, detail='This prompt requires an approval or cancellation decision.')
+    if wait_type == 'input' and form_data.decision not in {'selected', 'cancelled'}:
+        raise HTTPException(status_code=400, detail='This prompt requires one of the displayed choices.')
+    consumed = await InteractEmail.consume_checkpoint(
+        workflow_run_id=run_id,
+        company_user_id=str(context.company_user_id or ''),
+        actor_id=actor_id,
+        decision=form_data.decision,
+        expected_revision=form_data.revision,
+        reason=form_data.reason,
+    )
+    if not consumed:
+        raise HTTPException(status_code=409, detail='This workflow prompt expired or was already handled.')
+    if form_data.decision in {'rejected', 'cancelled'}:
+        return await Workflows.complete_run(
+            run_id,
+            'cancelled',
+            output={
+                'status': 'cancelled',
+                'workflow_id': workflow.id,
+                'workflow_name': workflow.name,
+                'outputs': [{'type': 'text', 'text': '已取消，未執行寄送或其他外部操作。'}],
+            },
+            db=db,
+        )
+    original_context = run.input.get('context') if isinstance(run.input, dict) else {}
+    original_context = original_context if isinstance(original_context, dict) else {}
+    run_form = WorkflowRunForm(
+        input=run.input or {},
+        trigger_type=run.trigger_type,
+        workflow_version_id=run.workflow_version_id,
+        model_id=str(original_context.get('model_id') or context.model_id or '').strip() or None,
+        channel_id=str(original_context.get('channel_id') or context.channel_id or '').strip() or None,
+        confirmed=True,
+    )
+    resume = {
+        'node_id': consumed['node_id'],
+        'decision': form_data.decision,
+        'value': form_data.value,
+        'payload_hash': consumed.get('payload_hash'),
+        'actor_id': actor_id,
+        'decided_at': int(time.time_ns()),
+    }
+    try:
+        output = await _execute_workflow(
+            request,
+            user,
+            workflow,
+            run_form,
+            run_id=run_id,
+            resume_state=consumed['state'],
+            resume=resume,
+            access_context_override=context,
+        )
+        return await Workflows.complete_run(run_id, 'success', output=output, db=db)
+    except WorkflowPause as pause:
+        return await _save_workflow_pause(run, workflow, context, pause, db=db)
+    except Exception as exc:
+        completed = await Workflows.complete_run(run_id, 'error', error=str(exc), db=db)
+        raise HTTPException(status_code=400, detail=completed.error) from exc
+
+
+async def resume_channel_workflow(
+    request: Request,
+    user,
+    context: WorkflowAccessContext,
+    workflow_id: str,
+    run_id: str,
+    decision: str,
+    value: Any,
+    revision: int,
+    actor_id: str,
+) -> WorkflowRunModel:
+    if not context.channel_id or not context.company_user_id:
+        raise HTTPException(status_code=403, detail=ERROR_MESSAGES.UNAUTHORIZED)
+    workflow = await Workflows.get_by_id(workflow_id)
+    if not workflow or workflow.status != 'published' or not workflow.default_version_id:
+        raise HTTPException(status_code=409, detail='This workflow is no longer available.')
+    if not workflow_channel_acl_allows(workflow, context):
+        raise HTTPException(status_code=403, detail=ERROR_MESSAGES.UNAUTHORIZED)
+    run = await Workflows.get_run(run_id)
+    if not run or run.workflow_id != workflow_id:
+        raise HTTPException(status_code=404, detail='Workflow run not found.')
+    return await _resume_workflow_run_internal(
+        request,
+        workflow,
+        run,
+        WorkflowResumeRequest(decision=decision, value=value, revision=revision),
+        user,
+        context,
+        actor_id,
+    )
+
+
+@router.post('/{id}/runs/{run_id}/resume', response_model=WorkflowRunModel)
+async def resume_workflow_run(
+    request: Request,
+    id: str,
+    run_id: str,
+    form_data: WorkflowResumeRequest,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    await check_workflows_permission(user)
+    workflow = await Workflows.get_by_id(id, db=db)
+    context = await _workflow_context_for_user(user, db)
+    check_workflow_access(workflow, user, context)
+    run = await Workflows.get_run(run_id, db=db)
+    if not run or run.workflow_id != id:
+        raise HTTPException(status_code=404, detail='Workflow run not found.')
+    if run.user_id != user.id and user.role != 'admin':
+        raise HTTPException(status_code=403, detail=ERROR_MESSAGES.UNAUTHORIZED)
+    return await _resume_workflow_run_internal(
+        request,
+        workflow,
+        run,
+        form_data,
+        user,
+        context,
+        user.id,
+        db=db,
+    )
 
 
 @router.get('/{id}/runs', response_model=list[WorkflowRunModel])

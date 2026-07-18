@@ -9,12 +9,15 @@ from fastapi import HTTPException
 from open_webui.models.interact_channels import InteractEventClaim
 from open_webui.routers.interact_channels import (
     ChannelChatRequest,
+    _channel_output_text,
     _channel_request_messages,
     _claim_and_respond,
+    _complete_claimed_result,
     _estimated_reservation_tokens,
     _generate_context_summary,
     _line_delivery_messages,
     _line_filter_workflow_options,
+    _line_result_messages,
     _line_workflow_menu_message,
     _line_workflow_menu_requested,
     _line_workflow_postback,
@@ -100,6 +103,84 @@ def _active_line_identity():
         group_ids=[],
         role_verified_at=9999999999,
     )
+
+
+def test_channel_text_output_uses_its_text_instead_of_type_label():
+    assert _channel_output_text({'type': 'text', 'text': '郵件已送出。'}) == '郵件已送出。'
+
+
+def test_line_result_deduplicates_content_and_text_output():
+    messages = _line_result_messages(
+        {
+            'content': '郵件已送出。',
+            'outputs': [{'type': 'text', 'text': '郵件已送出。'}],
+        }
+    )
+
+    assert messages == [{'type': 'text', 'text': '郵件已送出。'}]
+
+
+def test_line_result_accepts_card_without_plain_text():
+    messages = _line_result_messages(
+        {
+            'content': '',
+            'outputs': [
+                {
+                    'type': 'card',
+                    'title': '確認寄送郵件',
+                    'body': '確認後才會寄送。',
+                    'data': {
+                        'workflow_id': 'workflow-id',
+                        'run_id': 'run-id',
+                        'revision': 1,
+                    },
+                    'actions': [
+                        {
+                            'type': 'workflow_resume',
+                            'label': '確認寄送',
+                            'decision': 'approved',
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert len(messages) == 1
+    assert messages[0]['type'] == 'flex'
+    assert messages[0]['altText'] == '確認寄送郵件'
+
+
+@pytest.mark.asyncio
+async def test_complete_claimed_result_does_not_replace_structured_output_with_fallback(monkeypatch):
+    result = {
+        'ok': True,
+        'content': '',
+        'outputs': [{'type': 'card', 'title': '確認寄送郵件'}],
+    }
+    saved = {}
+
+    async def run_message(*args, **kwargs):
+        return result
+
+    async def set_response(event_id, content, tokens, reason):
+        saved.update(event_id=event_id, content=content, tokens=tokens, reason=reason)
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._run_channel_message', run_message)
+    monkeypatch.setattr('open_webui.routers.interact_channels.InteractChannels.set_response', set_response)
+
+    completed = await _complete_claimed_result(
+        SimpleNamespace(),
+        SimpleNamespace(reply_mode='ai', fallback_message='不應出現的 fallback'),
+        SimpleNamespace(event_id='event-id'),
+        'line-user',
+        'platform-event',
+        '寄信',
+    )
+
+    assert completed['content'] == ''
+    assert completed['outputs'] == result['outputs']
+    assert saved['content'] == ''
 
 
 def test_summary_state_keeps_only_messages_after_marker():

@@ -261,6 +261,27 @@ export const getWorkflowRuns = async (
 	}).then(parseResponse);
 };
 
+export const resumeWorkflowRun = async (
+	token: string,
+	workflowId: string,
+	runId: string,
+	payload: {
+		decision: 'approved' | 'rejected' | 'selected' | 'cancelled';
+		value?: any;
+		revision: number;
+		reason?: string;
+	}
+): Promise<WorkflowRunResponse> => {
+	return fetch(
+		`${WEBUI_API_BASE_URL}/workflows/${encodeURIComponent(workflowId)}/runs/${encodeURIComponent(runId)}/resume`,
+		{
+			method: 'POST',
+			headers: headers(token),
+			body: JSON.stringify(payload)
+		}
+	).then(parseResponse);
+};
+
 export const deleteWorkflowById = async (
 	token: string,
 	id: string

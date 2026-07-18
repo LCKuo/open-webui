@@ -1,8 +1,19 @@
 from types import SimpleNamespace
 
 import pytest
-
-from open_webui.routers.workflows import _workflow_multimodal_content
+from open_webui.routers.workflows import (
+    _as_bool,
+    _customer_contact_query_plan,
+    _customer_request_context,
+    _email_compose_context,
+    _email_draft_contact_context,
+    _email_knowledge_context,
+    _parse_email_draft,
+    _validate_email_draft_content,
+    _workflow_multimodal_content,
+)
+from open_webui.semantic_query.contracts import QueryPlan
+from open_webui.utils.workflow_runtime import WorkflowRuntimeError
 from open_webui.utils.workflows import (
     WorkflowAccessContext,
     decide_workflow_candidates,
@@ -52,6 +63,110 @@ def _workflow(**overrides):
 
 def _context(company_id='company-a'):
     return WorkflowAccessContext(user_id='member', role='user', company_user_id=company_id)
+
+
+def test_semantic_boolean_values_do_not_treat_false_text_as_opt_out():
+    assert _as_bool(True)
+    assert _as_bool('yes')
+    assert not _as_bool(False)
+    assert not _as_bool('false')
+    assert not _as_bool('0')
+
+
+def test_customer_contact_lookup_builds_valid_semantic_filter_group():
+    payload = _customer_contact_query_plan(
+        'customer-contacts',
+        ['customer.name', 'contact.email'],
+        'customer.name',
+        'Example Company',
+        10,
+    )
+
+    plan = QueryPlan.model_validate(payload)
+
+    assert plan.filters is not None
+    assert plan.filters.operator == 'and'
+    assert plan.filters.conditions[0].fieldId == 'customer.name'
+    assert plan.filters.conditions[0].operator == 'contains'
+
+
+def test_email_draft_model_context_excludes_recipient_address():
+    context = _email_draft_contact_context(
+        {
+            'customer_id': 'customer-1',
+            'customer_name': 'Example Company',
+            'contact_name': 'Amy',
+            'email': 'private@example.com',
+            'source': {'dataset_id': 'contacts'},
+        }
+    )
+
+    assert context == {
+        'customer_id': 'customer-1',
+        'customer_name': 'Example Company',
+        'contact_name': 'Amy',
+        'source': {'dataset_id': 'contacts'},
+    }
+
+
+def test_customer_request_context_preserves_request_and_normalizes_cc():
+    assert _customer_request_context(
+        {
+            'customer_name': 'Example Company',
+            'request': ' Arrange a product introduction ',
+            'cc': [' Sales@example.com ', '', 'OWNER@EXAMPLE.COM', 'invented@example.com'],
+        },
+        'Please CC sales@example.com and owner@example.com.',
+    ) == {
+        'request': 'Arrange a product introduction',
+        'cc': ['sales@example.com', 'owner@example.com'],
+    }
+
+
+def test_email_compose_context_keeps_contact_and_scoped_knowledge_separate():
+    contact, knowledge = _email_compose_context(
+        {
+            'value': {
+                'matched': True,
+                'value': {
+                    'status': 'found',
+                    'customer_name': 'Example Company',
+                    'contact_name': 'Amy',
+                    'email': 'private@example.com',
+                },
+            },
+            'knowledge': [
+                {'content': 'Approved product statement', 'source': 'sales-guide.pdf', 'file_id': 'secret'},
+                {'content': '', 'source': 'empty'},
+            ],
+        }
+    )
+
+    assert contact['email'] == 'private@example.com'
+    assert knowledge == [{'content': 'Approved product statement', 'source': 'sales-guide.pdf'}]
+    assert _email_knowledge_context({'content': 'not-a-list'}) == []
+
+
+def test_email_draft_parser_accepts_common_weaker_model_field_names():
+    subject, text = _parse_email_draft(
+        '{"email":{"title":"產品介紹","body":"郭先生您好，以下是適合貴公司的產品介紹內容。"}}',
+        '請寄一封產品介紹信',
+    )
+
+    assert subject == '產品介紹'
+    assert text == '郭先生您好，以下是適合貴公司的產品介紹內容。'
+
+
+def test_email_draft_parser_rejects_missing_body_instead_of_using_instruction():
+    with pytest.raises(WorkflowRuntimeError, match='缺少主旨或正文'):
+        _parse_email_draft('{"subject":"產品介紹"}', '請寄一封產品介紹信')
+
+
+def test_email_draft_validation_blocks_user_instruction_as_message_body():
+    request = '請寄一封推銷信給木綠森設計有限公司，介紹心情放鬆的產品。'
+
+    with pytest.raises(WorkflowRuntimeError, match='阻止將操作指令當成郵件寄出'):
+        _validate_email_draft_content('產品介紹', request, request)
 
 
 @pytest.mark.asyncio

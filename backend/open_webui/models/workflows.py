@@ -462,10 +462,16 @@ class WorkflowTable:
             row.status = status
             row.output = output
             row.error = error
-            row.completed_at = int(time.time_ns())
+            row.completed_at = None if status.startswith('waiting_') or status == 'running' else int(time.time_ns())
             await db.commit()
             await db.refresh(row)
             return WorkflowRunModel.model_validate(row)
+
+    async def get_run(self, run_id: str, db: Optional[AsyncSession] = None) -> Optional[WorkflowRunModel]:
+        await self.ensure_tables()
+        async with get_async_db_context(db) as db:
+            row = await db.get(WorkflowRun, run_id)
+            return WorkflowRunModel.model_validate(row) if row else None
 
     async def get_runs(
         self,

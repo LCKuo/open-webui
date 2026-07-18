@@ -78,6 +78,74 @@ def test_channel_uses_database_error_code_without_exposing_internal_detail():
     )
 
 
+def test_channel_reads_nested_semantic_error_code():
+    output = [
+        {'type': 'function_call', 'call_id': 'call-1', 'name': 'interact_semantic_query'},
+        {
+            'type': 'function_call_output',
+            'call_id': 'call-1',
+            'output': [
+                {
+                    'type': 'input_text',
+                    'text': json.dumps(
+                        {
+                            'ok': False,
+                            'error': {
+                                'code': 'QUERY-PLAN-INVALID',
+                                'message': '查詢計畫格式不正確。',
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+        },
+    ]
+
+    assert _tool_failure_from_items(output) == (
+        'QUERY-PLAN-INVALID',
+        '查詢計畫格式不正確。（錯誤代碼：QUERY-PLAN-INVALID）',
+    )
+
+
+def test_channel_ignores_tool_failure_resolved_by_later_retry():
+    output = [
+        {'type': 'function_call', 'call_id': 'call-1', 'name': 'interact_semantic_query'},
+        {
+            'type': 'function_call_output',
+            'call_id': 'call-1',
+            'output': [
+                {
+                    'type': 'input_text',
+                    'text': json.dumps(
+                        {
+                            'ok': False,
+                            'error': {
+                                'code': 'QUERY-PLAN-INVALID',
+                                'message': '查詢計畫格式不正確。',
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+        },
+        {'type': 'function_call', 'call_id': 'call-2', 'name': 'interact_semantic_query'},
+        {
+            'type': 'function_call_output',
+            'call_id': 'call-2',
+            'output': [
+                {
+                    'type': 'input_text',
+                    'text': json.dumps({'ok': True, 'rows': [{'customer.name': '木綠森設計有限公司'}]}),
+                }
+            ],
+        },
+    ]
+
+    assert _tool_failure_from_items(output) is None
+
+
 def test_channel_runtime_failures_are_distinct():
     assert _channel_runtime_failure('Configured Open WebUI model was not found.')[0] == 'AI-MODEL-NOT-FOUND'
     assert _channel_runtime_failure('Interact Web Ai user not found.')[0] == 'AI-ACCOUNT-NOT-FOUND'

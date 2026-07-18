@@ -533,7 +533,10 @@ def _mask_value(value: Any, rule: str) -> Any:
 
 
 def _mask_rows(
-    rows: list[dict[str, Any]], selected: list[dict[str, Any]], runtime: SemanticRuntime
+    rows: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    runtime: SemanticRuntime,
+    unmasked_field_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     _, catalog_fields = _catalog_maps(runtime.catalog)
     definition = runtime.version['definition']
@@ -542,7 +545,15 @@ def _mask_rows(
         for section in ('dimensions', 'measures')
         for item in definition.get(section) or []
     }
-    rules = {item['id']: (semantic_fields.get(item['id']) or {}).get('masking_rule', 'none') for item in selected}
+    unmasked = unmasked_field_ids or set()
+    rules = {
+        item['id']: (
+            'none'
+            if item['id'] in unmasked
+            else (semantic_fields.get(item['id']) or {}).get('masking_rule', 'none')
+        )
+        for item in selected
+    }
     return [{key: _mask_value(value, rules.get(key, 'none')) for key, value in row.items()} for row in rows]
 
 
@@ -655,20 +666,33 @@ def _redact_plan(plan_data: dict[str, Any]) -> dict[str, Any]:
         }
         redacted = {key: value for key, value in redacted.items() if key in allowed}
     filters = redacted.get('filters') if isinstance(redacted, dict) else None
-    if isinstance(filters, dict):
-        for condition in filters.get('conditions') or []:
-            if isinstance(condition, dict) and 'value' in condition:
-                value = condition['value']
-                condition['value'] = {
-                    'redacted': True,
-                    'valueType': 'list' if isinstance(value, list) else type(value).__name__,
-                }
+    if isinstance(filters, list):
+        conditions = filters
+    elif isinstance(filters, dict) and filters.get('fieldId'):
+        conditions = [filters]
+    elif isinstance(filters, dict):
+        conditions = filters.get('conditions') or []
+    else:
+        conditions = []
+    for condition in conditions:
+        if isinstance(condition, dict) and 'value' in condition:
+            value = condition['value']
+            condition['value'] = {
+                'redacted': True,
+                'valueType': 'list' if isinstance(value, list) else type(value).__name__,
+            }
     return redacted
 
 
 async def execute_query(  # noqa: C901
-    plan_data: dict[str, Any], context: QueryRuntimeContext
+    plan_data: dict[str, Any],
+    context: QueryRuntimeContext,
+    *,
+    unmasked_field_ids: set[str] | None = None,
 ) -> dict[str, Any]:
+    requested_unmasked_fields = {
+        str(item).strip() for item in (unmasked_field_ids or set()) if str(item).strip()
+    }
     request_id = context.request_id or str(uuid4())
     started = time.monotonic()
     event: dict[str, Any] = {
@@ -684,6 +708,11 @@ async def execute_query(  # noqa: C901
         'plan_fingerprint': canonical_fingerprint(plan_data),
     }
     try:
+        if requested_unmasked_fields and not context.workflow_id:
+            raise SemanticQueryError(
+                'SEMANTIC-FIELD-NOT-ALLOWED',
+                'Sensitive fields may only be resolved inside an authorized workflow.',
+            )
         await reserve_query_entitlement(context.company_user_id)
         plan = QueryPlan.model_validate(plan_data)
         runtime = await load_runtime(plan, context)
@@ -699,13 +728,28 @@ async def execute_query(  # noqa: C901
             raise SemanticQueryError('QUERY-COST-LIMIT', 'Requested row limit exceeds connector policy.')
         compiler = SemanticCompiler(runtime.connector.connector_type, runtime.catalog, runtime.version['definition'])
         compiled = compiler.compile(plan, runtime.row_filters)
+        selected_field_ids = {str(item.get('id') or '') for item in compiled.selectedFields}
+        invalid_unmasked_fields = requested_unmasked_fields - selected_field_ids
+        if invalid_unmasked_fields:
+            raise SemanticQueryError(
+                'SEMANTIC-FIELD-NOT-ALLOWED',
+                'Sensitive field access must be limited to selected semantic fields.',
+            )
+        if requested_unmasked_fields:
+            event['policy_decision'] = {
+                **runtime.policy_decision,
+                'sensitiveFieldAccess': {
+                    'purpose': 'workflow_email_delivery',
+                    'fieldIds': sorted(requested_unmasked_fields),
+                },
+            }
         if len(compiled.joins) > MAX_JOIN_COUNT:
             raise SemanticQueryError('QUERY-COST-LIMIT', 'Query contains too many joins.')
         rows = await asyncio.wait_for(
             asyncio.to_thread(_execute_sync, runtime.connector, compiled.sql, compiled.parameters),
             timeout=max(1, runtime.connector.query_timeout_seconds + 2),
         )
-        rows = _mask_rows(rows, compiled.selectedFields, runtime)
+        rows = _mask_rows(rows, compiled.selectedFields, runtime, requested_unmasked_fields)
         totals = None
         if plan.includeTotals and (plan.measures or plan.metrics):
             totals_plan = plan.model_copy(deep=True)
@@ -728,7 +772,12 @@ async def execute_query(  # noqa: C901
                 ),
                 timeout=max(1, runtime.connector.query_timeout_seconds + 2),
             )
-            total_rows = _mask_rows(total_rows, totals_query.selectedFields, runtime)
+            total_rows = _mask_rows(
+                total_rows,
+                totals_query.selectedFields,
+                runtime,
+                requested_unmasked_fields,
+            )
             totals = total_rows[0] if total_rows else {}
         encoded = json.dumps(
             {'rows': rows, 'totals': totals},

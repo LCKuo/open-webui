@@ -154,6 +154,7 @@ from open_webui.routers import (
     groups,
     images,
     interact_channels,
+    interact_email,
     interact_semantic,
     knowledge,
     memories,
@@ -795,6 +796,7 @@ app.include_router(automations.router, prefix='/api/v1/automations', tags=['auto
 app.include_router(workflows.router, prefix='/api/v1/workflows', tags=['workflows'])
 app.include_router(billing.router, prefix='/api/v1/billing', tags=['billing'])
 app.include_router(interact_channels.router, prefix='/api/v1/interact', tags=['interact'])
+app.include_router(interact_email.router, prefix='/api/v1/interact', tags=['interact-email'])
 app.include_router(interact_semantic.router, prefix='/api/v1/interact', tags=['interact-semantic'])
 app.include_router(calendar.router, prefix='/api/v1/calendars', tags=['calendars'])
 
