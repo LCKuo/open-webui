@@ -295,6 +295,17 @@ def _synced_description(
     return current_scan or previous_catalog or None
 
 
+def _snapshot_objects_by_physical(snapshot: Any | None) -> dict[str, dict[str, Any]]:
+    if snapshot is None:
+        return {}
+    schema = snapshot.schema_json or {}
+    return {
+        str(item.get('physicalName') or item.get('name') or item.get('table') or ''): item
+        for item in (schema.get('objects') or schema.get('tables') or [])
+        if str(item.get('physicalName') or item.get('name') or item.get('table') or '')
+    }
+
+
 def row_dict(row: Any, *, omit: set[str] | None = None) -> dict[str, Any]:
     if row is None:
         return {}
@@ -454,15 +465,7 @@ class InteractSemanticStore:
             )
         ).scalar_one_or_none()
         previous_snapshot_id = previous_snapshot.id if previous_snapshot else None
-        previous_schema_objects = {
-            str(item.get('physicalName') or item.get('name') or item.get('table') or ''): item
-            for item in (
-                (previous_snapshot.schema_json or {}).get('objects')
-                or (previous_snapshot.schema_json or {}).get('tables')
-                or []
-            )
-            if str(item.get('physicalName') or item.get('name') or item.get('table') or '')
-        }
+        previous_schema_objects = _snapshot_objects_by_physical(previous_snapshot)
         previous_objects = (
             (
                 await db.execute(

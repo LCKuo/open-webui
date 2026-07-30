@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from open_webui.models.interact_semantic import InteractSemantic, _business_day_start, _synced_description
+from open_webui.models.interact_semantic import (
+    InteractSemantic,
+    _business_day_start,
+    _snapshot_objects_by_physical,
+    _synced_description,
+)
 from open_webui.routers import interact_semantic as semantic_router
 from open_webui.routers.interact_channels import _safe_sso_return_url, _safe_sso_target
 from open_webui.routers.interact_semantic import (
@@ -13,7 +18,7 @@ from open_webui.routers.interact_semantic import (
 )
 from open_webui.semantic_query import entitlements
 from open_webui.semantic_query.errors import SemanticQueryError
-from open_webui.semantic_query.schema import _scoped_schema_descriptions
+from open_webui.semantic_query.schema import _scoped_schema_descriptions, schema_scan_error
 
 
 def test_business_day_uses_taipei_midnight_by_default(monkeypatch):
@@ -32,6 +37,20 @@ def test_schema_comments_refresh_without_overwriting_catalog_override():
         'Administrator definition'
     )
     assert _synced_description(None, None, 'Initial database comment') == 'Initial database comment'
+
+
+def test_first_schema_snapshot_has_no_previous_objects():
+    assert _snapshot_objects_by_physical(None) == {}
+    assert _snapshot_objects_by_physical(
+        SimpleNamespace(schema_json={'tables': [{'name': 'crm.users'}]})
+    ) == {'crm.users': {'name': 'crm.users'}}
+
+
+def test_schema_scan_internal_error_is_not_reported_as_database_query_failure():
+    error = schema_scan_error(AttributeError("'NoneType' object has no attribute 'schema_json'"))
+
+    assert error.code == 'SCHEMA-SCAN-FAILED'
+    assert error.public()['message'] == 'Schema 結構同步失敗，請重試；若持續發生請聯繫管理員。'
 
 
 def test_schema_descriptions_are_limited_to_connector_visible_tables():

@@ -78,6 +78,24 @@ async def _has_read_access_to_file(
     model_knowledge: Optional[list[dict]] = None,
 ) -> bool:
     """Check if a user can read a file via ownership, admin role, model attachment, or access grants."""
+    if model_knowledge is not None:
+        if not model_knowledge:
+            return False
+        attached_file_ids = {
+            item.get('id') for item in model_knowledge if item.get('type') == 'file'
+        }
+        attached_kb_ids = {
+            item.get('id') for item in model_knowledge if item.get('type') == 'collection'
+        }
+        is_attached = file.id in attached_file_ids
+        if not is_attached and attached_kb_ids:
+            from open_webui.models.knowledge import Knowledges
+
+            containing_kbs = await Knowledges.get_knowledges_by_file_id(file.id)
+            is_attached = any(kb.id in attached_kb_ids for kb in containing_kbs)
+        if not is_attached:
+            return False
+
     if file.user_id == user_id or user_role == 'admin':
         return True
     if model_knowledge and any(item.get('type') == 'file' and item.get('id') == file.id for item in model_knowledge):
@@ -1795,6 +1813,9 @@ async def search_knowledge_files(
     if not __user__:
         return json.dumps({'error': 'User context not available'})
 
+    if not __model_knowledge__:
+        return json.dumps({'error': 'No knowledge is attached to this model'})
+
     try:
         from open_webui.models.access_grants import AccessGrants
         from open_webui.models.files import Files
@@ -1967,6 +1988,9 @@ async def grep_knowledge_files(
     if not __user__:
         return json.dumps({'error': 'User context not available'})
 
+    if not __model_knowledge__:
+        return json.dumps({'error': 'No knowledge is attached to this model'})
+
     if not pattern or not pattern.strip():
         return json.dumps({'error': 'Pattern is required'})
 
@@ -2129,6 +2153,9 @@ async def view_file(
     if not __user__:
         return json.dumps({'error': 'User context not available'})
 
+    if not __model_knowledge__:
+        return json.dumps({'error': 'No knowledge is attached to this model'})
+
     # Coerce parameters from LLM tool calls (may come as strings)
     if isinstance(offset, str):
         try:
@@ -2226,6 +2253,7 @@ async def view_knowledge_file(
     end_line: Optional[int] = None,
     __request__: Request = None,
     __user__: dict = None,
+    __model_knowledge__: Optional[list[dict]] = None,
 ) -> str:
     """
     Get the content of a file from a knowledge base. Supports pagination for large files.
@@ -2243,6 +2271,9 @@ async def view_knowledge_file(
 
     if not __user__:
         return json.dumps({'error': 'User context not available'})
+
+    if not __model_knowledge__:
+        return json.dumps({'error': 'No knowledge is attached to this model'})
 
     # Coerce parameters from LLM tool calls (may come as strings)
     if isinstance(offset, str):
@@ -2273,13 +2304,18 @@ async def view_knowledge_file(
         if not file:
             return json.dumps({'error': 'File not found'})
 
-        # Check access via any KB containing this file
+        if not await _has_read_access_to_file(file, user_id, user_role, __model_knowledge__):
+            return json.dumps({'error': 'File not found'})
+
+        attached_kb_ids = {
+            item.get('id') for item in __model_knowledge__ if item.get('type') == 'collection'
+        }
+        # Resolve display metadata only from an attached KB.
         knowledges = await Knowledges.get_knowledges_by_file_id(file_id)
-        has_knowledge_access = False
         knowledge_info = None
 
         for knowledge_base in knowledges:
-            if (
+            if knowledge_base.id in attached_kb_ids and (
                 user_role == 'admin'
                 or knowledge_base.user_id == user_id
                 or await AccessGrants.has_access(
@@ -2290,13 +2326,8 @@ async def view_knowledge_file(
                     user_group_ids=set(user_group_ids),
                 )
             ):
-                has_knowledge_access = True
                 knowledge_info = {'id': knowledge_base.id, 'name': knowledge_base.name}
                 break
-
-        if not has_knowledge_access:
-            if file.user_id != user_id and user_role != 'admin':
-                return json.dumps({'error': 'Access denied'})
 
         content = ''
         if file.data:
@@ -2528,6 +2559,9 @@ async def query_knowledge_files(
 
     if not __user__:
         return json.dumps({'error': 'User context not available'})
+
+    if not __model_knowledge__:
+        return json.dumps({'error': 'No knowledge is attached to this model'})
 
     # Coerce parameters from LLM tool calls (may come as strings)
     if isinstance(count, str):

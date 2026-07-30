@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 ERROR_MESSAGES = {
+    'SCHEMA-SCAN-FAILED': 'Schema 結構同步失敗，請重試；若持續發生請聯繫管理員。',
     'DB-COMPANY-CONTEXT-MISSING': '目前請求缺少企業身分，無法判斷可使用的資料來源。',
     'DB-CONNECTOR-DISABLED': '資料庫連接器不存在或目前已停用。',
     'DB-MODEL-NOT-ALLOWED': '目前模型未獲授權使用這個資料庫連接器。',

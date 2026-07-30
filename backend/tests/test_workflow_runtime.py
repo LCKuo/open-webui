@@ -294,6 +294,88 @@ async def test_knowledge_query_node_uses_the_registered_acl_runtime():
     assert result['outputs'][0]['value']['source'] == 'policy.pdf'
 
 
+@pytest.mark.asyncio
+async def test_web_search_node_uses_secure_runtime_and_preserves_json_output():
+    captured = {}
+
+    async def node_runner(node_type, config, incoming, workflow_input):
+        captured.update(node_type=node_type, data=workflow_input['data'])
+        return {
+            'queries': workflow_input['data']['search_queries'],
+            'results': [{'title': 'Acme', 'url': 'https://acme.example'}],
+        }
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'form_input'}},
+            {'id': 'search', 'data': {'type': 'web_search', 'config': {'max_queries': 3}}},
+            {'id': 'output', 'data': {'type': 'webhook_response'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'search'},
+            {'source': 'search', 'target': 'output'},
+        ],
+    }
+
+    result = await execute_workflow_graph(
+        graph,
+        {'data': {'search_queries': ['custom parts manufacturer Taiwan']}},
+        node_runner=node_runner,
+    )
+
+    assert captured['node_type'] == 'web_search'
+    assert captured['data']['search_queries'] == ['custom parts manufacturer Taiwan']
+    assert result['outputs'][0]['type'] == 'json'
+    assert result['outputs'][0]['value']['results'][0]['title'] == 'Acme'
+
+
+@pytest.mark.asyncio
+async def test_json_parse_accepts_fenced_model_output_and_rejects_invalid_json():
+    async def model_runner(prompt, system_prompt, model_id, parts):
+        return {
+            'text': '```json\n{"version":"1","candidates":[]}\n```',
+            'model_id': model_id,
+            'usage': {},
+        }
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'form_input'}},
+            {'id': 'model', 'data': {'type': 'agent', 'config': {'model_id': 'model-a'}}},
+            {'id': 'parse', 'data': {'type': 'json_parse'}},
+            {'id': 'output', 'data': {'type': 'webhook_response'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'model'},
+            {'source': 'model', 'target': 'parse'},
+            {'source': 'parse', 'target': 'output'},
+        ],
+    }
+
+    result = await execute_workflow_graph(graph, {'data': {}}, model_runner=model_runner)
+    assert result['outputs'][0]['value'] == {'version': '1', 'candidates': []}
+
+    invalid_graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'form_input'}},
+            {
+                'id': 'prompt',
+                'data': {
+                    'type': 'prompt_template',
+                    'config': {'template': 'not json'},
+                },
+            },
+            {'id': 'parse', 'data': {'type': 'json_parse'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'prompt'},
+            {'source': 'prompt', 'target': 'parse'},
+        ],
+    }
+    with pytest.raises(WorkflowRuntimeError, match='valid JSON'):
+        await execute_workflow_graph(invalid_graph, {'message': 'not json'})
+
+
 def test_line_adapter_uses_native_image_and_falls_back_for_files():
     messages = _line_result_messages(
         {

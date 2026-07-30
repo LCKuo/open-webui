@@ -51,6 +51,7 @@ class ServiceEmailConnectorUpsertForm(EmailConnectorUpsertForm):
     companyUserId: str = Field(..., min_length=1, max_length=200)
     companyEmail: str = Field(..., min_length=3, max_length=320)
     actorId: Optional[str] = None
+    controlPlaneRevision: int = Field(default=1, ge=1)
 
 
 class EmailSendRequest(BaseModel):
@@ -212,12 +213,19 @@ def ensure_email_connector_allowed(
 ) -> None:
     if connector.company_user_id != context.get('company_user_id'):
         raise HTTPException(status_code=403, detail='Email connector belongs to another company.')
+    if getattr(connector, 'control_plane_status', 'active') != 'active':
+        raise HTTPException(
+            status_code=409,
+            detail='Email connector is quarantined pending company portal reconciliation.',
+        )
     if not allow_disabled and (not connector.enabled or connector.status not in {'ready', 'error'}):
         raise HTTPException(status_code=409, detail='Email connector is disabled or incomplete.')
     if not allow_disabled and connector.allowed_workflow_ids and workflow_id not in connector.allowed_workflow_ids:
         raise HTTPException(status_code=403, detail='This workflow is not allowed to use the email connector.')
     if not allow_disabled and connector.allowed_channel_ids and channel_id not in connector.allowed_channel_ids:
         raise HTTPException(status_code=403, detail='This channel is not allowed to use the email connector.')
+    if context.get('service_principal'):
+        return
     role = str(context.get('company_member_role') or '').lower()
     member_id = context.get('company_member_id')
     groups = set(context.get('group_ids') or [])
@@ -393,7 +401,10 @@ async def send_resend_email(
 @router.get('/email-connectors', response_model=list[EmailConnectorModel])
 async def list_email_connectors(user=Depends(get_verified_user)):
     context = await _company_context(user)
-    connectors = await InteractEmail.list_connectors(str(context['company_user_id']))
+    connectors = await InteractEmail.list_connectors(
+        str(context['company_user_id']),
+        include_quarantined=False,
+    )
     role = str(context.get('company_member_role') or '').lower()
     if role in {'owner', 'admin'}:
         return connectors
@@ -512,7 +523,7 @@ async def service_list_email_connectors(
     x_interact_service_token: str | None = Header(default=None),
 ):
     _require_service_token(authorization, x_interact_service_token)
-    return await InteractEmail.list_connectors(company_user_id)
+    return await InteractEmail.list_connectors(company_user_id, include_quarantined=True)
 
 
 @router.get('/admin/email-deliveries', response_model=list[EmailDeliveryModel])
@@ -539,19 +550,46 @@ async def service_save_email_connector(
         limit = int((entitlements.get('limits') or {}).get('emailConnectors') or 0)
         current_items = await InteractEmail.list_connectors(form.companyUserId)
         is_new = not any(item.id == form.id for item in current_items)
-        if not entitlements.get('operational') or limit <= 0 or (is_new and len(current_items) >= limit):
+        active_items = [item for item in current_items if item.control_plane_status == 'active']
+        if not entitlements.get('operational') or limit <= 0 or (is_new and len(active_items) >= limit):
             raise HTTPException(status_code=409, detail=f'Email connector plan limit reached ({limit}).')
         if form.daily_send_limit > int((entitlements.get('limits') or {}).get('dailyEmails') or 0):
             raise HTTPException(status_code=400, detail='Daily send limit exceeds the company plan.')
     connector_form = EmailConnectorUpsertForm.model_validate(
-        form.model_dump(exclude={'companyUserId', 'companyEmail', 'actorId'})
+        form.model_dump(
+            exclude={
+                'companyUserId',
+                'companyEmail',
+                'actorId',
+                'controlPlaneRevision',
+            }
+        )
     )
-    return await InteractEmail.upsert_connector(
-        form.companyUserId,
-        str(form.companyEmail),
-        form.actorId or form.companyUserId,
-        connector_form,
-    )
+    try:
+        return await InteractEmail.upsert_connector(
+            form.companyUserId,
+            str(form.companyEmail),
+            form.actorId or form.companyUserId,
+            connector_form,
+            control_plane_revision=form.controlPlaneRevision,
+            managed_by='company_portal',
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post('/admin/email-connectors/{connector_id}/quarantine', response_model=EmailConnectorModel)
+async def service_quarantine_email_connector(
+    connector_id: str,
+    company_user_id: str,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    connector = await InteractEmail.quarantine_connector(connector_id, company_user_id)
+    if not connector:
+        raise HTTPException(status_code=404, detail='Email connector not found.')
+    return connector
 
 
 @router.delete('/admin/email-connectors/{connector_id}')

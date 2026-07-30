@@ -731,6 +731,18 @@ async def update_model_by_id(
 
     model = await Models.update_model_by_id(form_data.id, ModelForm(**form_data.model_dump()), db=db)
     if model:
+        # Rebuild the shared runtime cache so channel traffic cannot continue
+        # using stale prompts, knowledge attachments, or tool settings.
+        from open_webui.utils.models import get_all_models, refresh_runtime_model_cache_entry
+
+        refresh_runtime_model_cache_entry(request, model)
+        try:
+            await get_all_models(request, refresh=True, user=user)
+        except Exception as exc:
+            # The persisted metadata is already overlaid above. A temporary
+            # upstream model-list outage must not turn a successful save into
+            # a misleading client error.
+            log.warning('Model %s saved but full runtime cache rebuild failed: %s', model.id, exc)
         await publish_event(
             request,
             EVENTS.MODEL_UPDATED,

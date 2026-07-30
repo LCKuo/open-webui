@@ -337,6 +337,7 @@ async def create_schema_scan(
         await InteractSemantic.finish_schema_scan(connector_id, success=True)
         return result
     except Exception as error:
+        log.exception('Semantic schema scan failed for connector %s', connector_id)
         safe_error = schema_scan_error(error)
         await InteractSemantic.finish_schema_scan(
             connector_id,

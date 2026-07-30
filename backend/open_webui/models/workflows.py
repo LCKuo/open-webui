@@ -192,12 +192,13 @@ class WorkflowTable:
         user_id: str,
         form: WorkflowForm,
         db: Optional[AsyncSession] = None,
+        workflow_id: Optional[str] = None,
     ) -> WorkflowModel:
         await self.ensure_tables()
         async with get_async_db_context(db) as db:
             now = int(time.time_ns())
             row = Workflow(
-                id=str(uuid4()),
+                id=workflow_id or str(uuid4()),
                 user_id=user_id,
                 name=form.name.strip(),
                 description=form.description,

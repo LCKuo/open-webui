@@ -80,6 +80,25 @@ async def test_delivery_daily_limit_is_reserved_atomically(email_table):
 
 
 @pytest.mark.asyncio
+async def test_delivery_list_can_be_restricted_to_campaign_workflows(email_table):
+    await email_table.create_delivery(**delivery_values())
+    await email_table.create_delivery(
+        **{
+            **delivery_values(),
+            'workflow_id': 'workflow-2',
+            'idempotency_key': 'workflow-run-2-send',
+        }
+    )
+
+    deliveries = await email_table.list_deliveries(
+        'company-1',
+        workflow_ids={'workflow-1'},
+    )
+
+    assert [delivery.workflow_id for delivery in deliveries] == ['workflow-1']
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_revision_advances_across_multiple_pauses(email_table):
     first = await email_table.save_checkpoint(
         workflow_run_id='run-1',
@@ -160,6 +179,115 @@ def test_connector_acl_checks_member_group_workflow_and_channel_together():
     ensure_email_connector_allowed(connector, context, 'workflow-1', 'line-1')
     with pytest.raises(HTTPException):
         ensure_email_connector_allowed(connector, context, 'workflow-1', 'line-2')
+
+
+def test_crm_service_principal_bypasses_seat_acl_but_not_workflow_acl():
+    connector = SimpleNamespace(
+        company_user_id='company-1',
+        enabled=True,
+        status='ready',
+        allowed_workflow_ids=['workflow-1'],
+        allowed_channel_ids=[],
+        access_mode='company_admins',
+        allowed_member_ids=[],
+        allowed_group_ids=[],
+    )
+    context = {
+        'company_user_id': 'company-1',
+        'company_member_id': None,
+        'company_member_role': None,
+        'group_ids': [],
+        'service_principal': True,
+    }
+
+    ensure_email_connector_allowed(connector, context, 'workflow-1', None)
+    with pytest.raises(HTTPException):
+        ensure_email_connector_allowed(connector, context, 'workflow-2', None)
+
+
+def test_quarantined_connector_is_rejected_before_other_acl_checks():
+    connector = SimpleNamespace(
+        company_user_id='company-1',
+        control_plane_status='orphaned',
+        enabled=True,
+        status='ready',
+    )
+    context = {
+        'company_user_id': 'company-1',
+        'company_member_id': 'owner-1',
+        'company_member_role': 'owner',
+        'group_ids': [],
+    }
+
+    with pytest.raises(HTTPException) as exc:
+        ensure_email_connector_allowed(
+            connector,
+            context,
+            workflow_id=None,
+            channel_id=None,
+            allow_disabled=True,
+        )
+
+    assert exc.value.status_code == 409
+    assert 'quarantined' in str(exc.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_control_plane_revision_quarantine_and_adoption_preserve_secret(
+    email_table,
+):
+    initial = email_models.EmailConnectorUpsertForm(
+        id='connector-1',
+        name='Customer mail',
+        enabled=True,
+        api_key='re_test_secret',
+        from_address='support@example.com',
+    )
+    created = await email_table.upsert_connector(
+        'company-1',
+        'owner@example.com',
+        'owner-1',
+        initial,
+        control_plane_revision=3,
+        managed_by='company_portal',
+    )
+    assert created.has_api_key is True
+    assert created.control_plane_revision == 3
+
+    with pytest.raises(ValueError):
+        await email_table.upsert_connector(
+            'company-1',
+            'owner@example.com',
+            'owner-1',
+            initial,
+            control_plane_revision=2,
+            managed_by='company_portal',
+        )
+
+    quarantined = await email_table.quarantine_connector(
+        'connector-1',
+        'company-1',
+    )
+    assert quarantined is not None
+    assert quarantined.enabled is False
+    assert quarantined.control_plane_status == 'orphaned'
+
+    adopted = await email_table.upsert_connector(
+        'company-1',
+        'owner@example.com',
+        'owner-1',
+        email_models.EmailConnectorUpsertForm(
+            id='connector-1',
+            name='Customer mail',
+            enabled=True,
+            from_address='support@example.com',
+        ),
+        control_plane_revision=4,
+        managed_by='company_portal',
+    )
+    assert adopted.has_api_key is True
+    assert adopted.control_plane_status == 'active'
+    assert adopted.control_plane_revision == 4
 
 
 def test_recipient_policy_accepts_legacy_combined_domain_values():

@@ -249,6 +249,9 @@ async def _get_accessible_kb_ids(
     user: dict, model_knowledge: list[dict] | None, knowledge_id: str | None = None
 ) -> list[tuple[str, str, str]]:
     """Get list of (kb_id, kb_name, kb_description) the user can access."""
+    if not model_knowledge:
+        return []
+
     from open_webui.models.access_grants import AccessGrants
     from open_webui.models.groups import Groups
     from open_webui.models.knowledge import Knowledges
@@ -285,20 +288,6 @@ async def _get_accessible_kb_ids(
             kb = await Knowledges.get_knowledge_by_id(kb_id)
             if kb and await _has_access(kb):
                 result.append((kb.id, kb.name, kb.description or ''))
-    elif knowledge_id:
-        kb = await Knowledges.get_knowledge_by_id(knowledge_id)
-        if kb and await _has_access(kb):
-            result.append((kb.id, kb.name, kb.description or ''))
-    else:
-        search = await Knowledges.search_knowledge_bases(
-            user_id,
-            filter={'query': '', 'user_id': user_id, 'group_ids': user_group_ids},
-            skip=0,
-            limit=50,
-        )
-        for kb in search.items:
-            result.append((kb.id, kb.name, kb.description or ''))
-
     return result
 
 

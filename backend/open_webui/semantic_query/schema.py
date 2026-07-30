@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 
 def schema_scan_error(error: Exception) -> SemanticQueryError:
     database_code = _database_error_code(error)
-    code = database_code if database_code in ERROR_MESSAGES else 'QUERY-EXECUTION-FAILED'
+    code = database_code if database_code in ERROR_MESSAGES else 'SCHEMA-SCAN-FAILED'
     return SemanticQueryError(
         code,
         retryable=code in {'DB-CONNECTION-FAILED', 'DB-TIMEOUT'},

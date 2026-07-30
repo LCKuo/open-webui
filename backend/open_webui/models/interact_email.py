@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from open_webui.internal.db import Base, async_engine, get_async_db_context
 from open_webui.utils.oauth import decrypt_data, encrypt_data
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import JSON, BigInteger, Boolean, Column, Index, Integer, Text, delete, func, select
+from sqlalchemy import JSON, BigInteger, Boolean, Column, Index, Integer, Text, delete, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 _tables_ready = False
@@ -78,6 +78,11 @@ class InteractEmailConnector(Base):
     max_recipients_per_send = Column(Integer, nullable=False, default=20)
     last_test_at = Column(BigInteger, nullable=True)
     last_error = Column(Text, nullable=True)
+    managed_by = Column(Text, nullable=False, default='company_portal')
+    control_plane_revision = Column(Integer, nullable=False, default=0)
+    control_plane_status = Column(Text, nullable=False, default='active')
+    quarantined_at = Column(BigInteger, nullable=True)
+    last_control_plane_seen_at = Column(BigInteger, nullable=True)
     created_by = Column(Text, nullable=False)
     updated_by = Column(Text, nullable=False)
     created_at = Column(BigInteger, nullable=False)
@@ -269,6 +274,11 @@ class EmailConnectorModel(BaseModel):
     max_recipients_per_send: int
     last_test_at: Optional[int] = None
     last_error: Optional[str] = None
+    managed_by: str = 'company_portal'
+    control_plane_revision: int = 0
+    control_plane_status: str = 'active'
+    quarantined_at: Optional[int] = None
+    last_control_plane_seen_at: Optional[int] = None
     created_by: str
     updated_by: str
     created_at: int
@@ -329,17 +339,44 @@ class InteractEmailTable:
                 await connection.run_sync(
                     lambda sync_connection: Base.metadata.create_all(sync_connection, tables=tables, checkfirst=True)
                 )
+                await connection.run_sync(self._ensure_control_plane_columns)
             _tables_ready = True
 
-    async def list_connectors(self, company_user_id: str) -> list[EmailConnectorModel]:
+    @staticmethod
+    def _ensure_control_plane_columns(sync_connection) -> None:
+        table = InteractEmailConnector.__table__
+        columns = {
+            column['name'] for column in inspect(sync_connection).get_columns(table.name, schema=table.schema)
+        }
+        additions = {
+            'managed_by': "TEXT NOT NULL DEFAULT 'company_portal'",
+            'control_plane_revision': 'INTEGER NOT NULL DEFAULT 0',
+            'control_plane_status': "TEXT NOT NULL DEFAULT 'active'",
+            'quarantined_at': 'BIGINT',
+            'last_control_plane_seen_at': 'BIGINT',
+        }
+        formatted_table = sync_connection.dialect.identifier_preparer.format_table(table)
+        for name, definition in additions.items():
+            if name not in columns:
+                sync_connection.execute(text(f'ALTER TABLE {formatted_table} ADD COLUMN {name} {definition}'))
+
+    async def list_connectors(
+        self,
+        company_user_id: str,
+        *,
+        include_quarantined: bool = True,
+    ) -> list[EmailConnectorModel]:
         await self.ensure_tables()
         async with get_async_db_context() as db:
+            statement = select(InteractEmailConnector).where(
+                InteractEmailConnector.company_user_id == company_user_id
+            )
+            if not include_quarantined:
+                statement = statement.where(InteractEmailConnector.control_plane_status == 'active')
             rows = (
                 (
                     await db.execute(
-                        select(InteractEmailConnector)
-                        .where(InteractEmailConnector.company_user_id == company_user_id)
-                        .order_by(InteractEmailConnector.updated_at.desc())
+                        statement.order_by(InteractEmailConnector.updated_at.desc())
                     )
                 )
                 .scalars()
@@ -358,12 +395,21 @@ class InteractEmailTable:
         company_email: str,
         actor_id: str,
         form: EmailConnectorUpsertForm,
+        *,
+        control_plane_revision: int | None = None,
+        managed_by: str | None = None,
     ) -> EmailConnectorModel:
         await self.ensure_tables()
         async with get_async_db_context() as db:
             row = await db.get(InteractEmailConnector, form.id) if form.id else None
             if row and row.company_user_id != company_user_id:
                 raise PermissionError('Email connector belongs to another company.')
+            if (
+                row
+                and control_plane_revision is not None
+                and control_plane_revision < int(row.control_plane_revision or 0)
+            ):
+                raise ValueError('Control-plane revision is older than the runtime connector.')
             now = int(time.time_ns())
             if not row:
                 row = InteractEmailConnector(
@@ -384,10 +430,34 @@ class InteractEmailTable:
                 row.key_last4 = form.api_key[-4:]
             if form.webhook_secret:
                 row.webhook_secret_encrypted = _encrypt(form.webhook_secret)
+            if control_plane_revision is not None:
+                row.control_plane_revision = control_plane_revision
+                row.control_plane_status = 'active'
+                row.quarantined_at = None
+                row.last_control_plane_seen_at = now
+            if managed_by:
+                row.managed_by = managed_by
             row.status = (
                 'ready' if row.enabled and row.api_key_encrypted else 'disabled' if not row.enabled else 'unconfigured'
             )
             row.updated_by = actor_id
+            row.updated_at = now
+            await db.commit()
+            await db.refresh(row)
+            return _connector_model(row)
+
+    async def quarantine_connector(self, connector_id: str, company_user_id: str) -> EmailConnectorModel | None:
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            row = await db.get(InteractEmailConnector, connector_id)
+            if not row or row.company_user_id != company_user_id:
+                return None
+            now = int(time.time_ns())
+            row.enabled = False
+            row.status = 'disabled'
+            row.control_plane_status = 'orphaned'
+            row.quarantined_at = row.quarantined_at or now
+            row.last_control_plane_seen_at = now
             row.updated_at = now
             await db.commit()
             await db.refresh(row)
@@ -491,16 +561,27 @@ class InteractEmailTable:
             await db.refresh(row)
             return EmailDeliveryModel.model_validate(row)
 
-    async def list_deliveries(self, company_user_id: str, limit: int = 50) -> list[EmailDeliveryModel]:
+    async def list_deliveries(
+        self,
+        company_user_id: str,
+        limit: int = 50,
+        workflow_ids: set[str] | None = None,
+    ) -> list[EmailDeliveryModel]:
         await self.ensure_tables()
         async with get_async_db_context() as db:
+            statement = select(InteractEmailDelivery).where(
+                InteractEmailDelivery.company_user_id == company_user_id
+            )
+            if workflow_ids:
+                statement = statement.where(
+                    InteractEmailDelivery.workflow_id.in_(workflow_ids)
+                )
             rows = (
                 (
                     await db.execute(
-                        select(InteractEmailDelivery)
-                        .where(InteractEmailDelivery.company_user_id == company_user_id)
+                        statement
                         .order_by(InteractEmailDelivery.created_at.desc())
-                        .limit(max(1, min(limit, 200)))
+                        .limit(max(1, min(limit, 500)))
                     )
                 )
                 .scalars()

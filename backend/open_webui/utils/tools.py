@@ -66,10 +66,8 @@ from open_webui.tools.builtin import (
     kb_exec,
     list_automations,
     list_knowledge,
-    list_knowledge_bases,
     list_memories,
     list_memory_paths,
-    query_knowledge_bases,
     query_knowledge_files,
     read_memory_path,
     replace_memory_content,
@@ -78,7 +76,6 @@ from open_webui.tools.builtin import (
     search_channel_messages,
     search_channels,
     search_chats,
-    search_knowledge_bases,
     search_knowledge_files,
     search_memories,
     search_notes,
@@ -99,6 +96,7 @@ from open_webui.tools.builtin import (
 )
 from open_webui.utils.access_control import has_access, has_connection_access, has_permission
 from open_webui.utils.headers import get_custom_headers, include_user_info_headers
+from open_webui.utils.knowledge_scope import KnowledgeScopeViolation, validate_company_knowledge_scope
 from open_webui.utils.misc import is_string_allowed
 from open_webui.utils.plugin import get_tool_contents_cache, get_tools_cache, load_tool_module_by_id
 from pydantic import BaseModel, Field, create_model
@@ -514,18 +512,27 @@ async def get_builtin_tools(
     if is_builtin_tool_enabled('time'):
         builtin_functions.extend([get_current_timestamp, calculate_timestamp])
 
-    # Knowledge base tools - conditional injection based on model knowledge
-    # If model has attached knowledge (any type), only provide query_knowledge_files
-    # Otherwise, provide all KB browsing tools
+    # Knowledge tools are attached-resource only. An empty selection is a
+    # deliberate deny state, never an instruction to browse everything.
     model_knowledge = model.get('info', {}).get('meta', {}).get('knowledge', [])
     # Merge folder-attached knowledge so builtin tools can search it
     folder_knowledge = extra_params.get('__metadata__', {}).get('folder_knowledge')
     if folder_knowledge:
         model_knowledge = list(model_knowledge or []) + list(folder_knowledge)
+    if getattr(request.state, 'interact_channel_runtime', False):
+        owner_user_id = str(getattr(request.state, 'interact_knowledge_scope_owner_user_id', '') or '')
+        if not owner_user_id:
+            raise KnowledgeScopeViolation('Trusted channel knowledge scope is missing its company owner.')
+        model_knowledge = await validate_company_knowledge_scope(
+            model_knowledge,
+            owner_user_id=owner_user_id,
+        )
     if is_builtin_tool_enabled('knowledge'):
         from open_webui.env import ENABLE_KB_EXEC
 
-        if ENABLE_KB_EXEC:
+        if not model_knowledge:
+            pass
+        elif ENABLE_KB_EXEC:
             builtin_functions.append(kb_exec)
             builtin_functions.append(query_knowledge_files)
             # Notes attached to the model need view_note since kb_exec is file-only
@@ -533,10 +540,7 @@ async def get_builtin_tools(
                 knowledge_types = {item.get('type') for item in model_knowledge}
                 if 'note' in knowledge_types:
                     builtin_functions.append(view_note)
-            if not model_knowledge:
-                builtin_functions.append(query_knowledge_bases)
-                builtin_functions.append(search_knowledge_bases)
-        elif model_knowledge:
+        else:
             builtin_functions.extend(
                 [list_knowledge, search_knowledge_files, grep_knowledge_files, query_knowledge_files]
             )
@@ -546,18 +550,6 @@ async def get_builtin_tools(
                 builtin_functions.extend([view_file, view_knowledge_file])
             if 'note' in knowledge_types:
                 builtin_functions.append(view_note)
-        else:
-            builtin_functions.extend(
-                [
-                    list_knowledge_bases,
-                    search_knowledge_bases,
-                    query_knowledge_bases,
-                    grep_knowledge_files,
-                    search_knowledge_files,
-                    query_knowledge_files,
-                    view_knowledge_file,
-                ]
-            )
 
     # Chats tools - search and fetch user's chat history
     if is_builtin_tool_enabled('chats'):

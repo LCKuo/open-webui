@@ -35,6 +35,7 @@ from open_webui.models.interact_channels import (
 )
 from open_webui.models.interact_data_connectors import InteractDataConnectors
 from open_webui.models.interact_sso import InteractSsoTickets
+from open_webui.models.models import Models
 from open_webui.models.users import Users
 from open_webui.storage.provider import Storage
 from open_webui.tools.interact_database import scan_data_connector_schema
@@ -55,12 +56,21 @@ from open_webui.utils.interact_billing import (
     is_billing_enabled,
     usage_token_counts,
 )
+from open_webui.utils.interact_crm_auth import (
+    CRM_ALLOWED_SCOPES,
+    issue_crm_access_token,
+)
+from open_webui.utils.knowledge_scope import (
+    KnowledgeScopeViolation,
+    channel_knowledge_scope_fingerprint,
+    validate_company_knowledge_scope,
+)
 from open_webui.utils.line_rich_menu import (
     build_line_role_menus,
     parse_line_postback_data,
 )
 from open_webui.utils.misc import get_message_list, validate_email_format
-from open_webui.utils.models import get_all_models
+from open_webui.utils.models import get_all_models, refresh_runtime_model_cache_entry
 from open_webui.utils.workflow_launch import validate_launch_input
 from open_webui.utils.workflows import WorkflowAccessContext
 from pydantic import BaseModel, Field
@@ -685,6 +695,26 @@ class ChannelHealthRequest(BaseModel):
     allowMissingUser: bool = False
 
 
+class CrmTokenRequest(BaseModel):
+    companyEmail: str = Field(..., min_length=3, max_length=320)
+    companyUserId: str = Field(..., min_length=1, max_length=200)
+    crmIntegrationId: str = Field(..., min_length=1, max_length=200)
+    crmInstanceId: str = Field(..., min_length=1, max_length=200)
+    crmInstanceName: str = Field(..., min_length=1, max_length=120)
+    crmUserId: str | None = Field(default=None, max_length=120)
+    scopes: list[str] = Field(default_factory=list, min_length=1, max_length=20)
+    allowedWorkflowIds: list[str] = Field(default_factory=list, max_length=100)
+    ttlSeconds: int = Field(default=300, ge=120, le=600)
+
+
+def _bio_has_exact_marker(bio: str | None, marker: str) -> bool:
+    return marker in {
+        line.strip()
+        for line in str(bio or '').splitlines()
+        if line.strip()
+    }
+
+
 class RichMenuSyncRequest(BaseModel):
     companyEmail: str = Field(..., min_length=3, max_length=320)
     companyUserId: str | None = Field(default=None, max_length=200)
@@ -788,7 +818,13 @@ class DataConnectorLocalCredentialsRequest(BaseModel):
     ssl_mode: Literal['disable', 'prefer', 'require'] | None = None
 
 
-def _stable_channel_chat_id(user_id: str, payload: ChannelChatRequest) -> str:
+def _stable_channel_chat_id(
+    user_id: str,
+    payload: ChannelChatRequest,
+    *,
+    model_id: str | None = None,
+    knowledge_scope_fingerprint: str = '',
+) -> str:
     stable_key = ':'.join(
         [
             'interact-channel',
@@ -796,7 +832,8 @@ def _stable_channel_chat_id(user_id: str, payload: ChannelChatRequest) -> str:
             payload.channelType,
             payload.channelIdentifier,
             payload.conversationId or payload.externalUserId,
-            payload.modelId,
+            model_id or payload.modelId,
+            knowledge_scope_fingerprint,
         ]
     )
     return f'interact-channel-{uuid5(NAMESPACE_URL, stable_key)}'
@@ -816,7 +853,14 @@ def _stable_message_id(chat_id: str, platform_event_id: str, role: str) -> str:
     return str(uuid5(NAMESPACE_URL, f'{chat_id}:{platform_event_id}:{role}'))
 
 
-async def _ensure_channel_chat(user_id: str, chat_id: str, payload: ChannelChatRequest):
+async def _ensure_channel_chat(
+    user_id: str,
+    chat_id: str,
+    payload: ChannelChatRequest,
+    *,
+    model_id: str | None = None,
+    knowledge_scope_fingerprint: str = '',
+):
     chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
     if chat:
         return chat
@@ -830,7 +874,7 @@ async def _ensure_channel_chat(user_id: str, chat_id: str, payload: ChannelChatR
                 chat={
                     'id': chat_id,
                     'title': title,
-                    'models': [payload.modelId],
+                    'models': [model_id or payload.modelId],
                     'history': {
                         'currentId': None,
                         'messages': {},
@@ -844,6 +888,7 @@ async def _ensure_channel_chat(user_id: str, chat_id: str, payload: ChannelChatR
                         'channelIdentifier': payload.channelIdentifier,
                         'externalUserId': payload.externalUserId,
                         'conversationId': payload.conversationId or payload.externalUserId,
+                        'knowledgeScopeFingerprint': knowledge_scope_fingerprint,
                     },
                     'timestamp': int(time.time() * 1000),
                 },
@@ -3866,8 +3911,51 @@ async def channel_chat(  # noqa: C901
                 detail='Configured Open WebUI model was not found.',
             )
 
-    chat_id = _stable_channel_chat_id(user.id, payload)
-    chat = await _ensure_channel_chat(user.id, chat_id, payload)
+    model_info = await Models.get_model_by_id(model_id)
+    if model_info and not model_info.is_active:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Configured Open WebUI model was disabled.')
+    if model_info:
+        runtime_model = refresh_runtime_model_cache_entry(request, model_info)
+        if runtime_model is None:
+            await get_all_models(request, refresh=True, user=user)
+
+    runtime_model = request.app.state.MODELS.get(model_id, {})
+    model_knowledge = (
+        runtime_model.get('info', {}).get('meta', {}).get('knowledge', [])
+        if isinstance(runtime_model, dict)
+        else []
+    )
+    try:
+        await validate_company_knowledge_scope(model_knowledge, owner_user_id=user.id)
+    except KnowledgeScopeViolation as exc:
+        log.warning(
+            'Blocked channel model %s for company user %s: %s',
+            model_id,
+            user.id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Configured model knowledge is outside this company.',
+        ) from exc
+
+    knowledge_scope_fingerprint = channel_knowledge_scope_fingerprint(model_id, model_knowledge)
+    request.state.interact_knowledge_scope_owner_user_id = user.id
+    request.state.interact_knowledge_scope_fingerprint = knowledge_scope_fingerprint
+
+    chat_id = _stable_channel_chat_id(
+        user.id,
+        payload,
+        model_id=model_id,
+        knowledge_scope_fingerprint=knowledge_scope_fingerprint,
+    )
+    chat = await _ensure_channel_chat(
+        user.id,
+        chat_id,
+        payload,
+        model_id=model_id,
+        knowledge_scope_fingerprint=knowledge_scope_fingerprint,
+    )
     if not chat:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Failed to create channel chat.')
 
@@ -3926,6 +4014,7 @@ async def channel_chat(  # noqa: C901
             'modelId': model_id,
             'externalUserId': payload.externalUserId,
             'conversationId': payload.conversationId or payload.externalUserId,
+            'knowledgeScopeFingerprint': knowledge_scope_fingerprint,
             **(
                 {
                     'identitySource': 'line-binding',
@@ -5620,6 +5709,64 @@ async def channel_health(
     }
 
 
+@router.post('/crm/tokens')
+async def issue_crm_token(
+    payload: CrmTokenRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    company_email = payload.companyEmail.strip().lower()
+    user = await Users.get_user_by_email(company_email)
+    company_marker = f'Company user id: {payload.companyUserId}'
+    if not user or not _bio_has_exact_marker(user.bio, company_marker):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Bound Interact Web Ai account was not found.',
+        )
+    if user.role == 'pending':
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Interact Web Ai account is not active.',
+        )
+
+    scopes = sorted(set(payload.scopes) & CRM_ALLOWED_SCOPES)
+    if not scopes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='No permitted CRM Agent scopes were requested.',
+        )
+    token, claims = issue_crm_access_token(
+        company_user_id=payload.companyUserId,
+        company_email=company_email,
+        webui_user_id=user.id,
+        crm_integration_id=payload.crmIntegrationId,
+        crm_instance_id=payload.crmInstanceId,
+        crm_instance_name=payload.crmInstanceName,
+        crm_user_id=payload.crmUserId,
+        scopes=scopes,
+        allowed_workflow_ids=[
+            workflow_id.strip()
+            for workflow_id in payload.allowedWorkflowIds
+            if workflow_id.strip()
+        ],
+        ttl_seconds=payload.ttlSeconds,
+    )
+    expires_at = dt.datetime.fromtimestamp(
+        int(claims['exp']),
+        tz=dt.UTC,
+    ).isoformat()
+    return {
+        'ok': True,
+        'accessToken': token,
+        'tokenType': 'Bearer',
+        'expiresIn': payload.ttlSeconds,
+        'expiresAt': expires_at,
+        'tokenJti': claims.get('jti'),
+        'scopes': scopes,
+    }
+
+
 @router.post('/sso/tickets')
 async def issue_sso_ticket(
     payload: SsoTicketRequest,
@@ -5636,7 +5783,7 @@ async def issue_sso_ticket(
 
     user = await Users.get_user_by_email(payload.email.strip().lower())
     company_marker = f'Company user id: {payload.companyUserId}'
-    if not user or company_marker not in str(user.bio or ''):
+    if not user or not _bio_has_exact_marker(user.bio, company_marker):
         raise HTTPException(status_code=404, detail='Bound Interact Web Ai account was not found.')
     if user.role == 'pending':
         raise HTTPException(status_code=403, detail='Interact Web Ai account is not active.')

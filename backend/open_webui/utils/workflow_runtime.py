@@ -61,8 +61,12 @@ SUPPORTED_RUNTIME_NODE_TYPES = (
         'prompt_template',
         'calculator',
         'transform_json',
+        'json_parse',
         'extract_fields',
         'structured_extract',
+        'web_search',
+        'fetch_url',
+        'prospect_contact_enrichment',
         'knowledge_query',
         'database_query',
         'semantic_query',
@@ -70,9 +74,13 @@ SUPPORTED_RUNTIME_NODE_TYPES = (
         'condition',
         'user_choice',
         'approval_gate',
+        'campaign_approval_gate',
         'email_compose',
+        'email_campaign_compose',
         'email_send',
+        'email_campaign_send',
         'email_delivery_status',
+        'campaign_delivery_summary',
         'email_result',
     }
 )
@@ -208,6 +216,39 @@ def _value_text(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False)
     except TypeError:
         return str(value)
+
+
+def _parse_json_value(value: Any) -> Any:
+    if isinstance(value, dict) and value.get('type') == 'text':
+        value = value.get('text')
+    elif isinstance(value, (dict, list)):
+        return value
+    text = _value_text(value).strip()
+    if not text:
+        raise WorkflowRuntimeError('JSON parser received an empty value.')
+    if len(text) > 1_000_000:
+        raise WorkflowRuntimeError('JSON parser input exceeds the 1 MB limit.')
+    fenced = re.fullmatch(r'```(?:json)?\s*([\s\S]*?)\s*```', text, flags=re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        object_start = text.find('{')
+        object_end = text.rfind('}')
+        array_start = text.find('[')
+        array_end = text.rfind(']')
+        candidates = []
+        if object_start >= 0 and object_end > object_start:
+            candidates.append(text[object_start : object_end + 1])
+        if array_start >= 0 and array_end > array_start:
+            candidates.append(text[array_start : array_end + 1])
+        for candidate in sorted(candidates, key=len, reverse=True):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    raise WorkflowRuntimeError('Model output is not valid JSON.')
 
 
 def _render_template(template: str, workflow_input: dict[str, Any], incoming: Any) -> str:
@@ -462,6 +503,8 @@ async def execute_workflow_graph(
             value = {'type': 'text', 'text': str(_safe_calculate(expression))}
         elif node_type == 'transform_json':
             value = config.get('value', incoming)
+        elif node_type == 'json_parse':
+            value = _parse_json_value(incoming)
         elif node_type == 'extract_fields':
             text = _value_text(incoming)
             fields = config.get('fields') if isinstance(config.get('fields'), list) else []
@@ -521,7 +564,7 @@ async def execute_workflow_graph(
                     'choices': choices,
                 }
                 raise WorkflowPause(node_id, 'input', prompt, checkpoint_state())
-        elif node_type == 'approval_gate':
+        elif node_type in {'approval_gate', 'campaign_approval_gate'}:
             payload_hash = _stable_hash(incoming)
             if resume and str(resume.get('node_id') or '') == node_id:
                 if str(resume.get('decision') or '') != 'approved':
@@ -555,13 +598,18 @@ async def execute_workflow_graph(
                 }
                 raise WorkflowPause(node_id, 'approval', prompt, checkpoint_state(), payload_hash)
         elif node_type in {
+            'web_search',
+            'fetch_url',
+            'prospect_contact_enrichment',
             'knowledge_query',
             'database_query',
             'semantic_query',
             'structured_extract',
             'customer_contact_lookup',
             'email_compose',
+            'email_campaign_compose',
             'email_send',
+            'email_campaign_send',
             'email_delivery_status',
         }:
             if node_runner is None:
@@ -580,6 +628,15 @@ async def execute_workflow_graph(
                 'text': str(config.get('success_text') or '郵件已送出。')
                 if status_value in {'sent', 'delivered', 'opened', 'clicked'}
                 else str(config.get('pending_text') or '郵件已交由寄送服務處理。'),
+                'delivery': delivery,
+            }
+        elif node_type == 'campaign_delivery_summary':
+            delivery = incoming.get('value') if isinstance(incoming, dict) and 'value' in incoming else incoming
+            status_value = delivery.get('status') if isinstance(delivery, dict) else None
+            value = {
+                'type': 'campaign_delivery',
+                'ok': status_value in {'sent', 'delivered', 'opened', 'clicked'},
+                'status': status_value or 'unknown',
                 'delivery': delivery,
             }
         elif node_type in RUNTIME_PASSTHROUGH_TYPES:

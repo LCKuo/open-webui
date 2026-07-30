@@ -239,6 +239,7 @@ from open_webui.utils.models import (
     get_all_base_models,
     get_all_models,
     get_filtered_models,
+    refresh_runtime_model_cache_entry,
 )
 from open_webui.utils.oauth import (
     OAuthClientInformationFull,
@@ -1059,6 +1060,11 @@ async def chat_completion(
 
             model = request.app.state.MODELS[model_id]
             model_info = await Models.get_model_by_id(model_id)
+            if model_info:
+                if not model_info.is_active:
+                    refresh_runtime_model_cache_entry(request, model_info)
+                    raise Exception('Model not found')
+                model = refresh_runtime_model_cache_entry(request, model_info) or model
 
             # Check if user has access to the model
             if not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):

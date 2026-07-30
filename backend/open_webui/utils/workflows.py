@@ -32,6 +32,12 @@ SENSITIVE_NODE_TYPES = {
     'database_query',
     'semantic_query',
     'knowledge_query',
+    'web_search',
+    'fetch_url',
+    'prospect_contact_enrichment',
+    'customer_contact_lookup',
+    'email_send',
+    'email_campaign_send',
     'http_request',
     'mcp_tools',
     'ticket_tool',
@@ -53,6 +59,7 @@ class WorkflowAccessContext:
     group_ids: set[str] = field(default_factory=set)
     channel_id: str | None = None
     model_id: str | None = None
+    service_principal: bool = False
 
     @property
     def is_admin(self) -> bool:

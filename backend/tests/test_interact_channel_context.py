@@ -22,6 +22,7 @@ from open_webui.routers.interact_channels import (
     _line_workflow_menu_requested,
     _line_workflow_postback,
     _prepare_channel_context,
+    _stable_channel_chat_id,
     _process_channel_job,
     _response_content,
     _response_event_content,
@@ -58,6 +59,25 @@ def _messages(count: int, content: str = 'message') -> list[dict]:
         }
         for index in range(count)
     ]
+
+
+def test_channel_chat_id_isolated_when_knowledge_scope_changes():
+    payload = _payload()
+    legacy = _stable_channel_chat_id('user', payload)
+
+    first = _stable_channel_chat_id(
+        'user',
+        payload,
+        knowledge_scope_fingerprint='scope-a',
+    )
+    second = _stable_channel_chat_id(
+        'user',
+        payload,
+        knowledge_scope_fingerprint='scope-b',
+    )
+
+    assert legacy != first
+    assert first != second
 
 
 def _request(
@@ -1543,7 +1563,7 @@ async def test_channel_chat_awaits_model_features(monkeypatch):
     async def get_user(email):
         return user
 
-    async def ensure_chat(*args):
+    async def ensure_chat(*args, **kwargs):
         return chat
 
     async def prepare_context(*args):
@@ -1614,7 +1634,7 @@ async def test_channel_chat_exposes_stored_billing_error_instead_of_fallback(mon
     async def get_user(email):
         return user
 
-    async def ensure_chat(*args):
+    async def ensure_chat(*args, **kwargs):
         return chat
 
     async def prepare_context(*args):

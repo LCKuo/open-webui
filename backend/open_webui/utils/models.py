@@ -383,6 +383,37 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
     return models
 
 
+def refresh_runtime_model_cache_entry(request: Request, model_info) -> dict | None:
+    """Overlay the latest persisted custom-model metadata onto the runtime cache entry."""
+    models = getattr(request.app.state, 'MODELS', None)
+    if models is None:
+        return None
+
+    current = models.get(model_info.id)
+    if not model_info.is_active:
+        if current is not None:
+            del models[model_info.id]
+        return None
+    if current is None:
+        return None
+
+    info = model_info.model_dump()
+    info.pop('params', None)
+    current_info = current.get('info', {}) if isinstance(current, dict) else {}
+    if current_info == info and current.get('name') == model_info.name:
+        return current
+
+    updated = copy.deepcopy(current)
+    updated['name'] = model_info.name
+    updated['info'] = info
+
+    meta = info.get('meta') or {}
+    updated['action_ids'] = list(meta.get('actionIds') or [])
+    updated['filter_ids'] = list(meta.get('filterIds') or [])
+    models[model_info.id] = updated
+    return updated
+
+
 async def check_model_access(user, model, db=None):
     if model.get('arena'):
         meta = model.get('info', {}).get('meta', {})
