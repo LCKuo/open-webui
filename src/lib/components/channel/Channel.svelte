@@ -309,10 +309,10 @@
 					} else {
 						return e.name;
 					}
-				}, '')} • Interact Ai</title
+				}, '')} / Open WebUI</title
 		>
 	{:else}
-		<title>#{channel?.name ?? 'Channel'} • Interact Ai</title>
+		<title>#{channel?.name ?? 'Channel'} / Open WebUI</title>
 	{/if}
 </svelte:head>
 
