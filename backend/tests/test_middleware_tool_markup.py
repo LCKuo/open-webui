@@ -6,6 +6,7 @@ from open_webui.utils.middleware import (
     _extract_legacy_markup_tool_calls,
     _is_builtin_tool_runtime,
     add_file_context,
+    resolve_function_calling_mode,
 )
 
 
@@ -65,6 +66,25 @@ def test_verified_channel_runtime_can_use_builtin_tools_without_browser_session(
     metadata = {'interact_channel': {'source': 'channel'}}
 
     assert _is_builtin_tool_runtime(request, metadata) is True
+
+
+def test_api_key_runtime_can_use_acl_checked_model_tools():
+    request = SimpleNamespace(state=SimpleNamespace(auth_type='api_key'))
+
+    assert _is_builtin_tool_runtime(request, {}) is True
+
+
+@pytest.mark.parametrize(
+    ('requested', 'configured', 'expected'),
+    [
+        ('legacy', 'native', 'legacy'),
+        (None, 'legacy', 'legacy'),
+        ('native', 'legacy', 'native'),
+        (None, None, 'default'),
+    ],
+)
+def test_function_calling_mode_preserves_explicit_model_behavior(requested, configured, expected):
+    assert resolve_function_calling_mode(requested, configured) == expected
 
 
 def test_channel_metadata_cannot_enable_builtin_tools_without_trusted_runtime():

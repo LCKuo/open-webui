@@ -331,11 +331,16 @@
 		const allModels = await fetchAllWorkspaceModels();
 		const modelsToEnable = allModels.filter((m) => !(m.is_active ?? true));
 		if (modelsToEnable.length === 0) return;
-		// Optimistic UI update for current page
-		(models ?? []).forEach((m) => (m.is_active = true));
-		models = models;
-		// Sync with server
-		await Promise.all(modelsToEnable.map((model) => toggleModelById(localStorage.token, model.id)));
+		for (const model of modelsToEnable) {
+			try {
+				await toggleModelById(localStorage.token, model.id);
+			} catch (error) {
+				const message =
+					typeof error === 'string' ? error : String(error?.detail ?? error ?? '模型啟用失敗。');
+				toast.error(message);
+				break;
+			}
+		}
 		await getModelList();
 	};
 
@@ -871,7 +876,18 @@
 														<Switch
 															bind:state={model.is_active}
 															on:change={async () => {
-																toggleModelById(localStorage.token, model.id);
+																const requestedState = model.is_active;
+																try {
+																	await toggleModelById(localStorage.token, model.id);
+																} catch (error) {
+																	model.is_active = !requestedState;
+																	models = models;
+																	const message =
+																		typeof error === 'string'
+																			? error
+																			: String(error?.detail ?? error ?? '模型狀態更新失敗。');
+																	toast.error(message);
+																}
 																_models.set(
 																	await getModels(
 																		localStorage.token,

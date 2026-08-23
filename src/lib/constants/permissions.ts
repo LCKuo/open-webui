@@ -60,7 +60,7 @@ export const DEFAULT_PERMISSIONS = {
 		temporary_enforced: false
 	},
 	features: {
-		api_keys: false,
+		api_keys: true,
 		notes: true,
 		channels: true,
 		folders: true,

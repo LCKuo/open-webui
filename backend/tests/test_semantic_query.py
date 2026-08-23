@@ -15,7 +15,9 @@ from open_webui.semantic_query.service import (
     _enforce_connector_catalog_policy,
     _execute_sync,
     _manifest_score,
+    _manifest_semantic_field,
     _redact_plan,
+    _validate_allowed_filter_values,
     execute_query,
     resolve_row_policies,
     validate_dataset_definition,
@@ -290,6 +292,206 @@ def test_query_plan_normalizes_filter_logic_alias():
 
     assert plan.filters.operator == 'or'
     assert plan.filters.conditions[0].operator == 'starts_with'
+
+
+def test_query_plan_normalizes_json_encoded_tool_containers():
+    plan = QueryPlan.model_validate(
+        {
+            'datasetId': 'prospects',
+            'dimensions': '["candidate.name", "candidate.score"]',
+            'measures': '[]',
+            'metrics': '[]',
+            'filters': {
+                'operator': 'and',
+                'conditions': '[{"fieldId":"candidate.status","operator":"equals","value":"review"}]',
+            },
+            'orderBy': '[{"fieldId":"candidate.score","direction":"desc"}]',
+            'limit': 3,
+        }
+    )
+
+    assert plan.dimensions == ['candidate.name', 'candidate.score']
+    assert plan.measures == []
+    assert plan.filters.conditions[0].operator == 'eq'
+    assert plan.orderBy[0].fieldId == 'candidate.score'
+
+
+def test_query_plan_normalizes_provider_item_wrappers():
+    plan = QueryPlan.model_validate(
+        {
+            'datasetId': 'prospects',
+            'dimensions': {'item': ['candidate.name', 'candidate.score']},
+            'measures': {'item': []},
+            'metrics': {'item': []},
+            'filters': {
+                'operator': 'and',
+                'conditions': {
+                    'item': [
+                        {
+                            'item': {
+                                'fieldId': 'candidate.status',
+                                'operator': 'equals',
+                                'value': 'review',
+                            }
+                        }
+                    ]
+                },
+            },
+            'orderBy': [
+                {
+                    'item': {
+                        'fieldId': 'candidate.score',
+                        'direction': 'desc',
+                    }
+                }
+            ],
+            'limit': 3,
+        }
+    )
+
+    assert plan.dimensions == ['candidate.name', 'candidate.score']
+    assert plan.measures == []
+    assert plan.filters.conditions[0].operator == 'eq'
+    assert plan.orderBy[0].fieldId == 'candidate.score'
+
+
+def test_query_plan_normalizes_provider_version_and_order_direction():
+    plan = QueryPlan.model_validate(
+        {
+            'version': '1.0',
+            'datasetId': 'dataset-1',
+            'dimensions': ['candidate.name'],
+            'orderBy': [
+                {'fieldId': 'candidate.score', 'direction': 'DESC'},
+            ],
+        }
+    )
+
+    assert plan.version == '1'
+    assert plan.orderBy[0].direction == 'desc'
+
+
+def test_query_plan_normalizes_provider_wrapped_filter_values():
+    plan = QueryPlan.model_validate(
+        {
+            'datasetId': 'prospects',
+            'dimensions': ['candidate.name'],
+            'filters': {
+                'conditions': [
+                    {
+                        'fieldId': 'candidate.status',
+                        'operator': 'in',
+                        'value': {'item': ['review', 'approved']},
+                    }
+                ]
+            },
+        }
+    )
+
+    assert plan.filters.conditions[0].value == ['review', 'approved']
+
+
+def test_query_plan_normalizes_provider_single_item_condition():
+    plan = QueryPlan.model_validate(
+        {
+            'datasetId': 'prospects',
+            'dimensions': {'item': ['candidate.name']},
+            'filters': {
+                'operator': 'and',
+                'conditions': {
+                    'item': {
+                        'fieldId': 'candidate.status',
+                        'operator': 'eq',
+                        'value': 'pending_review',
+                    }
+                },
+            },
+            'orderBy': {
+                'item': {
+                    'fieldId': 'candidate.score',
+                    'direction': 'desc',
+                }
+            },
+            'limit': '3',
+        }
+    )
+
+    assert plan.filters.conditions[0].value == 'pending_review'
+    assert plan.orderBy[0].fieldId == 'candidate.score'
+    assert plan.limit == 3
+
+
+def test_query_plan_normalizes_provider_single_item_selection():
+    plan = QueryPlan.model_validate(
+        {
+            'datasetId': 'prospects',
+            'dimensions': {'item': 'candidate.status'},
+            'measures': {'item': 'candidate.count'},
+        }
+    )
+
+    assert plan.dimensions == ['candidate.status']
+    assert plan.measures == ['candidate.count']
+
+
+def test_query_plan_still_rejects_non_json_list_strings():
+    with pytest.raises(ValidationError):
+        QueryPlan.model_validate(
+            {
+                'datasetId': 'prospects',
+                'dimensions': 'candidate.name,candidate.score',
+            }
+        )
+
+
+def test_manifest_exposes_allowed_filter_values():
+    assert _manifest_semantic_field(
+        {
+            'id': 'candidate.status',
+            'name': '狀態',
+            'description': 'new 與 reviewing 都代表等待人工覆核。',
+            'allowedValues': ['new', 'reviewing', 'qualified'],
+        }
+    ) == {
+        'id': 'candidate.status',
+        'name': '狀態',
+        'description': 'new 與 reviewing 都代表等待人工覆核。',
+        'allowedValues': ['new', 'reviewing', 'qualified'],
+    }
+
+
+def test_allowed_filter_values_are_canonicalized_and_unknown_values_rejected():
+    definition = {
+        'dimensions': [
+            {
+                'id': 'candidate.status',
+                'allowedValues': ['new', 'reviewing', 'qualified'],
+            }
+        ]
+    }
+    plan = QueryPlan.model_validate(
+        {
+            'datasetId': 'prospects',
+            'dimensions': ['candidate.name'],
+            'filters': {
+                'conditions': [
+                    {
+                        'fieldId': 'candidate.status',
+                        'operator': 'in',
+                        'value': ['NEW', 'reviewing'],
+                    }
+                ]
+            },
+        }
+    )
+
+    _validate_allowed_filter_values(plan, definition)
+    assert plan.filters.conditions[0].value == ['new', 'reviewing']
+
+    plan.filters.conditions[0].value = ['pending_review']
+    with pytest.raises(SemanticQueryError) as captured:
+        _validate_allowed_filter_values(plan, definition)
+    assert captured.value.code == 'QUERY-FILTER-VALUE-NOT-ALLOWED'
 
 
 def test_redact_plan_masks_values_from_llm_filter_list_shape():

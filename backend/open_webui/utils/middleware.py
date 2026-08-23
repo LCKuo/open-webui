@@ -377,11 +377,14 @@ def _is_builtin_tool_runtime(request: Request, metadata: dict[str, Any]) -> bool
 
     Browser chats are authenticated by their websocket session. External channel
     chats have no browser session, so their router marks the request only after
-    validating the internal service token. Requiring both that trusted marker and
-    channel metadata prevents ordinary API callers from enabling hidden tools by
-    spoofing request fields.
+    validating the internal service token. API-key requests are also trusted here
+    because the public chat route strips caller-supplied tool fields, checks model
+    ACL, and restores only the selected workspace model's server-owned defaults.
     """
     if metadata.get('session_id'):
+        return True
+
+    if getattr(request.state, 'auth_type', None) == 'api_key':
         return True
 
     channel_metadata = metadata.get('interact_channel')
@@ -390,6 +393,14 @@ def _is_builtin_tool_runtime(request: Request, metadata: dict[str, Any]) -> bool
         and isinstance(channel_metadata, dict)
         and channel_metadata.get('source') == 'channel'
     )
+
+
+def resolve_function_calling_mode(requested: Any, configured: Any) -> str:
+    """Preserve supported caller/model modes and fall back predictably."""
+    for value in (requested, configured):
+        if value in {'native', 'legacy'}:
+            return value
+    return 'default'
 
 
 def get_citation_source_from_tool_result(
@@ -2751,12 +2762,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             if note_files:
                 files = [*(files or []), *note_files]
 
+    model_capabilities = model.get('info', {}).get('meta', {}).get('capabilities') or {}
+    builtin_tools_default = getattr(request.state, 'auth_type', None) != 'api_key'
     use_builtin_tools = (
         chat and (chat.meta or {}).get('internal') is True and (chat.meta or {}).get('type') == 'note'
     ) or (
         _is_builtin_tool_runtime(request, metadata)
         and metadata.get('params', {}).get('function_calling') != 'legacy'
-        and (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get('builtin_tools', True)
+        and model_capabilities.get('builtin_tools', builtin_tools_default)
     )
 
     if skill_ids:

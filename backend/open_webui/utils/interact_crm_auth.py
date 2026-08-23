@@ -16,6 +16,10 @@ CRM_ALLOWED_SCOPES = {
     'workflow:preflight',
     'workflow:run',
     'workflow:resume',
+    'channel:list',
+    'channel:manage',
+    'agent:list',
+    'agent:select',
 }
 
 

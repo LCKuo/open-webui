@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import time
+import uuid
 from typing import Optional
+
 from open_webui.env import DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL
 from open_webui.internal.db import Base, JSONField, get_async_db_context
 from open_webui.utils.misc import throttle
@@ -164,6 +167,11 @@ class ApiKeyModel(BaseModel):
     updated_at: int  # timestamp in epoch
 
     model_config = ConfigDict(from_attributes=True)
+
+
+def hash_api_key(api_key: str) -> str:
+    """Return the non-reversible representation stored for new API keys."""
+    return f'sha256:{hashlib.sha256(api_key.encode("utf-8")).hexdigest()}'
 
 
 ####################
@@ -329,13 +337,53 @@ class UsersTable:
         api_key: str,
         db: AsyncSession | None = None,
     ) -> UserModel | None:
-        """Resolve a user from their API key via a JOIN on the api_key table."""
+        """Resolve a user from an API key, including legacy plaintext rows."""
         async with get_async_db_context(db) as session:
+            now_ts = int(time.time())
             result = await session.execute(
-                select(User).join(ApiKey, User.id == ApiKey.user_id).where(ApiKey.key == api_key),
+                select(User, ApiKey)
+                .join(ApiKey, User.id == ApiKey.user_id)
+                .where(
+                    or_(ApiKey.key == hash_api_key(api_key), ApiKey.key == api_key),
+                    or_(ApiKey.expires_at.is_(None), ApiKey.expires_at > now_ts),
+                ),
             )
-            user = result.scalars().first()
-            return UserModel.model_validate(user) if user else None
+            row = result.first()
+            if not row:
+                return None
+
+            user, key_record = row
+            if key_record.key == api_key:
+                key_record.key = hash_api_key(api_key)
+                key_record.data = {
+                    **(key_record.data if isinstance(key_record.data, dict) else {}),
+                    'version': 2,
+                    'name': '舊版 API Key',
+                    'prefix': api_key[:10],
+                    'last_four': api_key[-4:],
+                    'scopes': ['models:read', 'chat:write'],
+                }
+            key_record.last_used_at = now_ts
+            key_record.updated_at = now_ts
+            await session.commit()
+            return UserModel.model_validate(user)
+
+    async def get_api_key_by_token(
+        self,
+        api_key: str,
+        db: AsyncSession | None = None,
+    ) -> ApiKeyModel | None:
+        """Return key metadata for authentication and scope enforcement."""
+        async with get_async_db_context(db) as session:
+            now_ts = int(time.time())
+            result = await session.execute(
+                select(ApiKey).where(
+                    or_(ApiKey.key == hash_api_key(api_key), ApiKey.key == api_key),
+                    or_(ApiKey.expires_at.is_(None), ApiKey.expires_at > now_ts),
+                )
+            )
+            key_record = result.scalars().first()
+            return ApiKeyModel.model_validate(key_record) if key_record else None
 
     async def get_user_by_email(
         self,
@@ -701,17 +749,72 @@ class UsersTable:
 
     async def get_user_api_key_by_id(self, id: str, db: AsyncSession | None = None) -> str | None:
         async with get_async_db_context(db) as session:
-            api_key = (await session.execute(select(ApiKey).where(ApiKey.user_id == id))).scalars().first()
+            api_key = (
+                await session.execute(select(ApiKey).where(ApiKey.id == f'key_{id}', ApiKey.user_id == id))
+            ).scalars().first()
             return api_key.key if api_key else None
+
+    async def get_user_api_keys_by_id(
+        self,
+        user_id: str,
+        db: AsyncSession | None = None,
+    ) -> list[ApiKeyModel]:
+        async with get_async_db_context(db) as session:
+            result = await session.execute(
+                select(ApiKey).where(ApiKey.user_id == user_id).order_by(ApiKey.created_at.desc())
+            )
+            return [ApiKeyModel.model_validate(row) for row in result.scalars().all()]
+
+    async def create_user_api_key(
+        self,
+        user_id: str,
+        api_key: str,
+        data: dict,
+        expires_at: int | None = None,
+        db: AsyncSession | None = None,
+    ) -> ApiKeyModel:
+        async with get_async_db_context(db) as session:
+            now_ts = int(time.time())
+            new_key = ApiKey(
+                id=f'key_{uuid.uuid4().hex}',
+                user_id=user_id,
+                key=hash_api_key(api_key),
+                data=data,
+                expires_at=expires_at,
+                created_at=now_ts,
+                updated_at=now_ts,
+            )
+            session.add(new_key)
+            await session.commit()
+            await session.refresh(new_key)
+            return ApiKeyModel.model_validate(new_key)
+
+    async def delete_user_api_key(
+        self,
+        user_id: str,
+        key_id: str,
+        db: AsyncSession | None = None,
+    ) -> bool:
+        async with get_async_db_context(db) as session:
+            result = await session.execute(delete(ApiKey).where(ApiKey.id == key_id, ApiKey.user_id == user_id))
+            await session.commit()
+            return bool(result.rowcount)
 
     async def update_user_api_key_by_id(self, id: str, api_key: str, db: AsyncSession | None = None) -> bool:
         async with get_async_db_context(db) as session:
-            await session.execute(delete(ApiKey).where(ApiKey.user_id == id))
+            await session.execute(delete(ApiKey).where(ApiKey.id == f'key_{id}', ApiKey.user_id == id))
             now_ts = int(time.time())
             new_key = ApiKey(
                 id=f'key_{id}',
                 user_id=id,
-                key=api_key,
+                key=hash_api_key(api_key),
+                data={
+                    'version': 2,
+                    'name': '舊版 API Key',
+                    'prefix': api_key[:10],
+                    'last_four': api_key[-4:],
+                    'scopes': ['models:read', 'chat:write'],
+                },
                 created_at=now_ts,
                 updated_at=now_ts,
             )
@@ -721,7 +824,7 @@ class UsersTable:
 
     async def delete_user_api_key_by_id(self, id: str, db: AsyncSession | None = None) -> bool:
         async with get_async_db_context(db) as session:
-            await session.execute(delete(ApiKey).where(ApiKey.user_id == id))
+            await session.execute(delete(ApiKey).where(ApiKey.id == f'key_{id}', ApiKey.user_id == id))
             await session.commit()
             return True
 

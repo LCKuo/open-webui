@@ -58,7 +58,10 @@ from open_webui.utils.interact_billing import (
 )
 from open_webui.utils.interact_crm_auth import (
     CRM_ALLOWED_SCOPES,
+    assert_crm_company_context,
+    decode_crm_access_token,
     issue_crm_access_token,
+    require_crm_scope,
 )
 from open_webui.utils.knowledge_scope import (
     KnowledgeScopeViolation,
@@ -73,7 +76,7 @@ from open_webui.utils.misc import get_message_list, validate_email_format
 from open_webui.utils.models import get_all_models, refresh_runtime_model_cache_entry
 from open_webui.utils.workflow_launch import validate_launch_input
 from open_webui.utils.workflows import WorkflowAccessContext
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.exc import IntegrityError
 from starlette.responses import StreamingResponse
 
@@ -280,6 +283,7 @@ async def _process_channel_job(app, worker_id: str, job, lease_seconds: int, max
                     str(payload.get('workflowTrigger') or '') or None,
                     payload.get('workflowData') if isinstance(payload.get('workflowData'), dict) else {},
                     payload.get('companyIdentity') if isinstance(payload.get('companyIdentity'), dict) else None,
+                    str(payload.get('modelId') or '') or None,
                 )
             saved = await InteractChannels.save_job_result(
                 job.id,
@@ -464,6 +468,63 @@ def _public_channel_content(content: str | None) -> str:
     return clean.strip()
 
 
+SEMANTIC_CHANNEL_COMPLETION_INSTRUCTION = (
+    'When the user asks for company or CRM data, complete the entire authorized tool sequence '
+    'in this turn. First call interact_semantic_catalog. If it returns a suitable dataset, '
+    'immediately call interact_semantic_query with only IDs from that catalog, then answer from '
+    'the returned rows. Never stop after the catalog call, announce that you will query later, '
+    'or present a plan as the final answer. If a Query Plan is rejected, correct it at most twice; '
+    'then report the returned stable error without inventing data.'
+)
+
+CRM_AM_ACTION_INSTRUCTION = (
+    'You are the AM Agent. Database and semantic tools are strictly read-only. Your only CRM write '
+    'APIs are interact_crm_follow_up_create and interact_crm_follow_up_update. When the user explicitly '
+    'asks to record a confirmed customer interaction, use interact_crm_follow_up_create. To edit an '
+    'existing follow-up, first read crm_app.ai_follow_ups and its record_version, confirm every replacement '
+    'fact, then use interact_crm_follow_up_update. Never claim a write succeeded unless the API returns '
+    'ok=true. Never use interact_crm_bd_discovery_start or '
+    'interact_crm_bd_profile_suggestion_create, and never write CRM tables directly.'
+)
+
+CRM_BD_ACTION_INSTRUCTION = (
+    'You are the BD Agent. Database and semantic tools are strictly read-only. You may search public '
+    'company websites, directories, exhibitions, registries, and public business contact pages, including '
+    'verifiable corporate phone numbers and email addresses; never guess private personal contact data. '
+    'Your only CRM write APIs are interact_crm_bd_discovery_start and '
+    'interact_crm_bd_profile_suggestion_create. To create actual new public-web candidate work, use '
+    'interact_crm_bd_discovery_start after the user confirms an active target segment and run scope. To '
+    'improve a future search profile, use interact_crm_bd_profile_suggestion_create only with '
+    'human-approved candidate IDs and evidence URLs. It creates a pending suggestion and never applies '
+    'it; tell the user a manager must review it. Never use interact_crm_follow_up_create or '
+    'interact_crm_follow_up_update, and never write CRM tables directly.'
+)
+
+
+def _incomplete_semantic_tool_response(items: Any, content: str) -> bool:
+    if not isinstance(items, list) or not content:
+        return False
+    call_names = {
+        str(item.get('name') or '')
+        for item in items
+        if isinstance(item, dict) and item.get('type') == 'function_call'
+    }
+    if 'interact_semantic_catalog' not in call_names or 'interact_semantic_query' in call_names:
+        return False
+    transitional_patterns = (
+        '我先查詢',
+        '我來查詢',
+        '現在查詢',
+        '接著查詢',
+        '取得正確的欄位',
+        '取得欄位定義',
+        'will query',
+        'query next',
+    )
+    lowered = content.lower()
+    return any(pattern.lower() in lowered for pattern in transitional_patterns)
+
+
 CHANNEL_RUNTIME_ERROR_MESSAGES = {
     'WORKFLOW-QUICK-ACTION-UNAVAILABLE': '這個快速工作流已停用、更新或不再允許此渠道使用，請從最新按鈕重新選擇。',
     'AI-MODEL-NOT-CONFIGURED': '此渠道尚未設定 AI 模型。',
@@ -474,6 +535,7 @@ CHANNEL_RUNTIME_ERROR_MESSAGES = {
     'COMPANY-ACCOUNT-INACTIVE': '企業帳號或方案目前無法使用，請由管理員檢查方案狀態。',
     'COMPANY-TOKEN-BALANCE-INSUFFICIENT': '企業 AI 使用額度不足，請由管理員補充額度。',
     'BILLING-AUTHORIZATION-FAILED': '企業 AI 使用授權失敗，請聯繫管理員。',
+    'AI-UPSTREAM-NO-RESPONSE': 'AI 模型服務未回傳可用內容，請稍後重試或由管理員檢查模型連線。',
     'AI-RUNTIME-FAILED': 'AI 執行服務發生未分類錯誤，請聯繫管理員。',
 }
 
@@ -695,6 +757,11 @@ class ChannelHealthRequest(BaseModel):
     allowMissingUser: bool = False
 
 
+class CompanyModelInventoryRequest(BaseModel):
+    companyUserId: str = Field(..., min_length=1, max_length=200)
+    ownerUserIds: list[str] = Field(default_factory=list, max_length=10_000)
+
+
 class CrmTokenRequest(BaseModel):
     companyEmail: str = Field(..., min_length=3, max_length=320)
     companyUserId: str = Field(..., min_length=1, max_length=200)
@@ -739,6 +806,70 @@ class LineIdentityUnlinkRequest(BaseModel):
     bindingId: str = Field(..., min_length=1, max_length=200)
 
 
+class ChannelQuickActionRequest(BaseModel):
+    id: str = Field(..., min_length=1, max_length=80)
+    label: str = Field(..., min_length=1, max_length=30)
+    description: str = Field(default='', max_length=160)
+    message: str = Field(..., min_length=1, max_length=500)
+
+
+class ChannelAgentBindingRequest(BaseModel):
+    modelId: str = Field(..., min_length=1, max_length=160)
+    label: str = Field(..., min_length=1, max_length=40)
+    role: str = Field(default='general', min_length=1, max_length=40, pattern=r'^[A-Za-z0-9_-]+$')
+    description: str = Field(default='', max_length=240)
+    enabled: bool = True
+    isDefault: bool = False
+    allowedRoles: list[Literal['owner', 'admin', 'member']] = Field(
+        default_factory=lambda: ['owner', 'admin', 'member'],
+        max_length=3,
+    )
+    sourceProductKey: str | None = Field(default=None, max_length=60)
+    quickActions: list[ChannelQuickActionRequest] = Field(default_factory=list, max_length=8)
+
+
+class ChannelProductActionRequest(BaseModel):
+    id: str = Field(..., min_length=1, max_length=80)
+    label: str = Field(..., min_length=1, max_length=30)
+    description: str = Field(default='', max_length=160)
+    kind: Literal['link', 'message'] = 'link'
+    href: str | None = Field(default=None, max_length=700)
+    message: str | None = Field(default=None, max_length=500)
+    agentRole: str | None = Field(default=None, max_length=40, pattern=r'^[A-Za-z0-9_-]+$')
+    allowedRoles: list[Literal['owner', 'admin', 'member']] = Field(
+        default_factory=lambda: ['owner', 'admin', 'member'],
+        max_length=3,
+    )
+
+    @model_validator(mode='after')
+    def validate_action_target(self):
+        if self.kind == 'link' and not str(self.href or '').strip():
+            raise ValueError('Link actions require href.')
+        if self.kind == 'message' and not str(self.message or '').strip():
+            raise ValueError('Message actions require message.')
+        return self
+
+
+class ChannelProductBindingRequest(BaseModel):
+    productKey: str = Field(..., min_length=1, max_length=60)
+    instanceId: str = Field(..., min_length=1, max_length=160)
+    label: str = Field(..., min_length=1, max_length=50)
+    description: str = Field(default='', max_length=200)
+    enabled: bool = True
+    allowedRoles: list[Literal['owner', 'admin', 'member']] = Field(
+        default_factory=lambda: ['owner', 'admin', 'member'],
+        max_length=3,
+    )
+    actions: list[ChannelProductActionRequest] = Field(default_factory=list, max_length=12)
+
+
+class ChannelMenuProfileRequest(BaseModel):
+    title: str = Field(default='AI 工作台', min_length=1, max_length=40)
+    subtitle: str = Field(default='選擇要使用的助手或企業系統', max_length=80)
+    showAgents: bool = True
+    showProducts: bool = True
+
+
 class ChannelSyncRequest(BaseModel):
     companyEmail: str = Field(..., min_length=3, max_length=320)
     companyUserId: str | None = Field(default=None, max_length=200)
@@ -752,6 +883,12 @@ class ChannelSyncRequest(BaseModel):
     channelAccessToken: str | None = Field(default=None, max_length=4000)
     modelId: str | None = Field(default=None, max_length=160)
     fallbackModelId: str | None = Field(default=None, max_length=160)
+    agentBindings: list[ChannelAgentBindingRequest] = Field(default_factory=list, max_length=1)
+    channelMode: Literal['standalone', 'single_product', 'multi_product'] = 'standalone'
+    productRole: str = Field(default='general', min_length=1, max_length=40, pattern=r'^[A-Za-z0-9_-]+$')
+    productBindings: list[ChannelProductBindingRequest] = Field(default_factory=list, max_length=1)
+    menuProfile: ChannelMenuProfileRequest = Field(default_factory=ChannelMenuProfileRequest)
+    liffId: str | None = Field(default=None, max_length=160)
     fallbackMessage: str | None = Field(default=None, max_length=1000)
     rateLimitPerMinute: int = Field(default=60, ge=1, le=10000)
     userRateLimitPerMinute: int = Field(default=5, ge=1, le=120)
@@ -760,6 +897,36 @@ class ChannelSyncRequest(BaseModel):
     dailyBotTokenLimit: int = Field(default=100000, ge=1000, le=10000000)
     richMenuEnabled: bool = False
     richMenuLiffUri: str | None = Field(default=None, max_length=1000)
+
+
+class LiffAgentSessionRequest(BaseModel):
+    channelId: str = Field(..., min_length=1, max_length=200)
+    idToken: str = Field(..., min_length=20, max_length=8000)
+
+
+class LiffAgentSelectRequest(LiffAgentSessionRequest):
+    modelId: str = Field(..., min_length=1, max_length=160)
+
+
+class ChannelHubLiffSessionRequest(LiffAgentSessionRequest):
+    companyUserId: str = Field(..., min_length=1, max_length=200)
+
+
+class ChannelHubLiffSelectRequest(ChannelHubLiffSessionRequest):
+    modelId: str = Field(..., min_length=1, max_length=160)
+
+
+class SystemLineNotificationRequest(BaseModel):
+    companyEmail: str = Field(..., min_length=3, max_length=320)
+    companyUserId: str = Field(..., min_length=1, max_length=200)
+    productRole: Literal['am'] = 'am'
+    message: str = Field(..., min_length=1, max_length=5000)
+    idempotencyKey: str = Field(..., min_length=8, max_length=200)
+    allowedRoles: list[Literal['owner', 'admin', 'member']] = Field(
+        default_factory=lambda: ['owner', 'admin'],
+        min_length=1,
+        max_length=3,
+    )
 
 
 class DataConnectorAllowedChannelRef(BaseModel):
@@ -1460,6 +1627,169 @@ async def _platform_channel(
     return await InteractChannels.get_by_platform(channel_type, channel_identifier)
 
 
+def _enabled_agent_bindings(
+    channel: InteractChannelModel,
+    member_role: str | None = None,
+) -> list[dict[str, Any]]:
+    bindings: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in getattr(channel, 'agent_bindings', []) or []:
+        if not isinstance(raw, dict):
+            continue
+        model_id = str(raw.get('modelId') or '').strip()
+        allowed_roles = {
+            str(role) for role in raw.get('allowedRoles') or ['owner', 'admin', 'member']
+        }
+        if (
+            not model_id
+            or model_id in seen
+            or not bool(raw.get('enabled', True))
+            or (member_role and member_role not in allowed_roles)
+        ):
+            continue
+        seen.add(model_id)
+        bindings.append(
+            {
+                'modelId': model_id,
+                'label': str(raw.get('label') or model_id)[:40],
+                'role': str(raw.get('role') or 'general'),
+                'description': str(raw.get('description') or '')[:240],
+                'isDefault': bool(raw.get('isDefault')),
+                'allowedRoles': sorted(allowed_roles),
+                'sourceProductKey': str(raw.get('sourceProductKey') or '')[:60] or None,
+                'quickActions': [
+                    {
+                        'id': str(action.get('id') or '')[:80],
+                        'label': str(action.get('label') or '')[:30],
+                        'description': str(action.get('description') or '')[:160],
+                        'message': str(action.get('message') or '')[:500],
+                    }
+                    for action in raw.get('quickActions') or []
+                    if isinstance(action, dict)
+                    and str(action.get('id') or '').strip()
+                    and str(action.get('label') or '').strip()
+                    and str(action.get('message') or '').strip()
+                ][:8],
+            }
+        )
+    default = next((binding for binding in bindings if binding['isDefault']), None)
+    return [default or bindings[0]] if bindings else []
+
+
+def _enabled_product_bindings(
+    channel: InteractChannelModel,
+    member_role: str | None = None,
+) -> list[dict[str, Any]]:
+    products: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    product_role = str(getattr(channel, 'product_role', 'general') or 'general')
+    for raw in getattr(channel, 'product_bindings', []) or []:
+        if not isinstance(raw, dict) or not bool(raw.get('enabled', True)):
+            continue
+        product_key = str(raw.get('productKey') or '').strip()
+        instance_id = str(raw.get('instanceId') or '').strip()
+        binding_key = f'{product_key}:{instance_id}'
+        allowed_roles = {
+            str(role) for role in raw.get('allowedRoles') or ['owner', 'admin', 'member']
+        }
+        if (
+            not product_key
+            or not instance_id
+            or binding_key in seen
+            or (member_role and member_role not in allowed_roles)
+        ):
+            continue
+        seen.add(binding_key)
+        actions: list[dict[str, Any]] = []
+        for action in raw.get('actions') or []:
+            if not isinstance(action, dict):
+                continue
+            action_roles = {
+                str(role) for role in action.get('allowedRoles') or ['owner', 'admin', 'member']
+            }
+            if member_role and member_role not in action_roles:
+                continue
+            action_id = str(action.get('id') or '').strip()
+            label = str(action.get('label') or '').strip()
+            agent_role = str(action.get('agentRole') or '').strip()
+            if agent_role and agent_role != product_role:
+                continue
+            if product_role == 'general' and agent_role:
+                continue
+            kind = str(action.get('kind') or 'link').strip().lower()
+            href = str(action.get('href') or '').strip()
+            message = str(action.get('message') or '').strip()
+            if not action_id or not label or kind not in {'link', 'message'}:
+                continue
+            result = {
+                'id': action_id[:80],
+                'label': label[:30],
+                'description': str(action.get('description') or '')[:160],
+                'kind': kind,
+            }
+            if kind == 'link':
+                if not href.startswith('https://'):
+                    continue
+                result['href'] = href[:700]
+            else:
+                if not message:
+                    continue
+                result['message'] = message[:500]
+                if agent_role:
+                    result['agentRole'] = agent_role[:40]
+            actions.append(result)
+        products.append(
+            {
+                'productKey': product_key[:60],
+                'instanceId': instance_id[:160],
+                'label': str(raw.get('label') or product_key)[:50],
+                'description': str(raw.get('description') or '')[:200],
+                'actions': actions[:12],
+            }
+        )
+        break
+    return products
+
+
+def _line_event_requires_identity(
+    channel: InteractChannelModel,
+    event_type: str,
+    postback_name: str,
+) -> bool:
+    protected_actions = {
+        'workflow.run.v1',
+        'workflow.launch.v2',
+        'workflow.resume.v1',
+        'menu.workflows.v1',
+        'menu.workflows.instant.v1',
+        'menu.workflows.guided.v1',
+        'menu.workflows.file.v1',
+        'menu.data.v1',
+        'menu.file.v1',
+        'menu.history.v1',
+        'menu.resync.v1',
+    }
+    if postback_name in protected_actions or postback_name.startswith('menu.workflows'):
+        return True
+    if getattr(channel, 'access_mode', 'company_only') == 'public':
+        return False
+    # Account linking and basic help must remain available before a member is bound.
+    if postback_name in {'menu.account_link.v1', 'menu.account_status.v1', 'menu.help.v1'}:
+        return False
+    return event_type in {'message', 'postback'}
+
+
+async def _selected_channel_model(
+    channel: InteractChannelModel,
+    external_user_id: str,
+    member_role: str | None = None,
+) -> str | None:
+    bindings = _enabled_agent_bindings(channel, member_role)
+    if not bindings:
+        return getattr(channel, 'model_id', None)
+    return str(bindings[0]['modelId'])
+
+
 def _fallback_text(channel: InteractChannelModel) -> str:
     return channel.fallback_message or '目前 AI 助手暫停服務，我們已收到您的訊息，稍後會由專人回覆。'
 
@@ -1508,10 +1838,12 @@ async def _run_channel_message(
     workflow_trigger: str | None = None,
     workflow_data: dict[str, Any] | None = None,
     company_identity: dict[str, Any] | None = None,
+    selected_model_id: str | None = None,
 ) -> dict[str, Any]:
     if channel.reply_mode != 'ai':
         return {'ok': True, 'content': _fallback_text(channel), 'usage': {}}
-    if not channel.model_id:
+    effective_model_id = selected_model_id or channel.model_id
+    if not effective_model_id:
         code = 'AI-MODEL-NOT-CONFIGURED'
         return {
             'ok': False,
@@ -1531,7 +1863,7 @@ async def _run_channel_message(
                 externalUserId=external_user_id,
                 conversationId=conversation_id,
                 platformEventId=platform_event_id,
-                modelId=channel.model_id,
+                modelId=effective_model_id,
                 fallbackModelId=channel.fallback_model_id,
                 message=message,
                 parts=parts or [],
@@ -1664,6 +1996,7 @@ async def _complete_claimed_result(
     workflow_trigger: str | None = None,
     workflow_data: dict[str, Any] | None = None,
     company_identity: dict[str, Any] | None = None,
+    selected_model_id: str | None = None,
 ) -> dict[str, Any]:
     reserved_tokens = _estimated_reservation_tokens(message) if channel.reply_mode == 'ai' else 0
     result = await _run_channel_message(
@@ -1680,6 +2013,7 @@ async def _complete_claimed_result(
         workflow_trigger,
         workflow_data,
         company_identity,
+        selected_model_id,
     )
     outputs = result.get('outputs') if isinstance(result.get('outputs'), list) else []
     content = str(result.get('content') or '').strip()
@@ -2276,6 +2610,8 @@ async def sync_line_rich_menu(channel_id: str, *, force: bool = False) -> dict[s
                     alias_ids=aliases,
                     channel_name=channel.name,
                     portal_base_url=_line_portal_base_url(),
+                    liff_uri=state.liff_uri,
+                    product_role=str(getattr(channel, 'product_role', None) or 'general'),
                 )
             )
         digest = hashlib.sha256()
@@ -3254,11 +3590,13 @@ async def _line_selected_workflow_request(
     channel: InteractChannelModel,
     message: str,
     binding: InteractLineIdentityBindingModel | None = None,
+    model_id: str | None = None,
 ) -> tuple[str, str] | None:
     """Run the deterministic selector in the linked member's ACL context."""
     if not binding or binding.member_status != 'active':
         return None
-    if not channel.enabled or channel.reply_mode != 'ai' or not channel.model_id:
+    effective_model_id = model_id or channel.model_id
+    if not channel.enabled or channel.reply_mode != 'ai' or not effective_model_id:
         return None
     try:
         user = await Users.get_user_by_email(channel.company_email)
@@ -3279,7 +3617,7 @@ async def _line_selected_workflow_request(
                 company_member_role=binding.member_role,
                 group_ids=set(binding.group_ids),
                 channel_id=channel.id,
-                model_id=channel.model_id,
+                model_id=effective_model_id,
             ),
         )
         if selection.decision == 'selected' and selection.selected_workflow_id and selection.selected_version_id:
@@ -3988,6 +4326,20 @@ async def channel_chat(  # noqa: C901
         model_id,
         payload,
     )
+    if (
+        isinstance(runtime_model, dict)
+        and runtime_model.get('info', {}).get('meta', {}).get('builtinTools', {}).get('interact_database') is True
+    ):
+        messages.insert(0, {'role': 'system', 'content': SEMANTIC_CHANNEL_COMPLETION_INSTRUCTION})
+    runtime_builtin_tools = (
+        runtime_model.get('info', {}).get('meta', {}).get('builtinTools', {})
+        if isinstance(runtime_model, dict)
+        else {}
+    )
+    if runtime_builtin_tools.get('crm_am_actions') is True:
+        messages.insert(0, {'role': 'system', 'content': CRM_AM_ACTION_INSTRUCTION})
+    if runtime_builtin_tools.get('crm_bd_actions') is True:
+        messages.insert(0, {'role': 'system', 'content': CRM_BD_ACTION_INSTRUCTION})
 
     form_data = {
         'model': model_id,
@@ -4133,6 +4485,24 @@ async def channel_chat(  # noqa: C901
             or _message_content_from_response(response_data)
         )
     )
+    if _incomplete_semantic_tool_response(assistant_output, content):
+        content = ''
+
+    if not content and not outputs:
+        code = 'AI-UPSTREAM-NO-RESPONSE'
+        return {
+            'ok': False,
+            'chatId': chat_id,
+            'userMessageId': user_message_id,
+            'assistantMessageId': assistant_message_id,
+            'model': model_id,
+            'content': f'{CHANNEL_RUNTIME_ERROR_MESSAGES[code]}（錯誤代碼：{code}）',
+            'outputs': [],
+            'usage': usage,
+            'contextSummaryTokens': context_summary_tokens,
+            'reason': code,
+            'errorCode': code,
+        }
 
     return {
         'ok': True,
@@ -4162,13 +4532,70 @@ async def sync_channel(
     if user.role == 'pending':
         raise HTTPException(status_code=403, detail='Interact Web Ai user is pending approval.')
 
+    normalized_email = payload.companyEmail.strip().lower()
+    requested_company_id = str(payload.companyUserId or '').strip()
+    existing_requested_channel = await InteractChannels.get_by_id(channel_id)
+    if existing_requested_channel and (
+        existing_requested_channel.company_email != normalized_email
+        or (
+            existing_requested_channel.company_user_id
+            and requested_company_id
+            and existing_requested_channel.company_user_id != requested_company_id
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail='The requested channel ID belongs to another company.',
+        )
+
+    agent_bindings = [binding.model_dump() for binding in payload.agentBindings]
+    enabled_bindings = [binding for binding in agent_bindings if binding['enabled']]
+    model_ids = [binding['modelId'] for binding in enabled_bindings]
+    if len(enabled_bindings) != 1:
+        raise HTTPException(status_code=400, detail='A channel must bind exactly one enabled Agent.')
+    if payload.modelId != model_ids[0]:
+        raise HTTPException(status_code=400, detail='The channel model must match its sole Agent binding.')
+    if enabled_bindings[0].get('role') != payload.productRole:
+        raise HTTPException(status_code=400, detail='The channel responsibility must match its Agent role.')
+    enabled_bindings[0]['isDefault'] = True
+    enabled_products = [binding for binding in payload.productBindings if binding.enabled]
+    if payload.channelMode == 'multi_product':
+        raise HTTPException(status_code=400, detail='A channel can bind at most one product.')
+    if payload.productRole == 'general' and (enabled_products or payload.channelMode != 'standalone'):
+        raise HTTPException(status_code=400, detail='General channels cannot include product bindings.')
+    if payload.productRole != 'general' and (
+        len(enabled_products) != 1 or payload.channelMode != 'single_product'
+    ):
+        raise HTTPException(status_code=400, detail='Product channels require exactly one product.')
+    if any(binding.productKey == 'crm' for binding in enabled_products) and payload.productRole not in {
+        'bd',
+        'am',
+    }:
+        raise HTTPException(status_code=400, detail='CRM channels must use the BD or AM responsibility.')
+    if payload.liffId and not re.fullmatch(r'\d{6,20}-[A-Za-z0-9_-]{4,120}', payload.liffId):
+        raise HTTPException(status_code=400, detail='LIFF ID format is invalid.')
+    for model_id in model_ids:
+        model = await Models.get_model_by_id(model_id)
+        if not model or not model.is_active or model.user_id != user.id:
+            raise HTTPException(
+                status_code=403,
+                detail=f'Agent {model_id} is not an active model owned by this company.',
+            )
+
     effective_channel_id = channel_id
     existing_platform_channel = await InteractChannels.get_by_platform(
         payload.channelType,
         payload.channelIdentifier,
     )
     if existing_platform_channel and existing_platform_channel.id != channel_id:
-        if existing_platform_channel.company_email != payload.companyEmail.strip().lower():
+        if (
+            existing_platform_channel.company_email != normalized_email
+            or (
+                existing_platform_channel.company_user_id
+                and requested_company_id
+                and existing_platform_channel.company_user_id != requested_company_id
+            )
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -4202,6 +4629,12 @@ async def sync_channel(
                 'channel_access_token': payload.channelAccessToken,
                 'model_id': payload.modelId,
                 'fallback_model_id': payload.fallbackModelId,
+                'agent_bindings': agent_bindings,
+                'channel_mode': payload.channelMode,
+                'product_role': payload.productRole,
+                'product_bindings': [binding.model_dump() for binding in payload.productBindings],
+                'menu_profile': payload.menuProfile.model_dump(),
+                'liff_id': payload.liffId,
                 'fallback_message': payload.fallbackMessage,
                 'rate_limit_per_minute': payload.rateLimitPerMinute,
                 'user_rate_limit_per_minute': payload.userRateLimitPerMinute,
@@ -4716,6 +5149,57 @@ async def list_line_identities(
     }
 
 
+@router.post('/channels/{channel_id}/system-notifications/line')
+async def send_system_line_notification(
+    channel_id: str,
+    payload: SystemLineNotificationRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    channel = await _require_company_channel(
+        channel_id,
+        payload.companyEmail,
+        payload.companyUserId,
+    )
+    if channel.channel_type != 'line' or channel.product_role != payload.productRole:
+        raise HTTPException(status_code=403, detail='This notification is not allowed for the selected Channel role.')
+    if not channel.enabled:
+        raise HTTPException(status_code=409, detail='The selected LINE Channel is disabled.')
+    bindings = await InteractChannels.list_line_identity_bindings(
+        channel_id=channel_id,
+        company_user_id=payload.companyUserId,
+        reveal_external_user_id=True,
+    )
+    recipients = [
+        binding for binding in bindings
+        if binding.member_status == 'active'
+        and binding.member_role in payload.allowedRoles
+        and binding.external_user_id
+    ]
+    sent = 0
+    failures: list[dict[str, str]] = []
+    for binding in recipients:
+        retry_key = str(uuid5(NAMESPACE_URL, f'{payload.idempotencyKey}:{binding.id}'))
+        try:
+            await _send_line_push(
+                channel,
+                binding.external_user_id,
+                payload.message,
+                retry_key=retry_key,
+            )
+            sent += 1
+        except Exception as error:
+            failures.append({'lineUserRef': binding.line_user_ref, 'error': str(error)[:300]})
+    return {
+        'ok': not failures,
+        'recipientCount': len(recipients),
+        'sentCount': sent,
+        'failedCount': len(failures),
+        'failures': failures,
+    }
+
+
 @router.post('/channels/{channel_id}/line-identities/unlink')
 async def unlink_line_identity(
     channel_id: str,
@@ -4866,18 +5350,10 @@ async def platform_webhook(  # noqa: C901
                 and _line_account_link_requested(str(message.get('text') or ''))
             ):
                 postback_name = 'menu.account_link.v1'
-            identity_required = bool(
-                postback_name.startswith('menu.workflows')
-                or postback_name
-                in {
-                    'workflow.run.v1',
-                    'workflow.launch.v2',
-                    'workflow.resume.v1',
-                    'menu.data.v1',
-                    'menu.file.v1',
-                    'menu.history.v1',
-                    'menu.resync.v1',
-                }
+            identity_required = _line_event_requires_identity(
+                channel,
+                event_type,
+                postback_name,
             )
             identity_binding = (
                 await _line_refresh_identity(
@@ -4887,6 +5363,13 @@ async def platform_webhook(  # noqa: C901
                 )
                 if is_direct_line_chat
                 else None
+            )
+            selected_model_id = await _selected_channel_model(
+                channel,
+                external_user_id,
+                identity_binding.member_role
+                if identity_binding and identity_binding.member_status == 'active'
+                else None,
             )
             workflow_postback = await _line_resolve_workflow_postback(
                 channel,
@@ -5351,6 +5834,7 @@ async def platform_webhook(  # noqa: C901
                             channel,
                             message_text,
                             identity_binding,
+                            selected_model_id,
                         )
                         if selected_workflow:
                             workflow_trigger = f'{channel_type}.message'
@@ -5434,6 +5918,7 @@ async def platform_webhook(  # noqa: C901
                                 'recipientId': line_recipient_id,
                                 'message': execution_message,
                                 'parts': execution_parts,
+                                'modelId': selected_model_id,
                                 **(
                                     {
                                         'companyIdentity': {
@@ -5654,6 +6139,23 @@ async def platform_webhook(  # noqa: C901
     )
 
 
+@router.post('/internal/model-inventory')
+async def company_model_inventory(
+    payload: CompanyModelInventoryRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    owner_user_ids = list(dict.fromkeys(value.strip() for value in payload.ownerUserIds if value.strip()))
+    models = await Models.get_active_workspace_model_inventory_by_user_ids(owner_user_ids)
+    return {
+        'ok': True,
+        'companyUserId': payload.companyUserId,
+        'activeCount': len(models),
+        'models': models,
+    }
+
+
 @router.post('/health')
 async def channel_health(
     payload: ChannelHealthRequest,
@@ -5707,6 +6209,181 @@ async def channel_health(
         'expectedWorkerCount': _channel_worker_expected,
         'queue': queue,
     }
+
+
+def _crm_claims(authorization: str | None, scope: str) -> dict[str, Any]:
+    if not authorization or not authorization.startswith('Bearer '):
+        raise HTTPException(status_code=401, detail='CRM Agent token is required.')
+    claims = decode_crm_access_token(authorization[7:].strip())
+    require_crm_scope(claims, scope)
+    return claims
+
+
+async def _crm_company_user(claims: dict[str, Any]):
+    user = await Users.get_user_by_email(str(claims.get('company_email') or ''))
+    company_user_id = str(claims.get('company_user_id') or '')
+    if (
+        not user
+        or user.role == 'pending'
+        or not _bio_has_exact_marker(user.bio, f'Company user id: {company_user_id}')
+    ):
+        raise HTTPException(status_code=403, detail='The bound company Agent account is unavailable.')
+    assert_crm_company_context(
+        claims,
+        company_email=user.email,
+        company_user_id=company_user_id,
+        webui_user_id=user.id,
+    )
+    return user
+
+
+async def _verified_liff_identity(channel: InteractChannelModel, id_token: str):
+    if channel.channel_type != 'line' or not channel.liff_id:
+        raise HTTPException(status_code=409, detail='This LINE channel has not completed LIFF setup.')
+    client_id = channel.liff_id.split('-', 1)[0]
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            'https://api.line.me/oauth2/v2.1/verify',
+            data={'id_token': id_token, 'client_id': client_id},
+        ) as response:
+            result = await response.json(content_type=None)
+            if response.status != 200 or not isinstance(result, dict) or not result.get('sub'):
+                raise HTTPException(status_code=401, detail='LINE LIFF identity could not be verified.')
+    binding = await InteractChannels.get_line_identity_binding(channel.id, str(result['sub']))
+    if (
+        not binding
+        or binding.member_status != 'active'
+        or binding.company_user_id != channel.company_user_id
+    ):
+        raise HTTPException(status_code=403, detail='This LINE account is not bound to an active company member.')
+    return str(result['sub']), binding
+
+
+@router.get('/crm/channels')
+async def list_crm_channels(authorization: str | None = Header(default=None)):
+    claims = _crm_claims(authorization, 'channel:list')
+    await _crm_company_user(claims)
+    channels = await InteractChannels.list_line_channels_for_company(
+        company_user_id=str(claims['company_user_id']),
+        company_email=str(claims['company_email']),
+    )
+    return {
+        'ok': True,
+        'channels': [
+            {
+                'id': channel.id,
+                'name': channel.name,
+                'channelType': channel.channel_type,
+                'channelIdentifier': channel.channel_identifier,
+                'enabled': channel.enabled,
+                'defaultModelId': channel.model_id,
+                'agentBindings': _enabled_agent_bindings(channel),
+                'productRole': channel.product_role,
+                'liffId': channel.liff_id,
+                'liffReady': bool(channel.liff_id),
+            }
+            for channel in channels
+        ],
+    }
+
+
+@router.post('/crm/liff/agents/session')
+async def liff_agent_session(
+    payload: LiffAgentSessionRequest,
+    authorization: str | None = Header(default=None),
+):
+    claims = _crm_claims(authorization, 'agent:select')
+    await _crm_company_user(claims)
+    channel = await InteractChannels.get_by_id(payload.channelId)
+    if not channel or channel.company_user_id != str(claims['company_user_id']):
+        raise HTTPException(status_code=404, detail='LINE channel was not found for this company.')
+    external_user_id, binding = await _verified_liff_identity(channel, payload.idToken)
+    agents = _enabled_agent_bindings(channel, binding.member_role)
+    selected = await _selected_channel_model(channel, external_user_id, binding.member_role)
+    return {
+        'ok': True,
+        'channel': {'id': channel.id, 'name': channel.name},
+        'member': {'email': binding.member_email, 'role': binding.member_role},
+        'agents': agents,
+        'selectedModelId': selected,
+    }
+
+
+@router.post('/crm/liff/agents/select')
+async def select_liff_agent(
+    payload: LiffAgentSelectRequest,
+    authorization: str | None = Header(default=None),
+):
+    claims = _crm_claims(authorization, 'agent:select')
+    await _crm_company_user(claims)
+    channel = await InteractChannels.get_by_id(payload.channelId)
+    if not channel or channel.company_user_id != str(claims['company_user_id']):
+        raise HTTPException(status_code=404, detail='LINE channel was not found for this company.')
+    _, binding = await _verified_liff_identity(channel, payload.idToken)
+    allowed = {
+        item['modelId'] for item in _enabled_agent_bindings(channel, binding.member_role)
+    }
+    if payload.modelId not in allowed:
+        raise HTTPException(status_code=403, detail='This Agent is not available to the current member.')
+    # Kept for older LIFF clients. A channel now has one fixed Agent, so this
+    # endpoint only confirms that Agent and never stores a per-user override.
+    return {'ok': True, 'selectedModelId': payload.modelId}
+
+
+@router.post('/channel-hub/liff/session')
+async def channel_hub_liff_session(
+    payload: ChannelHubLiffSessionRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    channel = await InteractChannels.get_by_id(payload.channelId)
+    if not channel or channel.company_user_id != payload.companyUserId or not channel.enabled:
+        raise HTTPException(status_code=404, detail='LINE channel was not found for this company.')
+    external_user_id, binding = await _verified_liff_identity(channel, payload.idToken)
+    agents = _enabled_agent_bindings(channel, binding.member_role)
+    selected = await _selected_channel_model(channel, external_user_id, binding.member_role)
+    menu_profile = channel.menu_profile or {}
+    return {
+        'ok': True,
+        'channel': {
+            'id': channel.id,
+            'name': channel.name,
+            'mode': channel.channel_mode or 'standalone',
+            'productRole': channel.product_role or 'general',
+        },
+        'member': {'email': binding.member_email, 'role': binding.member_role},
+        'menuProfile': {
+            'title': str(menu_profile.get('title') or 'AI 工作台')[:40],
+            'subtitle': str(menu_profile.get('subtitle') or '使用此 Bot 的專屬 Agent 與快捷操作')[:80],
+            'showAgents': bool(menu_profile.get('showAgents', True)),
+            'showProducts': bool(menu_profile.get('showProducts', True)),
+        },
+        'agents': agents,
+        'products': _enabled_product_bindings(channel, binding.member_role),
+        'selectedModelId': selected,
+    }
+
+
+@router.post('/channel-hub/liff/select')
+async def channel_hub_select_liff_agent(
+    payload: ChannelHubLiffSelectRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+):
+    _require_service_token(authorization, x_interact_service_token)
+    channel = await InteractChannels.get_by_id(payload.channelId)
+    if not channel or channel.company_user_id != payload.companyUserId or not channel.enabled:
+        raise HTTPException(status_code=404, detail='LINE channel was not found for this company.')
+    _, binding = await _verified_liff_identity(channel, payload.idToken)
+    allowed = {
+        item['modelId'] for item in _enabled_agent_bindings(channel, binding.member_role)
+    }
+    if payload.modelId not in allowed:
+        raise HTTPException(status_code=403, detail='This Agent is not available to the current member.')
+    # Backward-compatible no-op: Agent switching is no longer supported.
+    return {'ok': True, 'selectedModelId': payload.modelId}
 
 
 @router.post('/crm/tokens')

@@ -63,6 +63,12 @@ from open_webui.utils.misc import is_host_allowed
 
 log = logging.getLogger(__name__)
 
+DEFAULT_PUBLIC_WEB_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/140.0.0.0 Safari/537.36 InteractVision/1.0'
+)
+
 
 def resolve_hostname(hostname):
     # Get address information
@@ -769,13 +775,10 @@ class SafeWebBaseLoader(WebBaseLoader):
         super().__init__(*args, **kwargs)
         self.trust_env = trust_env
 
-        # Propagate USER_AGENT env var so that both the sync _scrape() and
-        # async _fetch() paths present a real UA instead of python-requests/2.x
-        # which gets blocked by Cloudflare, Wikipedia, and similar bot-detection.
-        # _fetch() forwards self.session.headers to the aiohttp session, so
-        # setting it here covers both code-paths.
-        if USER_AGENT:
-            self.session.headers['User-Agent'] = USER_AGENT
+        # Both sync and async loaders need a browser-compatible UA. Many public
+        # company sites return a synthetic 403 to python-requests even though
+        # the same public page is available in a normal browser.
+        self.session.headers['User-Agent'] = USER_AGENT or DEFAULT_PUBLIC_WEB_USER_AGENT
 
         # Prevent redirect-based SSRF on the synchronous _scrape() path.
         # validate_url() is called once on the originally-submitted URL, but the

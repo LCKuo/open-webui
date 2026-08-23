@@ -30,6 +30,40 @@ logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 
 
+def serialize_external_api_model(model: dict) -> dict:
+    """Return the model discovery fields external API clients need."""
+    info = model.get('info') if isinstance(model.get('info'), dict) else {}
+    meta = info.get('meta') if isinstance(info.get('meta'), dict) else {}
+    interact = model.get('interact') if isinstance(model.get('interact'), dict) else {}
+
+    result = {
+        'id': model.get('id'),
+        'object': model.get('object', 'model'),
+        'created': model.get('created', 0),
+        'owned_by': model.get('owned_by', 'open-webui'),
+        'name': model.get('name') or model.get('id'),
+        'interact': {
+            'source': interact.get('source'),
+            'owned_by_current_user': bool(interact.get('owned_by_current_user')),
+            'capabilities': dict(interact.get('capabilities') or {}),
+        },
+    }
+
+    description = meta.get('description')
+    if isinstance(description, str) and description.strip():
+        result['description'] = description.strip()
+
+    tags = []
+    for tag in model.get('tags') or []:
+        name = tag.get('name') if isinstance(tag, dict) else None
+        if isinstance(name, str) and name.strip():
+            tags.append({'name': name.strip()})
+    if tags:
+        result['tags'] = tags
+
+    return result
+
+
 async def fetch_ollama_models(request: Request, user: UserModel = None):
     raw_ollama_models = await ollama.get_all_models(request, user=user)
     return [
@@ -516,6 +550,11 @@ async def get_filtered_models(models, user, db=None):
             if info:
                 model_infos[model['id']] = info
 
+        persisted_models = {
+            model.id: model
+            for model in await Models.get_models_by_ids(list(model_infos.keys()), db=db)
+        }
+
         user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id, db=db)}
 
         # Batch-fetch accessible resource IDs in a single query instead of N has_access calls
@@ -542,12 +581,18 @@ async def get_filtered_models(models, user, db=None):
                     filtered_models.append(model)
                 continue
 
-            model_info = model_infos.get(model['id'])
+            model_info = persisted_models.get(model['id'])
             if model_info:
                 if (
                     (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or user.id == model_info.get('user_id')
+                    or user.id == model_info.user_id
                     or model['id'] in accessible_model_ids
+                ) and await has_base_model_access(
+                    user.id,
+                    model_info,
+                    user_role=user.role,
+                    user_group_ids=user_group_ids,
+                    db=db,
                 ):
                     filtered_models.append(model)
             elif user.role == 'admin':

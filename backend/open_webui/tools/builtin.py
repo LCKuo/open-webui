@@ -69,6 +69,12 @@ from open_webui.tools.interact_semantic import (  # noqa: F401 re-exported
     interact_semantic_catalog,
     interact_semantic_query,
 )
+from open_webui.tools.interact_crm_actions import (  # noqa: F401 re-exported
+    interact_crm_bd_discovery_start,
+    interact_crm_bd_profile_suggestion_create,
+    interact_crm_follow_up_create,
+    interact_crm_follow_up_update,
+)
 from open_webui.tools.knowledge_fs import kb_exec  # noqa: F401 — re-exported
 from open_webui.tasks import stop_item_tasks
 from open_webui.events import EVENTS, publish_event

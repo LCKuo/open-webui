@@ -73,6 +73,7 @@ def run_migrations():
         command.upgrade(alembic_cfg, 'head')
     except Exception as e:
         log.exception(f'Error running migrations: {e}')
+        raise RuntimeError('Database migrations failed; refusing to start with an outdated schema') from e
 
 
 if ENABLE_DB_MIGRATIONS:
@@ -1903,7 +1904,7 @@ USER_PERMISSIONS_FEATURES_NOTES = os.getenv('USER_PERMISSIONS_FEATURES_NOTES', '
 
 USER_PERMISSIONS_FEATURES_CHANNELS = os.getenv('USER_PERMISSIONS_FEATURES_CHANNELS', 'True').lower() == 'true'
 
-USER_PERMISSIONS_FEATURES_API_KEYS = os.getenv('USER_PERMISSIONS_FEATURES_API_KEYS', 'False').lower() == 'true'
+USER_PERMISSIONS_FEATURES_API_KEYS = os.getenv('USER_PERMISSIONS_FEATURES_API_KEYS', 'True').lower() == 'true'
 
 USER_PERMISSIONS_FEATURES_MEMORIES = os.getenv('USER_PERMISSIONS_FEATURES_MEMORIES', 'True').lower() == 'true'
 
@@ -2420,7 +2421,7 @@ Responses from models: {{responses}}"""
 # Auth
 ####################################
 
-ENABLE_API_KEYS = os.getenv('ENABLE_API_KEYS', 'False').lower() == 'true'
+ENABLE_API_KEYS = os.getenv('ENABLE_API_KEYS', 'True').lower() == 'true'
 
 ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS = (
     os.getenv(

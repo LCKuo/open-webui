@@ -7,8 +7,8 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Awaitable, Optional, Union
-from urllib.parse import quote
+from typing import Any, Awaitable, Optional, Union
+from urllib.parse import quote, urljoin, urlparse
 
 import aiohttp
 import requests
@@ -33,21 +33,22 @@ from open_webui.env import (
     ENABLE_FORWARD_USER_INFO_HEADERS,
     ENABLE_RETRIEVAL_UNSCOPED_COLLECTIONS,
     OFFLINE_MODE,
+    USER_AGENT,
 )
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.chats import Chats
+from open_webui.models.config import Config
 from open_webui.models.files import Files
 from open_webui.models.folders import Folders
 from open_webui.models.knowledge import Knowledges
 from open_webui.models.notes import Notes
-from open_webui.models.config import Config
 from open_webui.models.users import UserModel
+from open_webui.retrieval.external import retrieve_external_knowledge
 from open_webui.retrieval.loaders.youtube import YoutubeLoader
 from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
-from open_webui.retrieval.external import retrieve_external_knowledge
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 from open_webui.retrieval.vector.main import GetResult, SearchResult
-from open_webui.retrieval.web.utils import get_web_loader
+from open_webui.retrieval.web.utils import DEFAULT_PUBLIC_WEB_USER_AGENT, get_web_loader
 from open_webui.utils.access_control.files import get_owner_accessible_folder_files, has_access_to_file
 from open_webui.utils.access_control.folders import has_folder_access
 from open_webui.utils.headers import include_user_info_headers
@@ -55,8 +56,6 @@ from open_webui.utils.misc import get_content_from_message, get_message_list
 
 log = logging.getLogger(__name__)
 
-
-from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.retrievers import BaseRetriever
@@ -208,6 +207,95 @@ def _is_text_content_type(content_type: str) -> bool:
     return not ct  # empty / missing → assume HTML
 
 
+def _extract_public_links(
+    html_content: str | bytes,
+    base_url: str,
+    max_links: int = 200,
+) -> list[dict[str, str]]:
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html_content, 'html.parser')
+    links: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for anchor in soup.select('a[href], area[href]'):
+        raw_href = str(anchor.get('href') or '').strip()
+        if not raw_href or raw_href.startswith(('#', 'mailto:', 'tel:', 'javascript:', 'data:')):
+            continue
+        absolute_url = urljoin(base_url, raw_href)
+        parsed = urlparse(absolute_url)
+        if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+            continue
+        normalized_url = parsed._replace(fragment='').geturl()
+        if normalized_url in seen:
+            continue
+        seen.add(normalized_url)
+        image = anchor.find('img')
+        label = ' '.join(
+            part
+            for part in (
+                anchor.get_text(' ', strip=True),
+                str(anchor.get('aria-label') or '').strip(),
+                str(anchor.get('title') or '').strip(),
+                str(image.get('alt') or '').strip() if image else '',
+            )
+            if part
+        )
+        links.append({'url': normalized_url, 'text': re.sub(r'\s+', ' ', label)[:160]})
+        if len(links) >= max(1, min(max_links, 500)):
+            break
+    return links
+
+
+def _get_public_page_links_sync(url: str, max_links: int) -> dict[str, Any]:
+    from open_webui.retrieval.web.utils import _SSRFSafeAdapter, validate_url
+
+    current_url = str(url or '').strip()
+    with requests.Session() as session:
+        session.headers['User-Agent'] = USER_AGENT or DEFAULT_PUBLIC_WEB_USER_AGENT
+        session.mount('http://', _SSRFSafeAdapter())
+        session.mount('https://', _SSRFSafeAdapter())
+        for _ in range(5):
+            validate_url(current_url)
+            response = session.get(
+                current_url,
+                stream=True,
+                timeout=20,
+                allow_redirects=False,
+            )
+            try:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = str(response.headers.get('Location') or '').strip()
+                    if not location:
+                        return {'source_url': current_url, 'links': []}
+                    current_url = urljoin(current_url, location)
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get('Content-Type', '').lower()
+                if 'html' not in content_type and 'xhtml' not in content_type:
+                    return {'source_url': current_url, 'links': []}
+                body = bytearray()
+                for chunk in response.iter_content(chunk_size=16_384):
+                    body.extend(chunk)
+                    if len(body) >= 2_000_000:
+                        break
+                html_content = bytes(body[:2_000_000])
+                return {
+                    'source_url': current_url,
+                    'links': _extract_public_links(html_content, current_url, max_links),
+                }
+            finally:
+                response.close()
+    return {'source_url': current_url, 'links': []}
+
+
+async def get_public_page_links(url: str, max_links: int = 200) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _get_public_page_links_sync,
+        url,
+        max(1, min(max_links, 500)),
+    )
+
+
 async def get_content_from_url(request, url: str) -> str:
     loader_config = await get_loader_config()
 
@@ -218,7 +306,7 @@ async def get_content_from_url(request, url: str) -> str:
 
 
 def _get_content_from_url_sync(request, url: str, loader_config):
-    from open_webui.retrieval.web.utils import validate_url, _SSRFSafeAdapter
+    from open_webui.retrieval.web.utils import _SSRFSafeAdapter, validate_url
 
     # Validate URL before making any request (blocks private IPs, non-HTTP, filter list)
     validate_url(url)

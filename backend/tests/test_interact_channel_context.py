@@ -8,6 +8,8 @@ import pytest
 from fastapi import HTTPException
 from open_webui.models.interact_channels import InteractEventClaim
 from open_webui.routers.interact_channels import (
+    CRM_AM_ACTION_INSTRUCTION,
+    CRM_BD_ACTION_INSTRUCTION,
     ChannelChatRequest,
     _channel_output_text,
     _channel_request_messages,
@@ -22,12 +24,12 @@ from open_webui.routers.interact_channels import (
     _line_workflow_menu_requested,
     _line_workflow_postback,
     _prepare_channel_context,
-    _stable_channel_chat_id,
     _process_channel_job,
     _response_content,
     _response_event_content,
     _run_channel_message,
     _should_summarize_context,
+    _stable_channel_chat_id,
     _summary_history_state,
     _usage_tokens,
     channel_chat,
@@ -36,6 +38,22 @@ from open_webui.routers.interact_channels import (
 )
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
+
+
+def test_am_instruction_names_the_only_allowed_crm_write_apis():
+    assert 'interact_crm_follow_up_create' in CRM_AM_ACTION_INSTRUCTION
+    assert 'interact_crm_follow_up_update' in CRM_AM_ACTION_INSTRUCTION
+    assert 'Never use interact_crm_bd_discovery_start' in CRM_AM_ACTION_INSTRUCTION
+    assert 'never write CRM tables directly' in CRM_AM_ACTION_INSTRUCTION
+
+
+def test_bd_instruction_allows_public_business_contacts_but_blocks_am_writes():
+    assert 'public business contact pages' in CRM_BD_ACTION_INSTRUCTION
+    assert 'verifiable corporate phone numbers and email addresses' in CRM_BD_ACTION_INSTRUCTION
+    assert 'interact_crm_bd_discovery_start' in CRM_BD_ACTION_INSTRUCTION
+    assert 'interact_crm_bd_profile_suggestion_create' in CRM_BD_ACTION_INSTRUCTION
+    assert 'Never use interact_crm_follow_up_create' in CRM_BD_ACTION_INSTRUCTION
+    assert 'never write CRM tables directly' in CRM_BD_ACTION_INSTRUCTION
 
 
 def _payload(message: str = 'latest question') -> ChannelChatRequest:
@@ -392,6 +410,15 @@ async def test_enabled_line_webhook_queues_without_waiting_for_model(monkeypatch
         id='channel-id',
         enabled=True,
         reply_mode='ai',
+        access_mode='public',
+        model_id='support-agent',
+        agent_bindings=[{
+            'modelId': 'support-agent',
+            'label': 'Support Agent',
+            'role': 'general',
+            'enabled': True,
+            'isDefault': True,
+        }],
         fallback_message='fallback',
         channel_secret='line-secret',
         channel_access_token='line-access-token',
@@ -463,6 +490,15 @@ async def test_selected_workflow_request_gets_progress_reply(monkeypatch):
         id='channel-id',
         enabled=True,
         reply_mode='ai',
+        access_mode='public',
+        model_id='support-agent',
+        agent_bindings=[{
+            'modelId': 'support-agent',
+            'label': 'Support Agent',
+            'role': 'general',
+            'enabled': True,
+            'isDefault': True,
+        }],
         fallback_message='fallback',
         channel_secret='line-secret',
         channel_access_token='line-access-token',

@@ -20,6 +20,7 @@ ERROR_MESSAGES = {
     'SEMANTIC-MODEL-DRIFT-BLOCKED': '資料庫結構已變更，這個資料集需由管理員重新確認。',
     'ROW-POLICY-CONTEXT-MISSING': '缺少套用資料列權限所需的使用者或渠道資訊。',
     'QUERY-PLAN-INVALID': '查詢計畫格式不正確。',
+    'QUERY-FILTER-VALUE-NOT-ALLOWED': '查詢條件使用了資料集未允許的值，請從欄位 allowedValues 重新選擇。',
     'QUERY-TYPE-MISMATCH': '查詢條件與欄位型別不相容。',
     'QUERY-FANOUT-RISK': '這個跨表聚合可能重複計算資料，已停止執行。',
     'QUERY-COST-LIMIT': '查詢超出允許的複雜度或結果限制。',

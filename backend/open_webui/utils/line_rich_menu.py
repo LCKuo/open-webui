@@ -482,11 +482,21 @@ def _postback_action(label: str, action: str, *, keyboard: bool = False) -> dict
     return result
 
 
+def _message_action(label: str, text: str) -> dict[str, Any]:
+    return {
+        'type': 'message',
+        'label': label[:20],
+        'text': text[:300],
+    }
+
+
 def _role_menu_items(
     audience: str,
     tab: str,
     *,
     portal_base_url: str | None,
+    liff_uri: str | None = None,
+    product_role: str = 'general',
 ) -> list[dict[str, Any]]:
     if audience == 'guest':
         return [
@@ -614,6 +624,130 @@ def _role_menu_items(
             ]
         )
         return items
+
+    role_home: list[dict[str, Any]] = []
+    if liff_uri:
+        role_home.append(
+            {
+                'label': (
+                    'AM 客戶工作台'
+                    if product_role == 'am'
+                    else 'BD 獲客工作台'
+                    if product_role == 'bd'
+                    else 'AI 工作台'
+                ),
+                'icon': 'link',
+                'accent': '#06C755',
+                'action': _uri_action('開啟 AI 工作台', liff_uri),
+            }
+        )
+    if product_role == 'am':
+        return role_home + [
+            {
+                'label': '今日聯絡客戶',
+                'icon': 'history',
+                'accent': '#2563EB',
+                'action': _message_action(
+                    '今日聯絡客戶',
+                    '請依已授權 CRM 資料，整理今天最值得聯絡的客戶，列出回購或流失依據、資料日期、信心與下一步。',
+                ),
+            },
+            {
+                'label': '記錄客戶跟進',
+                'icon': 'form',
+                'accent': '#059669',
+                'action': _message_action(
+                    '記錄客戶跟進',
+                    '我要記錄一筆客戶跟進。請依序詢問公司、聯絡人或商機、方式、實際內容、'
+                    '結果、時間與下一步；確認後使用 CRM 跟進 API 寫入。',
+                ),
+            },
+            {
+                'label': '修正跟進紀錄',
+                'icon': 'refresh',
+                'accent': '#7C3AED',
+                'action': _message_action(
+                    '修正跟進紀錄',
+                    '我要修正既有跟進紀錄。請先讀取最新版與 record_version，逐項確認替換內容，'
+                    '再使用 CRM 跟進修改 API。',
+                ),
+            },
+            {
+                'label': '擬定跟進信',
+                'icon': 'chat',
+                'accent': '#0891B2',
+                'action': _message_action(
+                    '擬定跟進信',
+                    '請根據最近跟進與交易紀錄，找出需要下一封信的客戶並產生專業簡潔草稿；不要直接寄送。',
+                ),
+            },
+            {
+                'label': '公司資料',
+                'icon': 'database',
+                'accent': '#475569',
+                'action': _postback_action('查詢公司資料', 'menu.data.v1', keyboard=True),
+            },
+            {
+                'label': '使用說明',
+                'icon': 'help',
+                'accent': '#EA580C',
+                'action': _postback_action('使用說明', 'menu.help.v1'),
+            },
+        ]
+    if product_role == 'bd':
+        return role_home + [
+            {
+                'label': '執行潛客探索',
+                'icon': 'play',
+                'accent': '#2563EB',
+                'action': _message_action(
+                    '執行潛客探索',
+                    '我要執行新的潛客探索。請先列出可用目標客群，詢問地區、淨新增數量與排除條件；'
+                    '我確認後使用 CRM 探索 API 建立背景任務。',
+                ),
+            },
+            {
+                'label': '分析產品切入點',
+                'icon': 'database',
+                'accent': '#0891B2',
+                'action': _message_action(
+                    '分析產品切入點',
+                    '我要分析一家潛在客戶的產品切入點。請先詢問公司名稱或網站，'
+                    '再依公開證據提出最多 3 個方向並區分事實與假設。',
+                ),
+            },
+            {
+                'label': '改善搜尋輪廓',
+                'icon': 'refresh',
+                'accent': '#7C3AED',
+                'action': _message_action(
+                    '改善搜尋輪廓',
+                    '我要依人工核准的候選公司改善搜尋輪廓。請用公開證據產生建議；'
+                    '確認後用輪廓建議 API 建立待審項目，不要直接套用。',
+                ),
+            },
+            {
+                'label': '待確認名單',
+                'icon': 'user',
+                'accent': '#059669',
+                'action': _message_action(
+                    '待確認名單',
+                    '請列出目前待人工確認的潛在客戶，包含分數、公開來源、聯絡資訊狀態與主要不確定性。',
+                ),
+            },
+            {
+                'label': '自由提問',
+                'icon': 'chat',
+                'accent': '#475569',
+                'action': _postback_action('自由提問', 'menu.ask.v1', keyboard=True),
+            },
+            {
+                'label': '使用說明',
+                'icon': 'help',
+                'accent': '#EA580C',
+                'action': _postback_action('使用說明', 'menu.help.v1'),
+            },
+        ]
 
     return [
         {
@@ -831,6 +965,8 @@ def build_line_role_menus(
     alias_ids: dict[str, str],
     channel_name: str,
     portal_base_url: str | None = None,
+    liff_uri: str | None = None,
+    product_role: str = 'general',
 ) -> list[LineRoleMenuArtifact]:
     if audience not in _ROLE_TABS:
         raise ValueError('Unsupported LINE Rich Menu audience.')
@@ -841,7 +977,13 @@ def build_line_role_menus(
         alias_id = alias_ids.get(tab)
         if not alias_id:
             raise ValueError(f'Missing Rich Menu alias for {audience}:{tab}.')
-        items = _role_menu_items(audience, tab, portal_base_url=portal_base_url)
+        items = _role_menu_items(
+            audience,
+            tab,
+            portal_base_url=portal_base_url,
+            liff_uri=liff_uri,
+            product_role=product_role,
+        )
         image_bytes = _role_menu_image(audience, tab, tabs, items)
         areas: list[dict[str, Any]] = []
         if audience == 'guest':

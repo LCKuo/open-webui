@@ -34,6 +34,7 @@ _job_claim_lock = asyncio.Lock()
 _event_claim_lock = asyncio.Lock()
 _workflow_session_lock = asyncio.Lock()
 _line_identity_lock = asyncio.Lock()
+_line_agent_preference_lock = asyncio.Lock()
 LINE_IDENTITY_LINK_RETENTION_SECONDS = 24 * 60 * 60
 
 
@@ -53,6 +54,12 @@ class InteractChannel(Base):
     channel_access_token = Column(Text, nullable=True)
     model_id = Column(Text, nullable=True)
     fallback_model_id = Column(Text, nullable=True)
+    agent_bindings_json = Column(Text, nullable=False, default='[]')
+    channel_mode = Column(Text, nullable=False, default='standalone')
+    product_role = Column(Text, nullable=False, default='general')
+    product_bindings_json = Column(Text, nullable=False, default='[]')
+    menu_profile_json = Column(Text, nullable=False, default='{}')
+    liff_id = Column(Text, nullable=True)
     fallback_message = Column(Text, nullable=True)
     rate_limit_per_minute = Column(Integer, nullable=False, default=60)
     user_rate_limit_per_minute = Column(Integer, nullable=False, default=5)
@@ -215,6 +222,25 @@ class InteractLineIdentityBinding(Base):
     )
 
 
+class InteractLineAgentPreference(Base):
+    __tablename__ = 'interact_line_agent_preference'
+
+    id = Column(Text, primary_key=True)
+    channel_id = Column(Text, nullable=False)
+    external_user_hash = Column(Text, nullable=False)
+    model_id = Column(Text, nullable=False)
+    updated_at = Column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'channel_id',
+            'external_user_hash',
+            name='uq_interact_line_agent_preference_user',
+        ),
+        Index('ix_interact_line_agent_preference_channel', 'channel_id', 'model_id'),
+    )
+
+
 class InteractChannelRichMenuVariant(Base):
     __tablename__ = 'interact_channel_rich_menu_variant'
 
@@ -253,6 +279,12 @@ class InteractChannelModel(BaseModel):
     channel_access_token: str | None = None
     model_id: str | None = None
     fallback_model_id: str | None = None
+    agent_bindings: list[dict[str, Any]] = Field(default_factory=list)
+    channel_mode: str = 'standalone'
+    product_role: str = 'general'
+    product_bindings: list[dict[str, Any]] = Field(default_factory=list)
+    menu_profile: dict[str, Any] = Field(default_factory=dict)
+    liff_id: str | None = None
     fallback_message: str | None = None
     rate_limit_per_minute: int
     user_rate_limit_per_minute: int = 5
@@ -393,6 +425,7 @@ class InteractChannelsTable:
                             InteractChannelWorkflowSession.__table__,
                             InteractLineIdentityLink.__table__,
                             InteractLineIdentityBinding.__table__,
+                            InteractLineAgentPreference.__table__,
                             InteractChannelRichMenuVariant.__table__,
                         ],
                         checkfirst=True,
@@ -408,6 +441,12 @@ class InteractChannelsTable:
                 'company_user_id': 'TEXT',
                 'user_rate_limit_per_minute': 'INTEGER NOT NULL DEFAULT 5',
                 'max_concurrent_jobs': 'INTEGER NOT NULL DEFAULT 8',
+                'agent_bindings_json': "TEXT NOT NULL DEFAULT '[]'",
+                'channel_mode': "TEXT NOT NULL DEFAULT 'standalone'",
+                'product_role': "TEXT NOT NULL DEFAULT 'general'",
+                'product_bindings_json': "TEXT NOT NULL DEFAULT '[]'",
+                'menu_profile_json': "TEXT NOT NULL DEFAULT '{}'",
+                'liff_id': 'TEXT',
             },
             InteractChannelEvent.__table__: {
                 'quota_exempt': 'BOOLEAN NOT NULL DEFAULT FALSE',
@@ -434,6 +473,21 @@ class InteractChannelsTable:
         model = InteractChannelModel.model_validate(row)
         model.channel_secret = _decrypt_secret(row.channel_secret)
         model.channel_access_token = _decrypt_secret(row.channel_access_token)
+        try:
+            bindings = json.loads(row.agent_bindings_json or '[]')
+        except json.JSONDecodeError:
+            bindings = []
+        model.agent_bindings = bindings if isinstance(bindings, list) else []
+        try:
+            product_bindings = json.loads(row.product_bindings_json or '[]')
+        except json.JSONDecodeError:
+            product_bindings = []
+        try:
+            menu_profile = json.loads(row.menu_profile_json or '{}')
+        except json.JSONDecodeError:
+            menu_profile = {}
+        model.product_bindings = product_bindings if isinstance(product_bindings, list) else []
+        model.menu_profile = menu_profile if isinstance(menu_profile, dict) else {}
         return model
 
     @staticmethod
@@ -542,6 +596,24 @@ class InteractChannelsTable:
             row.channel_access_token = _encrypt_secret(data.get('channel_access_token'))
             row.model_id = data.get('model_id')
             row.fallback_model_id = data.get('fallback_model_id')
+            row.agent_bindings_json = json.dumps(
+                data.get('agent_bindings') or [],
+                ensure_ascii=False,
+                separators=(',', ':'),
+            )
+            row.channel_mode = data.get('channel_mode') or 'standalone'
+            row.product_role = data.get('product_role') or 'general'
+            row.product_bindings_json = json.dumps(
+                data.get('product_bindings') or [],
+                ensure_ascii=False,
+                separators=(',', ':'),
+            )
+            row.menu_profile_json = json.dumps(
+                data.get('menu_profile') or {},
+                ensure_ascii=False,
+                separators=(',', ':'),
+            )
+            row.liff_id = data.get('liff_id')
             row.fallback_message = data.get('fallback_message')
             row.rate_limit_per_minute = data['rate_limit_per_minute']
             row.user_rate_limit_per_minute = data['user_rate_limit_per_minute']
@@ -552,6 +624,59 @@ class InteractChannelsTable:
             await db.commit()
             await db.refresh(row)
             return self._model(row)
+
+    async def get_line_agent_preference(
+        self,
+        channel_id: str,
+        external_user_id: str,
+    ) -> str | None:
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            row = (
+                await db.execute(
+                    select(InteractLineAgentPreference).where(
+                        InteractLineAgentPreference.channel_id == channel_id,
+                        InteractLineAgentPreference.external_user_hash
+                        == line_identity_hash(channel_id, external_user_id),
+                    )
+                )
+            ).scalar_one_or_none()
+            return row.model_id if row else None
+
+    async def set_line_agent_preference(
+        self,
+        channel_id: str,
+        external_user_id: str,
+        model_id: str,
+    ) -> str:
+        await self.ensure_tables()
+        user_hash = line_identity_hash(channel_id, external_user_id)
+        now = int(time.time())
+        async with _line_agent_preference_lock:
+            async with get_async_db_context() as db:
+                row = (
+                    await db.execute(
+                        select(InteractLineAgentPreference).where(
+                            InteractLineAgentPreference.channel_id == channel_id,
+                            InteractLineAgentPreference.external_user_hash == user_hash,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if row:
+                    row.model_id = model_id
+                    row.updated_at = now
+                else:
+                    db.add(
+                        InteractLineAgentPreference(
+                            id=str(uuid4()),
+                            channel_id=channel_id,
+                            external_user_hash=user_hash,
+                            model_id=model_id,
+                            updated_at=now,
+                        )
+                    )
+                await db.commit()
+        return model_id
 
     async def rekey(self, old_id: str, new_id: str) -> bool:
         if old_id == new_id:

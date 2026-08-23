@@ -20,7 +20,6 @@ from open_webui.config import (
     OAUTH_PROVIDERS,
 )
 from open_webui.constants import ERROR_MESSAGES
-from open_webui.events import EVENTS, publish_event
 from open_webui.env import (
     AIOHTTP_CLIENT_SESSION_SSL,
     ENABLE_INITIAL_ADMIN_SIGNUP,
@@ -37,6 +36,7 @@ from open_webui.env import (
     WEBUI_AUTH_TRUSTED_NAME_HEADER,
     WEBUI_AUTH_TRUSTED_ROLE_HEADER,
 )
+from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
 from open_webui.models.auths import (
     AddUserForm,
@@ -77,7 +77,7 @@ from open_webui.utils.groups import apply_default_group_assignment
 from open_webui.utils.misc import parse_duration, validate_email_format
 from open_webui.utils.rate_limit import RateLimiter
 from open_webui.utils.redis import get_redis_client
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1453,9 +1453,17 @@ async def update_oauth_config(request: Request, form_data: OAuthConfigForm, user
 
 
 async def _check_api_key_permission(request: Request, user, db: AsyncSession):
-    if not await Config.get('auth.enable_api_keys') or (
-        user.role != 'admin'
-        and not await has_permission(user.id, 'features.api_keys', await Config.get('user.permissions'), db=db)
+    if not await Config.get('auth.enable_api_keys'):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.API_KEY_CREATION_NOT_ALLOWED,
+        )
+
+    if user.role != 'admin' and not await has_permission(
+        user.id,
+        'features.api_keys',
+        await Config.get('user.permissions') or {},
+        db=db,
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -1463,29 +1471,256 @@ async def _check_api_key_permission(request: Request, user, db: AsyncSession):
         )
 
 
-# create api key
+API_KEY_SCOPES = ['models:read', 'chat:write']
+MAX_API_KEYS_PER_USER = 10
+
+
+class ApiKeyCreateForm(BaseModel):
+    name: str = Field(default='我的應用程式', min_length=1, max_length=80)
+    expires_in_days: int | None = 90
+
+    @field_validator('name')
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError('API Key 名稱不可為空白。')
+        return value
+
+    @field_validator('expires_in_days')
+    @classmethod
+    def validate_expiry(cls, value: int | None) -> int | None:
+        if value not in {None, 30, 90, 365}:
+            raise ValueError('到期日僅支援 30、90、365 天或永不到期。')
+        return value
+
+
+class ApiKeySummary(BaseModel):
+    id: str
+    name: str
+    prefix: str
+    last_four: str
+    scopes: list[str]
+    expires_at: int | None
+    last_used_at: int | None
+    created_at: int
+
+
+class ApiKeyCreated(ApiKeySummary):
+    api_key: str
+
+
+def _api_key_summary(record) -> dict:
+    data = record.data if isinstance(record.data, dict) else {}
+    stored_key = record.key or ''
+    is_legacy_plaintext = stored_key.startswith('sk-')
+    return {
+        'id': record.id,
+        'name': str(data.get('name') or '舊版 API Key'),
+        'prefix': str(data.get('prefix') or (stored_key[:7] if is_legacy_plaintext else 'sk-legacy')),
+        'last_four': str(data.get('last_four') or (stored_key[-4:] if is_legacy_plaintext else '----')),
+        'scopes': list(data.get('scopes') or API_KEY_SCOPES),
+        'expires_at': record.expires_at,
+        'last_used_at': record.last_used_at,
+        'created_at': record.created_at,
+    }
+
+
+async def _create_user_api_key(user, form_data: ApiKeyCreateForm, db: AsyncSession) -> dict:
+    existing = await Users.get_user_api_keys_by_id(user.id, db=db)
+    now_ts = int(time.time())
+    active_keys = [record for record in existing if record.expires_at is None or record.expires_at > now_ts]
+    if len(active_keys) >= MAX_API_KEYS_PER_USER:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f'每個帳號最多可建立 {MAX_API_KEYS_PER_USER} 把 API Key，請先撤銷不再使用的金鑰。',
+        )
+
+    api_key = create_api_key()
+    expires_at = now_ts + form_data.expires_in_days * 86400 if form_data.expires_in_days is not None else None
+    record = await Users.create_user_api_key(
+        user.id,
+        api_key,
+        {
+            'version': 2,
+            'name': form_data.name,
+            'prefix': api_key[:10],
+            'last_four': api_key[-4:],
+            'scopes': API_KEY_SCOPES,
+        },
+        expires_at=expires_at,
+        db=db,
+    )
+    return {**_api_key_summary(record), 'api_key': api_key}
+
+
+def build_api_tour(base_url: str) -> str:
+    api_base_url = f'{base_url.rstrip("/")}/api/v1'
+    return f"""# Interact Web Ai API 串接 Tour
+
+這份指南說明如何使用個人 API Key 呼叫您有權使用的模型。
+
+## 1. 安全保存 API Key
+
+API Key 只會在建立時顯示一次。請存入伺服器端環境變數，不要放在瀏覽器、App 原始碼或 Git 儲存庫。
+
+```bash
+export INTERACT_API_KEY="sk-請貼上建立時取得的金鑰"
+```
+
+API Base URL：`{api_base_url}`
+
+## 2. 取得可用模型
+
+```bash
+curl "{api_base_url}/models" \\
+  -H "Authorization: Bearer $INTERACT_API_KEY"
+```
+
+回傳內容包含：
+
+- `interact.source = workspace`：您的工作區模型，呼叫時會自動套用該模型已設定的提示詞、知識庫、工具、技能、篩選器與可在 API 執行的預設能力。
+- `interact.source = enterprise_base`：企業目前授權給您的原始模型。
+- `interact.capabilities`：這個 Key 經 API 呼叫時實際可自動套用的能力摘要。
+
+請永遠使用清單實際回傳的 `id`，不要在程式中猜測或寫死供應商模型名稱。
+
+API 呼叫不能自行指定 WebUI 內部工具、工作流、渠道、檔案或終端；只有模型本身已配置且此帳號仍有權存取的能力會由伺服器套用。需要瀏覽器互動的檔案上傳與程式碼直譯器不會自動啟用。
+
+## 3. 呼叫聊天 API
+
+```bash
+curl "{api_base_url}/chat/completions" \\
+  -H "Authorization: Bearer $INTERACT_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{{
+    "model": "從-models-回傳值選擇",
+    "messages": [{{"role": "user", "content": "請介紹公司的核心服務"}}],
+    "stream": false
+  }}'
+```
+
+Python（OpenAI SDK）：
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["INTERACT_API_KEY"],
+    base_url="{api_base_url}",
+)
+
+models = client.models.list()
+response = client.chat.completions.create(
+    model=models.data[0].id,
+    messages=[{{"role": "user", "content": "請介紹公司的核心服務"}}],
+)
+print(response.choices[0].message.content)
+```
+
+## 4. 權限與計費
+
+- API 使用者只會看到此帳號本身可存取的工作區模型與企業原始模型；模型停用或 ACL 收回後會立即不可用。
+- 外部 API 推論會依企業方案與實際使用量扣除主站台企業 Token。
+- HTTP `401`：金鑰錯誤、過期或已撤銷。
+- HTTP `403`：端點或模型不在此金鑰／帳號權限內。
+- HTTP `402`：企業 Token 不足或企業計費帳號不可用。
+
+## 5. 維運建議
+
+- 每個系統建立不同名稱的 Key，便於辨識與個別撤銷。
+- 正式服務建議設定 90 天到期並在到期前輪替。
+- 若疑似外洩，立即在 WebUI「設定 → 帳號 → API 存取」撤銷該 Key。
+"""
+
+
+@router.get('/api_keys', response_model=list[ApiKeySummary])
+async def list_api_keys(
+    request: Request, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
+    await _check_api_key_permission(request, user, db)
+    records = await Users.get_user_api_keys_by_id(user.id, db=db)
+    return [_api_key_summary(record) for record in records]
+
+
+@router.post('/api_keys', response_model=ApiKeyCreated)
+async def create_user_api_key(
+    request: Request,
+    form_data: ApiKeyCreateForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    await _check_api_key_permission(request, user, db)
+    created = await _create_user_api_key(user, form_data, db)
+    await publish_event(
+        request,
+        EVENTS.AUTH_API_KEY_CREATED,
+        actor=user,
+        subject_id=created['id'],
+        subject_type='api_key',
+        data={'name': created['name'], 'scopes': created['scopes']},
+    )
+    return created
+
+
+@router.get('/api_keys/tour.md')
+async def download_api_tour(
+    request: Request, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
+    await _check_api_key_permission(request, user, db)
+    configured_base_url = await Config.get('webui.url')
+    public_base_url = (
+        configured_base_url
+        if isinstance(configured_base_url, str) and configured_base_url
+        else str(request.base_url)
+    )
+    return Response(
+        content=build_api_tour(public_base_url.rstrip('/')),
+        media_type='text/markdown; charset=utf-8',
+        headers={'Content-Disposition': 'attachment; filename="tour.md"'},
+    )
+
+
+@router.delete('/api_keys/{key_id}', response_model=bool)
+async def revoke_user_api_key(
+    request: Request,
+    key_id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    await _check_api_key_permission(request, user, db)
+    success = await Users.delete_user_api_key(user.id, key_id, db=db)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.API_KEY_NOT_FOUND)
+    await publish_event(
+        request,
+        EVENTS.AUTH_API_KEY_DELETED,
+        actor=user,
+        subject_id=key_id,
+        subject_type='api_key',
+    )
+    return True
+
+
+# Legacy single-key endpoints remain for older clients. New keys are only
+# returned once at creation and are never readable from storage.
 @router.post('/api_key', response_model=ApiKey)
 async def generate_api_key(
     request: Request, user=Depends(get_current_user), db: AsyncSession = Depends(get_async_session)
 ):
     await _check_api_key_permission(request, user, db)
-
     api_key = create_api_key()
-    success = await Users.update_user_api_key_by_id(user.id, api_key, db=db)
-
-    if success:
-        await publish_event(
-            request,
-            EVENTS.AUTH_API_KEY_CREATED,
-            actor=user,
-            subject_id=user.id,
-            subject_type='user',
-        )
-        return {
-            'api_key': api_key,
-        }
-    else:
+    if not await Users.update_user_api_key_by_id(user.id, api_key, db=db):
         raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_API_KEY_ERROR)
+    await publish_event(
+        request,
+        EVENTS.AUTH_API_KEY_CREATED,
+        actor=user,
+        subject_id=user.id,
+        subject_type='user',
+    )
+    return {'api_key': api_key}
 
 
 # delete api key
@@ -1510,13 +1745,9 @@ async def delete_api_key(
 @router.get('/api_key', response_model=ApiKey)
 async def get_api_key(request: Request, user=Depends(get_current_user), db: AsyncSession = Depends(get_async_session)):
     await _check_api_key_permission(request, user, db)
-    api_key = await Users.get_user_api_key_by_id(user.id, db=db)
-    if api_key:
-        return {
-            'api_key': api_key,
-        }
-    else:
+    if not await Users.get_user_api_key_by_id(user.id, db=db):
         raise HTTPException(404, detail=ERROR_MESSAGES.API_KEY_NOT_FOUND)
+    return {'api_key': None}
 
 
 ############################

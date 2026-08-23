@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -100,11 +101,60 @@ class QueryPlan(StrictModel):
     @model_validator(mode='before')
     @classmethod
     def normalize_common_tool_shapes(cls, value: Any):
+        def parse_json_container(candidate: Any) -> Any:
+            if not isinstance(candidate, str):
+                return candidate
+            raw = candidate.strip()
+            if not raw or len(raw) > 20_000 or raw[0] not in {'[', '{'}:
+                return candidate
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return candidate
+            return parsed if isinstance(parsed, (list, dict)) else candidate
+
+        def unwrap_item_container(candidate: Any) -> Any:
+            """Normalize provider-generated array wrappers without relaxing the schema."""
+            candidate = parse_json_container(candidate)
+            for _ in range(3):
+                if not isinstance(candidate, dict) or set(candidate) != {'item'}:
+                    break
+                candidate = parse_json_container(candidate['item'])
+            return candidate
+
         if not isinstance(value, dict):
             return value
 
         normalized = dict(value)
-        filters = normalized.get('filters')
+        version = normalized.get('version')
+        if version in {1, 1.0, '1.0'}:
+            normalized['version'] = '1'
+        for field in ('measures', 'metrics', 'dimensions', 'orderBy'):
+            if field in normalized:
+                raw_field = parse_json_container(normalized[field])
+                normalized[field] = unwrap_item_container(raw_field)
+                if (
+                    field in {'measures', 'metrics', 'dimensions'}
+                    and isinstance(normalized[field], str)
+                    and isinstance(raw_field, dict)
+                    and set(raw_field) == {'item'}
+                ):
+                    normalized[field] = [normalized[field]]
+
+        order_by = normalized.get('orderBy')
+        if isinstance(order_by, dict):
+            normalized['orderBy'] = [order_by]
+        elif isinstance(order_by, list):
+            normalized['orderBy'] = [unwrap_item_container(item) for item in order_by]
+
+        for item in normalized.get('orderBy') or []:
+            if not isinstance(item, dict):
+                continue
+            direction = item.get('direction')
+            if isinstance(direction, str):
+                item['direction'] = direction.strip().lower()
+
+        filters = unwrap_item_container(normalized.get('filters'))
         if isinstance(filters, list):
             filters = {'operator': 'and', 'conditions': filters}
         elif isinstance(filters, dict) and filters.get('fieldId'):
@@ -136,10 +186,13 @@ class QueryPlan(StrictModel):
             group_operator = filters.get('operator')
             if isinstance(group_operator, str) and group_operator.strip().lower() in {'and', 'or'}:
                 filters['operator'] = group_operator.strip().lower()
-            conditions = filters.get('conditions')
+            conditions = unwrap_item_container(filters.get('conditions'))
+            if isinstance(conditions, dict) and conditions.get('fieldId'):
+                conditions = [conditions]
             if isinstance(conditions, list):
                 normalized_conditions = []
                 for condition in conditions:
+                    condition = unwrap_item_container(condition)
                     if not isinstance(condition, dict):
                         normalized_conditions.append(condition)
                         continue
@@ -148,6 +201,8 @@ class QueryPlan(StrictModel):
                     if isinstance(operator, str):
                         token = operator.strip()
                         condition['operator'] = aliases.get(token, aliases.get(token.lower(), token.lower()))
+                    if 'value' in condition:
+                        condition['value'] = unwrap_item_container(condition['value'])
                     normalized_conditions.append(condition)
                 filters['conditions'] = normalized_conditions
             normalized['filters'] = filters

@@ -52,6 +52,7 @@
 	let inputFiles;
 
 	let showAdvanced = false;
+	let showCapabilities = false;
 	let showPreview = false;
 	let showAccessControlModal = false;
 
@@ -512,6 +513,15 @@
 			</button>
 		{/if}
 
+		<div class="mb-4">
+			<h1 class="text-xl font-semibold text-gray-900 dark:text-white">
+				{edit ? '編輯 Agent' : '建立 Agent'}
+			</h1>
+			<p class="mt-1 text-sm leading-5 text-gray-500 dark:text-gray-400">
+				先設定名稱、基礎模型、提示詞與知識庫；不常用的能力集中在進階區，不會影響既有設定。
+			</p>
+		</div>
+
 		<div class="min-h-0 w-full flex-1 overflow-y-auto pr-1 scrollbar-hover">
 			<input
 				bind:this={filesInputElement}
@@ -897,97 +907,127 @@
 							<Knowledge bind:selectedItems={knowledge} />
 						</div>
 
-						<div class="my-3">
-							<ToolsSelector bind:selectedToolIds={toolIds} tools={$tools ?? []} />
-						</div>
+						<section class="my-3 rounded-lg border border-gray-200/80 dark:border-gray-800">
+							<button
+								class="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-3 text-left transition hover:bg-gray-50 dark:hover:bg-gray-900"
+								type="button"
+								aria-expanded={showCapabilities}
+								on:click={() => {
+									showCapabilities = !showCapabilities;
+								}}
+							>
+								<span>
+									<span class="block text-sm font-medium text-gray-800 dark:text-gray-100"
+										>進階能力與工具</span
+									>
+									<span class="mt-0.5 block text-xs leading-5 text-gray-500 dark:text-gray-400">
+										{toolIds.length} 個工具、{skillIds.length} 個技能、{Object.keys(
+											capabilities
+										).filter((key) => capabilities[key]).length} 項功能
+									</span>
+								</span>
+								<span class="shrink-0 text-xs font-medium text-gray-500 dark:text-gray-400">
+									{showCapabilities ? '收合' : '展開'}
+								</span>
+							</button>
 
-						<div class="my-3">
-							<SkillsSelector bind:selectedSkillIds={skillIds} skills={skillsList} />
-						</div>
-
-						{#if ($functions ?? []).filter((func) => func.type === 'filter').length > 0 || ($functions ?? []).filter((func) => func.type === 'action').length > 0}
-							<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
-
-							{#if ($functions ?? []).filter((func) => func.type === 'filter').length > 0}
-								<div class="my-3">
-									<FiltersSelector
-										bind:selectedFilterIds={filterIds}
-										filters={($functions ?? []).filter((func) => func.type === 'filter')}
-									/>
-								</div>
-
-								{@const toggleableFilters = $functions.filter(
-									(func) =>
-										func.type === 'filter' &&
-										(filterIds.includes(func.id) || func?.is_global) &&
-										func?.meta?.toggle
-								)}
-
-								{#if toggleableFilters.length > 0}
+							{#if showCapabilities}
+								<div class="border-t border-gray-200/80 px-3 pb-1 pt-2 dark:border-gray-800">
 									<div class="my-3">
-										<DefaultFiltersSelector
-											bind:selectedFilterIds={defaultFilterIds}
-											filters={toggleableFilters}
+										<ToolsSelector bind:selectedToolIds={toolIds} tools={$tools ?? []} />
+									</div>
+
+									<div class="my-3">
+										<SkillsSelector bind:selectedSkillIds={skillIds} skills={skillsList} />
+									</div>
+
+									{#if ($functions ?? []).filter((func) => func.type === 'filter').length > 0 || ($functions ?? []).filter((func) => func.type === 'action').length > 0}
+										<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
+
+										{#if ($functions ?? []).filter((func) => func.type === 'filter').length > 0}
+											<div class="my-3">
+												<FiltersSelector
+													bind:selectedFilterIds={filterIds}
+													filters={($functions ?? []).filter((func) => func.type === 'filter')}
+												/>
+											</div>
+
+											{@const toggleableFilters = $functions.filter(
+												(func) =>
+													func.type === 'filter' &&
+													(filterIds.includes(func.id) || func?.is_global) &&
+													func?.meta?.toggle
+											)}
+
+											{#if toggleableFilters.length > 0}
+												<div class="my-3">
+													<DefaultFiltersSelector
+														bind:selectedFilterIds={defaultFilterIds}
+														filters={toggleableFilters}
+													/>
+												</div>
+											{/if}
+										{/if}
+
+										{#if ($functions ?? []).filter((func) => func.type === 'action').length > 0}
+											<div class="my-3">
+												<ActionsSelector
+													bind:selectedActionIds={actionIds}
+													actions={($functions ?? []).filter((func) => func.type === 'action')}
+												/>
+											</div>
+										{/if}
+									{/if}
+
+									<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
+
+									<div class="my-3">
+										<Capabilities bind:capabilities />
+									</div>
+
+									{#if Object.keys(capabilities).filter((key) => capabilities[key]).length > 0}
+										{@const availableFeatures = Object.entries(capabilities)
+											.filter(
+												([key, value]) =>
+													value &&
+													['web_search', 'code_interpreter', 'image_generation'].includes(key)
+											)
+											.map(([key, value]) => key)}
+
+										{#if availableFeatures.length > 0}
+											<div class="my-3">
+												<DefaultFeatures {availableFeatures} bind:featureIds={defaultFeatureIds} />
+											</div>
+										{/if}
+									{/if}
+
+									{#if capabilities.builtin_tools}
+										<div class="my-3">
+											<BuiltinTools bind:builtinTools />
+										</div>
+									{/if}
+
+									{#if capabilities.terminal}
+										<div class="my-3">
+											<TerminalSelector bind:terminalId />
+										</div>
+									{/if}
+
+									<div class="my-3">
+										<div class="flex w-full justify-between mb-1">
+											<div class="self-center text-xs font-normal text-gray-500">
+												{$i18n.t('TTS Voice')}
+											</div>
+										</div>
+										<TTSVoiceInput
+											bind:value={tts.voice}
+											{voices}
+											placeholder={$i18n.t('e.g. alloy, echo, shimmer')}
 										/>
 									</div>
-								{/if}
-							{/if}
-
-							{#if ($functions ?? []).filter((func) => func.type === 'action').length > 0}
-								<div class="my-3">
-									<ActionsSelector
-										bind:selectedActionIds={actionIds}
-										actions={($functions ?? []).filter((func) => func.type === 'action')}
-									/>
 								</div>
 							{/if}
-						{/if}
-
-						<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
-
-						<div class="my-3">
-							<Capabilities bind:capabilities />
-						</div>
-
-						{#if Object.keys(capabilities).filter((key) => capabilities[key]).length > 0}
-							{@const availableFeatures = Object.entries(capabilities)
-								.filter(
-									([key, value]) =>
-										value && ['web_search', 'code_interpreter', 'image_generation'].includes(key)
-								)
-								.map(([key, value]) => key)}
-
-							{#if availableFeatures.length > 0}
-								<div class="my-3">
-									<DefaultFeatures {availableFeatures} bind:featureIds={defaultFeatureIds} />
-								</div>
-							{/if}
-						{/if}
-
-						{#if capabilities.builtin_tools}
-							<div class="my-3">
-								<BuiltinTools bind:builtinTools />
-							</div>
-						{/if}
-
-						{#if capabilities.terminal}
-							<div class="my-3">
-								<TerminalSelector bind:terminalId />
-							</div>
-						{/if}
-
-						<div class="my-3">
-							<div class="flex w-full justify-between mb-1">
-								<div class="self-center text-xs font-normal text-gray-500">
-									{$i18n.t('TTS Voice')}
-								</div>
-							</div>
-							<TTSVoiceInput
-								bind:value={tts.voice}
-								{voices}
-								placeholder={$i18n.t('e.g. alloy, echo, shimmer')}
-							/>
-						</div>
+						</section>
 
 						<hr class="my-3 border-gray-100/30 dark:border-gray-850/30" />
 

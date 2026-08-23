@@ -961,18 +961,16 @@
 
 		<div class="flex flex-col w-full">
 			<div class="flex w-full justify-between my-1">
-				<div class=" self-center text-xs font-normal">
+				<div class="self-center text-xs font-medium">
 					{$i18n.t('API Keys')}
 				</div>
-				<Switch bind:state={permissions.features.api_keys} ariaLabel={$i18n.t('API Keys')} />
-			</div>
-			{#if defaultPermissions?.features?.api_keys && !permissions.features.api_keys}
-				<div>
-					<div class="text-xs text-gray-500">
-						{$i18n.t('This is a default user permission and will remain enabled.')}
-					</div>
+				<div class="rounded-md bg-gray-100 px-2 py-1 text-[11px] font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300">
+					全體有效帳號
 				</div>
-			{/if}
+			</div>
+			<div class="text-xs leading-5 text-gray-500">
+				API Key 採固定最小權限，不隨群組開關；需要緊急停用時請使用管理設定的全站開關。
+			</div>
 		</div>
 
 		<div class="flex flex-col w-full">

@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from open_webui.internal.db import Base, async_engine, get_async_db_context
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import JSON, BigInteger, Column, Index, String, Text, cast, delete, func, or_, select
+from sqlalchemy import JSON, BigInteger, Column, Index, String, Text, cast, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 _tables_ready = False
@@ -172,8 +172,17 @@ class WorkflowTable:
             from open_webui.utils.workflow_launch import add_guidance_node_to_legacy_graph
 
             async with get_async_db_context() as db:
+                now = int(time.time_ns())
+                await db.execute(
+                    update(WorkflowRun)
+                    .where(WorkflowRun.status == 'running')
+                    .values(
+                        status='error',
+                        error='WebUI restarted before this background workflow completed. Retry the task.',
+                        completed_at=now,
+                    )
+                )
                 rows = (await db.execute(select(Workflow))).scalars().all()
-                upgraded = False
                 for row in rows:
                     try:
                         graph, changed = add_guidance_node_to_legacy_graph(row.graph, row.meta)
@@ -182,9 +191,7 @@ class WorkflowTable:
                         continue
                     if changed:
                         row.graph = graph
-                        upgraded = True
-                if upgraded:
-                    await db.commit()
+                await db.commit()
             _tables_ready = True
 
     async def insert(

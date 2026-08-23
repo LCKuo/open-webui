@@ -10,6 +10,7 @@
 
 	import Modal from '../common/Modal.svelte';
 	import Account from './Settings/Account.svelte';
+	import ApiAccess from './Settings/Account/ApiAccess.svelte';
 	import About from './Settings/About.svelte';
 	import General from './Settings/General.svelte';
 	import Interface from './Settings/Interface.svelte';
@@ -36,6 +37,7 @@
 	import ArchiveBox from '../icons/ArchiveBox.svelte';
 	import ChevronLeft from '../icons/ChevronLeft.svelte';
 	import Keyboard from '../icons/Keyboard.svelte';
+	import CodeBracket from '../icons/CodeBracket.svelte';
 	import UsageIcon from '../icons/UsageIcon.svelte';
 	import AdminTabIcon from '$lib/components/admin/Settings/AdminTabIcon.svelte';
 	import AdminGeneral from '$lib/components/admin/Settings/General.svelte';
@@ -112,6 +114,7 @@
 		data_controls: 'Data',
 		usage: 'Data',
 		archived_chats: 'Data',
+		api_access: 'Profile',
 		account: 'Profile',
 		about: 'Profile'
 	};
@@ -539,6 +542,21 @@
 			]
 		},
 		{
+			id: 'api_access',
+			title: 'API Access',
+			keywords: [
+				'api',
+				'api access',
+				'api key',
+				'api keys',
+				'apikey',
+				'apikeys',
+				'developer',
+				'integration key',
+				'tour.md'
+			]
+		},
+		{
 			id: 'account',
 			title: 'Account',
 			keywords: [
@@ -778,6 +796,13 @@
 				return (
 					$config?.features?.enable_memories &&
 					($user?.role === 'admin' || ($user?.permissions?.features?.memories ?? true))
+				);
+			}
+
+			if (tab.id === 'api_access') {
+				return (
+					($config?.features?.enable_api_keys ?? false) &&
+					($user?.role === 'admin' || ($user?.permissions?.features?.api_keys ?? false))
 				);
 			}
 
@@ -1085,6 +1110,19 @@
 							<ArchiveBox className="size-3.5" strokeWidth="2" />
 							<span>{$i18n.t('Archived Chats')}</span>
 						</button>
+					{:else if tabId === 'api_access'}
+						<button
+							role="tab"
+							aria-controls="tab-api-access"
+							aria-selected={selectedTab === 'api_access'}
+							class={tabButtonClass(selectedTab === 'api_access')}
+							on:click={() => {
+								selectedTab = 'api_access';
+							}}
+						>
+							<CodeBracket className="size-3.5" strokeWidth="2" />
+							<span>{$i18n.t('API Access')}</span>
+						</button>
 					{:else if tabId === 'account'}
 						<button
 							role="tab"
@@ -1211,6 +1249,10 @@
 				<Usage />
 			{:else if selectedTab === 'archived_chats'}
 				<ArchivedChats />
+			{:else if selectedTab === 'api_access'}
+				<div id="tab-api-access" class="h-full overflow-y-auto pr-1.5 scrollbar-hover">
+					<ApiAccess />
+				</div>
 			{:else if selectedTab === 'account'}
 				<Account
 					saveHandler={() => {

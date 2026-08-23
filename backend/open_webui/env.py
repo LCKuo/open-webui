@@ -227,19 +227,28 @@ if FROM_INIT_PY:
 
     # Check if the data directory exists in the package directory
     if DATA_DIR.exists() and DATA_DIR != NEW_DATA_DIR:
-        log.info(f'Moving {DATA_DIR} to {NEW_DATA_DIR}')
-        for item in DATA_DIR.iterdir():
-            dest = NEW_DATA_DIR / item.name
-            if item.is_dir():
-                shutil.copytree(item, dest, dirs_exist_ok=True)
-            else:
-                shutil.copy2(item, dest)
+        destination_database = NEW_DATA_DIR / 'webui.db'
+        if destination_database.exists():
+            log.warning(
+                'Legacy data directory %s was not migrated because %s already '
+                'contains webui.db. Keeping both directories unchanged.',
+                DATA_DIR,
+                NEW_DATA_DIR,
+            )
+        else:
+            log.info(f'Moving {DATA_DIR} to {NEW_DATA_DIR}')
+            for item in DATA_DIR.iterdir():
+                dest = NEW_DATA_DIR / item.name
+                if item.is_dir():
+                    shutil.copytree(item, dest, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, dest)
 
-        # Zip the data directory
-        shutil.make_archive(DATA_DIR.parent / 'open_webui_data', 'zip', DATA_DIR)
+            # Zip the data directory
+            shutil.make_archive(DATA_DIR.parent / 'open_webui_data', 'zip', DATA_DIR)
 
-        # Remove the old data directory
-        shutil.rmtree(DATA_DIR)
+            # Remove the old data directory
+            shutil.rmtree(DATA_DIR)
 
     DATA_DIR = Path(os.getenv('DATA_DIR', OPEN_WEBUI_DIR / 'data'))
 

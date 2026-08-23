@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
-import json
 import logging
 import posixpath
-from typing import Optional
 from urllib.parse import unquote
 
 from fastapi import (
@@ -20,8 +17,8 @@ from fastapi import (
 from fastapi.responses import RedirectResponse, StreamingResponse
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.constants import ERROR_MESSAGES
-from open_webui.events import EVENTS, publish_event
 from open_webui.env import ENABLE_PROFILE_IMAGE_URL_FORWARDING, PROFILE_IMAGE_ALLOWED_MIME_TYPES
+from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.config import Config
@@ -30,17 +27,18 @@ from open_webui.models.models import (
     ModelAccessListResponse,
     ModelAccessResponse,
     ModelForm,
-    ModelListResponse,
     ModelMeta,
     ModelModel,
     ModelParams,
     ModelResponse,
     Models,
 )
+from open_webui.models.users import Users
 from open_webui.utils.access_control import filter_allowed_access_grants, has_permission
 from open_webui.utils.access_control.files import has_access_to_file
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.chat_variables import get_chat_variables_schema
+from open_webui.utils.interact_model_entitlements import enforce_model_activation_limit
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -290,7 +288,9 @@ async def create_new_model(
             'sharing.public_models',
         )
 
-        model = await Models.insert_new_model(form_data, user.id, db=db)
+        additions = int(bool(form_data.is_active and form_data.base_model_id))
+        async with enforce_model_activation_limit(user=user, additions=additions, db=db):
+            model = await Models.insert_new_model(form_data, user.id, db=db)
         if model:
             await publish_event(
                 request,
@@ -391,75 +391,83 @@ async def import_models(
             else:
                 writable_model_ids = set(existing_model_ids)
 
-            imported_ids = []
-            for model_data in data:
-                model_id = model_data.get('id')
+            prepared_models: list[tuple[str, str, ModelForm]] = []
+            activation_additions = 0
+            for raw_model_data in data:
+                model_id = raw_model_data.get('id')
+                if not model_id or not is_valid_model_id(model_id):
+                    continue
 
-                if model_id and is_valid_model_id(model_id):
-                    imported_ids.append(model_id)
-                    # Defense-in-depth: skip models referencing inaccessible files
-                    try:
-                        await _verify_knowledge_file_access(
-                            (model_data.get('meta') or {}).get('knowledge'),
-                            user,
-                            db,
-                        )
-                    except HTTPException:
+                # Validate access before counting the model toward this import.
+                # Otherwise a skipped entry could incorrectly consume capacity.
+                try:
+                    await _verify_knowledge_file_access(
+                        (raw_model_data.get('meta') or {}).get('knowledge'),
+                        user,
+                        db,
+                    )
+                except HTTPException:
+                    log.warning(
+                        'import_models: user %s skipped model %s (knowledge file access denied)',
+                        user.id,
+                        model_id,
+                    )
+                    continue
+
+                model_data = dict(raw_model_data)
+                existing_model = existing_models.get(model_id)
+                if existing_model:
+                    if (
+                        user.role != 'admin'
+                        and existing_model.user_id != user.id
+                        and model_id not in writable_model_ids
+                    ):
                         log.warning(
-                            'import_models: user %s skipped model %s (knowledge file access denied)',
+                            'import_models: user %s skipped model %s (no write access)',
                             user.id,
                             model_id,
                         )
                         continue
 
-                    existing_model = existing_models.get(model_id)
-                    if existing_model:
-                        # Enforce ownership/write-access before allowing overwrite
-                        if (
-                            user.role != 'admin'
-                            and existing_model.user_id != user.id
-                            and model_id not in writable_model_ids
-                        ):
-                            log.warning(
-                                'import_models: user %s skipped model %s (no write access)',
-                                user.id,
-                                model_id,
-                            )
-                            continue
+                    model_data['meta'] = {
+                        **existing_model.meta.model_dump(),
+                        **(model_data.get('meta') or {}),
+                    }
+                    model_data['params'] = model_data.get('params', {})
+                    prepared_model = ModelForm(**{**existing_model.model_dump(), **model_data})
+                    if not existing_model.is_active and prepared_model.is_active and prepared_model.base_model_id:
+                        activation_additions += 1
+                    operation = 'update'
+                else:
+                    model_data['meta'] = model_data.get('meta', {})
+                    model_data['params'] = model_data.get('params', {})
+                    prepared_model = ModelForm(**model_data)
+                    if prepared_model.is_active and prepared_model.base_model_id:
+                        activation_additions += 1
+                    operation = 'insert'
 
-                        # Update existing model
-                        model_data['meta'] = {
-                            **existing_model.meta.model_dump(),
-                            **(model_data.get('meta') or {}),
-                        }
-                        model_data['params'] = model_data.get('params', {})
+                if 'access_grants' in model_data or operation == 'insert':
+                    prepared_model.access_grants = await filter_allowed_access_grants(
+                        await Config.get('user.permissions'),
+                        user.id,
+                        user.role,
+                        prepared_model.access_grants,
+                        'sharing.public_models',
+                    )
+                prepared_models.append((operation, model_id, prepared_model))
 
-                        updated_model = ModelForm(**{**existing_model.model_dump(), **model_data})
-                        # Only filter access_grants when explicitly provided
-                        # in the payload to avoid altering existing ACLs on
-                        # metadata-only imports.
-                        if 'access_grants' in model_data:
-                            updated_model.access_grants = await filter_allowed_access_grants(
-                                await Config.get('user.permissions'),
-                                user.id,
-                                user.role,
-                                updated_model.access_grants,
-                                'sharing.public_models',
-                            )
-                        await Models.update_model_by_id(model_id, updated_model, db=db)
+            imported_ids = []
+            async with enforce_model_activation_limit(
+                user=user,
+                additions=activation_additions,
+                db=db,
+            ):
+                for operation, model_id, prepared_model in prepared_models:
+                    if operation == 'update':
+                        await Models.update_model_by_id(model_id, prepared_model, db=db)
                     else:
-                        # Insert new model
-                        model_data['meta'] = model_data.get('meta', {})
-                        model_data['params'] = model_data.get('params', {})
-                        new_model = ModelForm(**model_data)
-                        new_model.access_grants = await filter_allowed_access_grants(
-                            await Config.get('user.permissions'),
-                            user.id,
-                            user.role,
-                            new_model.access_grants,
-                            'sharing.public_models',
-                        )
-                        await Models.insert_new_model(user_id=user.id, form_data=new_model, db=db)
+                        await Models.insert_new_model(user_id=user.id, form_data=prepared_model, db=db)
+                    imported_ids.append(model_id)
             await publish_event(
                 request,
                 EVENTS.MODEL_IMPORTED,
@@ -470,6 +478,8 @@ async def import_models(
             return True
         else:
             raise HTTPException(status_code=400, detail='Invalid JSON format')
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception(e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -664,7 +674,17 @@ async def toggle_model_by_id(
                 db=db,
             )
         ):
-            model = await Models.toggle_model_by_id(id, db=db)
+            additions = int(bool(not model.is_active and model.base_model_id))
+            entitlement_user = user
+            if model.user_id != user.id:
+                entitlement_user = await Users.get_user_by_id(model.user_id, db=db) or user
+            async with enforce_model_activation_limit(
+                user=user,
+                entitlement_user=entitlement_user,
+                additions=additions,
+                db=db,
+            ):
+                model = await Models.toggle_model_by_id(id, db=db)
 
             if model:
                 await publish_event(
@@ -749,7 +769,17 @@ async def update_model_by_id(
         'sharing.public_models',
     )
 
-    model = await Models.update_model_by_id(form_data.id, ModelForm(**form_data.model_dump()), db=db)
+    additions = int(bool(not model.is_active and form_data.is_active and form_data.base_model_id))
+    entitlement_user = user
+    if model.user_id != user.id:
+        entitlement_user = await Users.get_user_by_id(model.user_id, db=db) or user
+    async with enforce_model_activation_limit(
+        user=user,
+        entitlement_user=entitlement_user,
+        additions=additions,
+        db=db,
+    ):
+        model = await Models.update_model_by_id(form_data.id, ModelForm(**form_data.model_dump()), db=db)
     if model:
         # Rebuild the shared runtime cache so channel traffic cannot continue
         # using stale prompts, knowledge attachments, or tool settings.

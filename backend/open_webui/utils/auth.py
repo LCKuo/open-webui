@@ -39,7 +39,6 @@ from open_webui.env import (
 from open_webui.models.auths import Auths
 from open_webui.models.config import Config
 from open_webui.models.users import Users
-from open_webui.utils.access_control import has_permission
 from pytz import UTC
 
 log = logging.getLogger(__name__)
@@ -306,6 +305,13 @@ def create_api_key():
     return f'sk-{key}'
 
 
+def is_api_key_scope_allowed(scopes: set[str], method: str, path: str) -> bool:
+    method = method.upper()
+    return ('models:read' in scopes and method == 'GET' and path in {'/api/models', '/api/v1/models'}) or (
+        'chat:write' in scopes and method == 'POST' and path in {'/api/chat/completions', '/api/v1/chat/completions'}
+    )
+
+
 def get_http_authorization_cred(auth_header: str | None):
     if not auth_header:
         return None
@@ -344,6 +350,7 @@ async def get_current_user(
     # auth by api key
     if token.startswith('sk-'):
         user = await get_current_user_by_api_key(request, token)
+        request.state.auth_type = 'api_key'
 
         # Add user info to current span
         if ENABLE_OTEL:
@@ -406,9 +413,9 @@ async def get_current_user(
                 # Refresh the user's last active timestamp
                 # Fire-and-forget via asyncio.create_task to avoid blocking
                 asyncio.create_task(Users.update_last_active_by_id(user.id))
-
             # Scope-backed, so outer middleware (audit) can reuse the resolved user
             request.state.user = user
+            request.state.auth_type = 'jwt'
             return user
         else:
             raise HTTPException(
@@ -433,8 +440,9 @@ async def get_current_user(
 async def get_current_user_by_api_key(request, api_key: str):
     # Each function call manages its own short-lived session internally
     user = await Users.get_user_by_api_key(api_key)
+    key_record = await Users.get_api_key_by_token(api_key)
 
-    if user is None:
+    if user is None or key_record is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.INVALID_TOKEN,
@@ -442,7 +450,6 @@ async def get_current_user_by_api_key(request, api_key: str):
 
     config_values = await Config.get_many(
         'auth.enable_api_keys',
-        'user.permissions',
         'auth.api_key.endpoint_restrictions',
         'auth.api_key.allowed_endpoints',
     )
@@ -451,13 +458,27 @@ async def get_current_user_by_api_key(request, api_key: str):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.API_KEY_NOT_ALLOWED)
 
     if user.role != 'admin':
-        user_permissions = config_values.get('user.permissions')
+        from open_webui.utils.access_control import has_permission
+
         if not await has_permission(
             user.id,
             'features.api_keys',
-            user_permissions,
+            await Config.get('user.permissions') or {},
         ):
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.API_KEY_NOT_ALLOWED)
+
+    key_data = key_record.data if isinstance(key_record.data, dict) else {}
+    scopes = set(key_data.get('scopes') or {'models:read', 'chat:write'})
+    request_path = request.scope['path']
+    method = request.method.upper()
+    if not is_api_key_scope_allowed(scopes, method, request_path):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='This API Key is not allowed to access this endpoint.',
+        )
+
+    request.state.api_key_id = key_record.id
+    request.state.api_key_scopes = sorted(scopes)
 
     # Enforce endpoint restrictions — checked here (not in middleware)
     # so it applies regardless of how the API key was transported

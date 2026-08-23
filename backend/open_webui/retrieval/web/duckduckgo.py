@@ -4,7 +4,7 @@ import logging
 import urllib.request
 
 from ddgs import DDGS
-from ddgs.exceptions import RatelimitException
+from ddgs.exceptions import DDGSException
 from open_webui.retrieval.web.main import SearchResult, get_filtered_results
 
 log = logging.getLogger(__name__)
@@ -36,16 +36,25 @@ def search_duckduckgo(
         if concurrent_requests:
             ddgs.threads = concurrent_requests
 
-        # Use the ddgs.text() method to perform the search
-        try:
+        def run(selected_backend: str | None):
             kwargs = {'safesearch': 'moderate', 'max_results': count}
-            if backend and backend != 'auto':
-                kwargs['backend'] = backend
+            if selected_backend and selected_backend != 'auto':
+                kwargs['backend'] = selected_backend
             results = ddgs.text(query, **kwargs)
-            search_results = results if results is not None else []
-        except RatelimitException as e:
-            log.error(f'RatelimitException: {e}')
+            return results if results is not None else []
+
+        try:
+            search_results = run(backend)
+        except DDGSException as exc:
+            log.warning('DuckDuckGo backend %s failed: %s', backend or 'auto', exc)
             search_results = []
+
+        if not search_results and backend and backend != 'auto':
+            try:
+                search_results = run('auto')
+            except DDGSException as exc:
+                log.warning('DuckDuckGo automatic backend fallback failed: %s', exc)
+                search_results = []
     if filter_list:
         search_results = get_filtered_results(search_results, filter_list)
 

@@ -5,6 +5,11 @@ SETLOCAL ENABLEDELAYEDEXPANSION
 :: Get the directory of the current script
 SET "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%" || exit /b
+IF NOT "%WEBUI_DATA_DIR%"=="" (
+    SET "DATA_DIR=%WEBUI_DATA_DIR%"
+) ELSE (
+    SET "DATA_DIR=%SCRIPT_DIR%open_webui\recovery-test-data"
+)
 
 :: Add conditional Playwright browser installation
 IF /I "%WEB_LOADER_ENGINE%" == "playwright" (
@@ -49,6 +54,14 @@ IF "%WEBUI_SECRET_KEY% %WEBUI_JWT_SECRET_KEY%" == " " (
 
 :: Execute uvicorn
 SET "WEBUI_SECRET_KEY=%WEBUI_SECRET_KEY%"
+echo Using WebUI data directory: %DATA_DIR%
+SET "DATA_GUARD_PYTHON=%SCRIPT_DIR%..\.venv\Scripts\python.exe"
+IF NOT EXIST "%DATA_GUARD_PYTHON%" SET "DATA_GUARD_PYTHON=python"
+"%DATA_GUARD_PYTHON%" "%SCRIPT_DIR%..\scripts\validate_webui_data.py" "%DATA_DIR%"
+IF ERRORLEVEL 1 (
+    echo WebUI was not started because the configured database failed validation.
+    exit /b 1
+)
 IF "%UVICORN_WORKERS%"=="" SET UVICORN_WORKERS=1
 uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips %FORWARDED_ALLOW_IPS% --workers %UVICORN_WORKERS% --ws auto
 :: For ssl user uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips '*' --ssl-keyfile "key.pem" --ssl-certfile "cert.pem" --ws auto

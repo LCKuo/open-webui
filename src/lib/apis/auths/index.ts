@@ -600,6 +600,76 @@ export const deleteAPIKey = async (token: string) => {
 	return res;
 };
 
+export type UserAPIKey = {
+	id: string;
+	name: string;
+	prefix: string;
+	last_four: string;
+	scopes: string[];
+	expires_at: number | null;
+	last_used_at: number | null;
+	created_at: number;
+};
+
+export type CreatedUserAPIKey = UserAPIKey & {
+	api_key: string;
+};
+
+const apiKeyError = async (res: Response) => {
+	const payload = await res.json().catch(() => null);
+	return payload?.detail ?? payload?.error ?? `HTTP ${res.status}`;
+};
+
+export const listUserAPIKeys = async (token: string): Promise<UserAPIKey[]> => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/api_keys`, {
+		headers: { Authorization: `Bearer ${token}` }
+	});
+	if (!res.ok) throw await apiKeyError(res);
+	return res.json();
+};
+
+export const createUserAPIKey = async (
+	token: string,
+	form: { name: string; expires_in_days: 30 | 90 | 365 | null }
+): Promise<CreatedUserAPIKey> => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/api_keys`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			Authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify(form)
+	});
+	if (!res.ok) throw await apiKeyError(res);
+	return res.json();
+};
+
+export const revokeUserAPIKey = async (token: string, keyId: string): Promise<boolean> => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/api_keys/${encodeURIComponent(keyId)}`, {
+		method: 'DELETE',
+		headers: { Authorization: `Bearer ${token}` }
+	});
+	if (!res.ok) throw await apiKeyError(res);
+	return res.json();
+};
+
+export const downloadAPITour = async (token: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/api_keys/tour.md`, {
+		headers: { Authorization: `Bearer ${token}` }
+	});
+	if (!res.ok) throw await apiKeyError(res);
+
+	const blob = await res.blob();
+	const url = URL.createObjectURL(blob);
+	const anchor = document.createElement('a');
+	anchor.href = url;
+	anchor.download = 'tour.md';
+	document.body.appendChild(anchor);
+	anchor.click();
+	anchor.remove();
+	URL.revokeObjectURL(url);
+};
+
 export const deleteOAuthSession = async (token: string, provider: string) => {
 	let error = null;
 

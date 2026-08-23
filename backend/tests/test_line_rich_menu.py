@@ -4,18 +4,26 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from open_webui.models.interact_channels import line_identity_hash
 from open_webui.routers.interact_channels import (
+    ChannelHubLiffSessionRequest,
     ChannelSyncRequest,
     LineIdentityUnlinkRequest,
     _download_line_message_content,
+    _enabled_agent_bindings,
+    _enabled_product_bindings,
+    _issue_line_account_link,
     _line_account_link_requested,
     _line_advance_workflow_session,
+    _line_event_requires_identity,
     _line_guided_input,
     _line_next_guided_field,
     _line_part_as_file,
     _line_refresh_identity,
     _line_resolve_workflow_postback,
     _require_company_channel,
+    channel_hub_liff_session,
+    sync_channel,
     sync_line_rich_menu,
     unlink_line_identity,
 )
@@ -82,6 +90,294 @@ def test_line_account_link_command_accepts_portal_deep_link_text():
     assert _line_account_link_requested('綁定帳號') is True
     assert _line_account_link_requested(' 綁定企業帳號！ ') is True
     assert _line_account_link_requested('查詢公司資料') is False
+
+
+def test_line_identity_hash_is_scoped_to_each_bot_channel():
+    first = line_identity_hash('channel-a', 'same-line-user')
+    second = line_identity_hash('channel-b', 'same-line-user')
+
+    assert first != second
+    assert first == line_identity_hash('channel-a', 'same-line-user')
+
+
+def test_member_channel_requires_identity_for_plain_messages_and_agent_actions():
+    channel = SimpleNamespace(access_mode='member')
+
+    assert _line_event_requires_identity(channel, 'message', '') is True
+    assert _line_event_requires_identity(channel, 'postback', 'menu.workflows.v1') is True
+    assert _line_event_requires_identity(channel, 'postback', 'menu.account_link.v1') is False
+    assert _line_event_requires_identity(channel, 'postback', 'menu.help.v1') is False
+
+
+def test_public_channel_keeps_plain_chat_open_but_protects_enterprise_workflows():
+    channel = SimpleNamespace(access_mode='public')
+
+    assert _line_event_requires_identity(channel, 'message', '') is False
+    assert _line_event_requires_identity(channel, 'postback', 'workflow.launch.v2') is True
+
+
+def test_channel_hub_filters_agents_and_quick_actions_by_company_role():
+    channel = SimpleNamespace(
+        agent_bindings=[
+            {
+                'modelId': 'support-agent',
+                'label': '客服助手',
+                'role': 'support',
+                'enabled': True,
+                'isDefault': True,
+                'allowedRoles': ['owner', 'admin', 'member'],
+                'quickActions': [
+                    {'id': 'faq', 'label': '常見問題', 'message': '請整理常見問題'},
+                ],
+            },
+            {
+                'modelId': 'admin-agent',
+                'label': '管理助手',
+                'role': 'operations',
+                'enabled': True,
+                'allowedRoles': ['owner', 'admin'],
+            },
+        ],
+    )
+
+    member_agents = _enabled_agent_bindings(channel, 'member')
+    assert [item['modelId'] for item in member_agents] == ['support-agent']
+    assert member_agents[0]['role'] == 'support'
+    assert member_agents[0]['quickActions'][0]['message'] == '請整理常見問題'
+    assert [item['modelId'] for item in _enabled_agent_bindings(channel, 'admin')] == [
+        'support-agent'
+    ]
+
+
+def test_channel_hub_filters_product_actions_and_rejects_non_https_urls():
+    channel = SimpleNamespace(
+        product_role='bd',
+        product_bindings=[
+            {
+                'productKey': 'crm',
+                'instanceId': 'crm-1',
+                'label': 'CRM',
+                'enabled': True,
+                'allowedRoles': ['owner', 'admin', 'member'],
+                'actions': [
+                    {
+                        'id': 'customers',
+                        'label': '客戶清單',
+                        'href': 'https://crm.example.com/customers',
+                        'allowedRoles': ['owner', 'admin', 'member'],
+                    },
+                    {
+                        'id': 'settings',
+                        'label': '管理設定',
+                        'href': 'https://crm.example.com/settings',
+                        'allowedRoles': ['owner'],
+                    },
+                    {
+                        'id': 'unsafe',
+                        'label': '不安全網址',
+                        'href': 'javascript:alert(1)',
+                        'allowedRoles': ['member'],
+                    },
+                    {
+                        'id': 'ask-bd',
+                        'label': '研究潛在客戶',
+                        'kind': 'message',
+                        'message': '請先詢問本次研究條件。',
+                        'agentRole': 'bd',
+                        'allowedRoles': ['member'],
+                    },
+                ],
+            },
+        ],
+    )
+
+    member_products = _enabled_product_bindings(channel, 'member')
+    assert len(member_products) == 1
+    assert [action['id'] for action in member_products[0]['actions']] == ['customers', 'ask-bd']
+    assert member_products[0]['actions'][1]['agentRole'] == 'bd'
+    assert {action['id'] for action in _enabled_product_bindings(channel, 'owner')[0]['actions']} == {
+        'customers',
+        'settings',
+    }
+
+
+def test_channel_sync_schema_supports_standalone_and_future_product_adapters():
+    payload = ChannelSyncRequest(
+        companyEmail='company@example.com',
+        companyUserId='company-id',
+        channelType='line',
+        channelIdentifier='line-1',
+        name='企業工作台',
+        agentBindings=[{
+            'modelId': 'erp-agent',
+            'label': 'ERP 助手',
+            'role': 'inventory',
+            'isDefault': True,
+        }],
+        modelId='erp-agent',
+        channelMode='single_product',
+        productRole='inventory',
+        productBindings=[{
+            'productKey': 'erp',
+            'instanceId': 'erp-1',
+            'label': 'ERP',
+            'actions': [{
+                'id': 'inventory',
+                'label': '庫存',
+                'kind': 'link',
+                'href': 'https://erp.example.com/inventory',
+            }, {
+                'id': 'inventory-agent',
+                'label': '詢問庫存',
+                'kind': 'message',
+                'message': '請查詢指定品項庫存。',
+                'agentRole': 'inventory',
+            }],
+        }],
+        menuProfile={'title': '辦公室工作台', 'subtitle': '選擇系統'},
+    )
+
+    assert payload.agentBindings[0].role == 'inventory'
+    assert payload.channelMode == 'single_product'
+    assert payload.productBindings[0].productKey == 'erp'
+    assert payload.productBindings[0].actions[1].kind == 'message'
+
+
+def test_am_role_menu_exposes_only_am_actions_and_liff_workspace():
+    artifacts = build_line_role_menus(
+        audience='member',
+        alias_ids={'home': 'am-home', 'workflows': 'am-workflows'},
+        channel_name='AM Bot',
+        liff_uri='https://liff.line.me/2000000000-amtest',
+        product_role='am',
+    )
+    home = next(item for item in artifacts if item.tab == 'home')
+    actions = [area['action'] for area in home.menu['areas']]
+    payload = json.dumps(actions, ensure_ascii=False)
+
+    assert 'https://liff.line.me/2000000000-amtest' in payload
+    assert '記錄客戶跟進' in payload
+    assert '修正跟進紀錄' in payload
+    assert '執行新的潛客探索' not in payload
+
+
+def test_bd_role_menu_exposes_only_bd_actions_and_liff_workspace():
+    artifacts = build_line_role_menus(
+        audience='member',
+        alias_ids={'home': 'bd-home', 'workflows': 'bd-workflows'},
+        channel_name='BD Bot',
+        liff_uri='https://liff.line.me/2000000000-bdtest',
+        product_role='bd',
+    )
+    home = next(item for item in artifacts if item.tab == 'home')
+    actions = [area['action'] for area in home.menu['areas']]
+    payload = json.dumps(actions, ensure_ascii=False)
+
+    assert 'https://liff.line.me/2000000000-bdtest' in payload
+    assert '執行新的潛客探索' in payload
+    assert '改善搜尋輪廓' in payload
+    assert '記錄客戶跟進' not in payload
+
+
+@pytest.mark.asyncio
+async def test_channel_hub_never_returns_a_channel_from_another_company(monkeypatch):
+    async def other_company_channel(*args, **kwargs):
+        return SimpleNamespace(id='channel-a', company_user_id='company-b')
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._require_service_token',
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.get_by_id',
+        other_company_channel,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await channel_hub_liff_session(
+            ChannelHubLiffSessionRequest(
+                channelId='channel-a',
+                companyUserId='company-a',
+                idToken='x' * 30,
+            ),
+        )
+
+    assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_account_link_keeps_each_bot_channel_in_its_own_url_and_state(monkeypatch):
+    created_links = []
+    sent_messages = []
+
+    async def line_api(channel, *args, **kwargs):
+        return {'linkToken': f'link-token-{channel.id}'}
+
+    async def create_link(**kwargs):
+        created_links.append(kwargs)
+
+    async def send_messages(channel, reply_token, messages):
+        sent_messages.append((channel.id, reply_token, messages))
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels._line_portal_base_url',
+        lambda: 'https://portal.example.com',
+    )
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_api_request', line_api)
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.create_line_identity_link',
+        create_link,
+    )
+    monkeypatch.setattr('open_webui.routers.interact_channels._send_line_messages', send_messages)
+
+    await _issue_line_account_link(SimpleNamespace(id='channel-a'), 'same-line-user', 'reply-a')
+    await _issue_line_account_link(SimpleNamespace(id='channel-b'), 'same-line-user', 'reply-b')
+
+    assert [item['channel_id'] for item in created_links] == ['channel-a', 'channel-b']
+    assert created_links[0]['state'] != created_links[1]['state']
+    first_uri = sent_messages[0][2][0]['contents']['footer']['contents'][0]['action']['uri']
+    second_uri = sent_messages[1][2][0]['contents']['footer']['contents'][0]['action']['uri']
+    assert 'channelId=channel-a' in first_uri
+    assert 'channelId=channel-b' in second_uri
+    assert first_uri != second_uri
+
+
+@pytest.mark.asyncio
+async def test_channel_sync_rejects_an_internal_channel_id_owned_by_another_company(
+    monkeypatch,
+):
+    async def webui_user(*args, **kwargs):
+        return SimpleNamespace(role='user')
+
+    async def other_company_channel(*args, **kwargs):
+        return SimpleNamespace(
+            id='shared-channel-id',
+            company_email='other@example.com',
+            company_user_id='other-company-id',
+        )
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._require_service_token', lambda *args: None)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Users.get_user_by_email', webui_user)
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.get_by_id',
+        other_company_channel,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await sync_channel(
+            'shared-channel-id',
+            ChannelSyncRequest(
+                companyEmail='company@example.com',
+                companyUserId='company-id',
+                channelType='line',
+                channelIdentifier='line-channel-a',
+                name='LINE Bot A',
+            ),
+            authorization='Bearer service-token',
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == 'The requested channel ID belongs to another company.'
 
 
 def test_rich_menu_uses_dynamic_workflow_ids_and_balanced_layout():

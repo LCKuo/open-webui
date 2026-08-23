@@ -616,6 +616,7 @@ async def validate_query(
     except ValidationError as error:
         raise SemanticQueryError('QUERY-PLAN-INVALID', _validation_error_detail(error)) from error
     runtime = await load_runtime(plan, context)
+    _validate_allowed_filter_values(plan, runtime.version['definition'])
     compiler = SemanticCompiler(runtime.connector.connector_type, runtime.catalog, runtime.version['definition'])
     compiled = compiler.compile(plan, runtime.row_filters)
     if len(compiled.joins) > MAX_JOIN_COUNT:
@@ -716,6 +717,7 @@ async def execute_query(  # noqa: C901
         await reserve_query_entitlement(context.company_user_id)
         plan = QueryPlan.model_validate(plan_data)
         runtime = await load_runtime(plan, context)
+        _validate_allowed_filter_values(plan, runtime.version['definition'])
         event.update(
             connector_id=runtime.connector.id,
             connector_type=runtime.connector.connector_type,
@@ -881,6 +883,55 @@ def _manifest_score(query: str, manifest: dict[str, Any]) -> float:
     return round(score, 4)
 
 
+def _manifest_semantic_field(item: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        'id': item.get('id'),
+        'name': item.get('name'),
+        'description': item.get('description'),
+    }
+    allowed_values = item.get('allowedValues') or item.get('allowed_values') or []
+    if isinstance(allowed_values, list) and allowed_values:
+        result['allowedValues'] = allowed_values
+    return result
+
+
+def _validate_allowed_filter_values(plan: QueryPlan, definition: dict[str, Any]) -> None:
+    if not plan.filters:
+        return
+    semantic_fields = {
+        str(item.get('id') or ''): item
+        for section in ('dimensions', 'measures')
+        for item in definition.get(section) or []
+    }
+    for condition in plan.filters.conditions:
+        item = semantic_fields.get(condition.fieldId) or {}
+        allowed_values = item.get('allowedValues') or item.get('allowed_values') or []
+        if not isinstance(allowed_values, list) or not allowed_values:
+            continue
+        if condition.operator not in {'eq', 'ne', 'in', 'not_in'}:
+            continue
+        requested_values = condition.value if isinstance(condition.value, list) else [condition.value]
+        canonical_strings = {
+            value.strip().lower(): value
+            for value in allowed_values
+            if isinstance(value, str) and value.strip()
+        }
+        normalized_values = []
+        for value in requested_values:
+            if value in allowed_values:
+                normalized_values.append(value)
+                continue
+            if isinstance(value, str) and value.strip().lower() in canonical_strings:
+                normalized_values.append(canonical_strings[value.strip().lower()])
+                continue
+            raise SemanticQueryError(
+                'QUERY-FILTER-VALUE-NOT-ALLOWED',
+                f'Unsupported value for {condition.fieldId}. Allowed values: {allowed_values}',
+                field_path=condition.fieldId,
+            )
+        condition.value = normalized_values if isinstance(condition.value, list) else normalized_values[0]
+
+
 async def accessible_dataset_manifests(context: QueryRuntimeContext, query: str | None = None) -> list[dict[str, Any]]:
     datasets = await InteractSemantic.list_datasets(context.company_user_id, published_only=True)
     needle = (query or '').strip().lower()
@@ -908,18 +959,9 @@ async def accessible_dataset_manifests(context: QueryRuntimeContext, query: str 
             'notFor': definition.get('notFor') or [],
             'examples': definition.get('examples') or [],
             'synonyms': definition.get('synonyms') or [],
-            'dimensions': [
-                {'id': item.get('id'), 'name': item.get('name'), 'description': item.get('description')}
-                for item in definition.get('dimensions') or []
-            ],
-            'measures': [
-                {'id': item.get('id'), 'name': item.get('name'), 'description': item.get('description')}
-                for item in definition.get('measures') or []
-            ],
-            'metrics': [
-                {'id': item.get('id'), 'name': item.get('name'), 'description': item.get('description')}
-                for item in definition.get('metrics') or []
-            ],
+            'dimensions': [_manifest_semantic_field(item) for item in definition.get('dimensions') or []],
+            'measures': [_manifest_semantic_field(item) for item in definition.get('measures') or []],
+            'metrics': [_manifest_semantic_field(item) for item in definition.get('metrics') or []],
         }
         manifest['selectorScore'] = _manifest_score(needle, manifest)
         manifests.append(manifest)

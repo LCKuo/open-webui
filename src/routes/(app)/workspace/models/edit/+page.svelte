@@ -14,6 +14,9 @@
 	import ModelEditor from '$lib/components/workspace/Models/ModelEditor.svelte';
 
 	let model = null;
+	let activationError = '';
+	const errorMessage = (error) =>
+		typeof error === 'string' ? error : String(error?.detail ?? error ?? '模型儲存失敗。');
 
 	onMount(async () => {
 		const _id = $page.url.searchParams.get('id');
@@ -36,7 +39,14 @@
 	});
 
 	const onSubmit = async (modelInfo) => {
-		const res = await updateModelById(localStorage.token, modelInfo.id, modelInfo);
+		activationError = '';
+		const res = await updateModelById(localStorage.token, modelInfo.id, modelInfo).catch(
+			(error) => {
+				activationError = errorMessage(error);
+				toast.error(activationError);
+				return null;
+			}
+		);
 
 		if (res) {
 			await models.set(
@@ -52,6 +62,15 @@
 </script>
 
 {#if model}
+	{#if activationError}
+		<div
+			class="mx-auto mb-4 w-full max-w-5xl rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100"
+			role="alert"
+		>
+			<p class="font-medium">模型未啟用</p>
+			<p class="mt-1">{activationError}</p>
+		</div>
+	{/if}
 	<ModelEditor
 		edit={true}
 		{model}

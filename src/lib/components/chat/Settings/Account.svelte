@@ -348,7 +348,7 @@
 			</UserSettingSection>
 		{/if}
 
-		{#if ($config?.features?.enable_api_keys ?? true) && ($user?.role === 'admin' || ($user?.permissions?.features?.api_keys ?? false))}
+		{#if false}
 			<UserSettingSection title={$i18n.t('API keys')}>
 				<UserSettingRow description={$i18n.t('Show or hide sensitive account secrets.')}>
 					<span slot="label">{$i18n.t('Secrets')}</span>
@@ -516,6 +516,7 @@
 				{/if}
 			</UserSettingSection>
 		{/if}
+
 	</div>
 
 	<div class="shrink-0 flex w-full justify-end pt-3 text-sm font-normal">

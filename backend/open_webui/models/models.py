@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from copy import deepcopy
-from typing import Any, Optional
+from typing import Any
 
 from open_webui.internal.db import Base, JSONField, get_async_db_context
 from open_webui.models.access_grants import AccessGrantModel, AccessGrants
@@ -13,7 +13,6 @@ from open_webui.models.users import User, UserModel, UserResponse, Users
 from open_webui.utils.validate import validate_profile_image_url
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import BigInteger, Boolean, Column, String, Text, cast, delete, func, or_, select, update
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -53,6 +52,39 @@ def strip_extracted_content_from_model_knowledge(knowledge: Any) -> Any:
         sanitized.append(next_item)
 
     return sanitized
+
+
+def _model_product_affinity(meta: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Return explicit product affinity, with compatibility for managed CRM agents."""
+
+    def clean_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return list(
+            dict.fromkeys(
+                item.strip().lower()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            )
+        )
+
+    product_keys = clean_list(meta.get('productKeys'))
+    product_roles = clean_list(meta.get('productRoles'))
+    managed_use_cases = set(clean_list(meta.get('managedUseCases')))
+
+    # Existing managed Agents predate explicit product metadata. Their managed
+    # use cases are authoritative enough to classify them without name matching.
+    if not product_keys and managed_use_cases.intersection(
+        {'prospecting_discovery', 'customer_growth', 'account_management'}
+    ):
+        product_keys.append('crm')
+    if not product_roles:
+        if 'prospecting_discovery' in managed_use_cases:
+            product_roles.append('bd')
+        if managed_use_cases.intersection({'customer_growth', 'account_management'}):
+            product_roles.append('am')
+
+    return sorted(set(product_keys)), sorted(set(product_roles))
 
 
 # --- Models DB Schema ---
@@ -182,6 +214,65 @@ class ModelForm(BaseModel):
 
 
 class ModelsTable:
+    async def count_active_workspace_models_by_user_ids(
+        self,
+        user_ids: list[str],
+        db: AsyncSession | None = None,
+    ) -> int:
+        clean_ids = list(dict.fromkeys(user_id for user_id in user_ids if user_id))
+        if not clean_ids:
+            return 0
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(func.count(Model.id)).where(
+                    Model.user_id.in_(clean_ids),
+                    Model.base_model_id.is_not(None),
+                    Model.is_active.is_(True),
+                )
+            )
+            return int(result.scalar() or 0)
+
+    async def get_active_workspace_model_inventory_by_user_ids(
+        self,
+        user_ids: list[str],
+        db: AsyncSession | None = None,
+    ) -> list[dict[str, Any]]:
+        clean_ids = list(dict.fromkeys(user_id for user_id in user_ids if user_id))
+        if not clean_ids:
+            return []
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(Model.id, Model.name, Model.user_id, Model.base_model_id, Model.meta)
+                .where(
+                    Model.user_id.in_(clean_ids),
+                    Model.base_model_id.is_not(None),
+                    Model.is_active.is_(True),
+                )
+                .order_by(Model.name.asc(), Model.id.asc())
+            )
+            inventory: list[dict[str, Any]] = []
+            for row in result.all():
+                meta = row.meta if isinstance(row.meta, dict) else {}
+                knowledge = meta.get('knowledge') if isinstance(meta.get('knowledge'), list) else []
+                capabilities = meta.get('capabilities') if isinstance(meta.get('capabilities'), dict) else {}
+                product_keys, product_roles = _model_product_affinity(meta)
+                inventory.append(
+                    {
+                        'id': row.id,
+                        'name': row.name,
+                        'ownerUserId': row.user_id,
+                        'baseModelId': row.base_model_id,
+                        'description': str(meta.get('description') or '')[:300],
+                        'knowledgeCount': len(knowledge),
+                        'capabilities': sorted(
+                            key for key, enabled in capabilities.items() if enabled is True
+                        ),
+                        'productKeys': product_keys,
+                        'productRoles': product_roles,
+                    }
+                )
+            return inventory
+
     async def _get_access_grants(self, model_id: str, db: AsyncSession | None = None) -> list[AccessGrantModel]:
         return await AccessGrants.get_grants_by_resource('model', model_id, db=db)
 

@@ -19,7 +19,11 @@ COMPUTE_CREDIT_MULTIPLIER = 5
 
 
 def _base_url() -> str:
-    return DEFAULT_BASE_URL
+    return (
+        os.environ.get("INTERACT_BILLING_BASE_URL")
+        or os.environ.get("OPEN_WEBUI_BILLING_BASE_URL")
+        or DEFAULT_BASE_URL
+    ).strip().rstrip("/")
 
 
 def _service_token() -> str:
@@ -204,6 +208,7 @@ def billing_workflow_metadata(metadata: dict[str, Any]) -> dict[str, str]:
 class BillingIdentity:
     company_user: dict[str, Any]
     company_member: Optional[dict[str, Any]] = None
+    model_entitlement: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -214,6 +219,7 @@ class BillingAuthorization:
     estimated_input_tokens: int
     max_output_tokens: int
     reserved_tokens: int
+    usage_channel: str = "webui"
     company_member_id: Optional[str] = None
     company_member_email: Optional[str] = None
 
@@ -282,9 +288,11 @@ class InteractBillingClient:
         )
         company_user = data["company_user"]
         company_member = data.get("company_member")
+        model_entitlement = data.get("model_entitlement")
         return BillingIdentity(
             company_user=company_user,
             company_member=company_member if isinstance(company_member, dict) else None,
+            model_entitlement=model_entitlement if isinstance(model_entitlement, dict) else None,
         )
 
     async def resolve_user(self, user: Any) -> dict[str, Any]:
@@ -328,6 +336,7 @@ class InteractBillingClient:
 
     async def authorize(self, user: Any, form_data: dict[str, Any], metadata: dict[str, Any]) -> BillingAuthorization:
         input_tokens, max_output_tokens, reserved_tokens = estimate_reserved_tokens(form_data)
+        usage_channel = "external_api" if metadata.get("auth_type") == "api_key" else "webui"
         channel_metadata = metadata.get('interact_channel') or {}
         if (
             isinstance(channel_metadata, dict)
@@ -393,8 +402,10 @@ class InteractBillingClient:
                 "max_output_tokens": max_output_tokens,
                 "estimated_compute_tokens": 0,
                 "estimated_billable_tokens": reserved_tokens,
+                "usage_channel": usage_channel,
                 "metadata": {
                     "openWebuiEmail": user.email,
+                    "apiKeyId": metadata.get("api_key_id"),
                     **(
                         {
                             "companyMemberId": company_member.get("id"),
@@ -429,6 +440,7 @@ class InteractBillingClient:
             estimated_input_tokens=input_tokens,
             max_output_tokens=max_output_tokens,
             reserved_tokens=data["reserved_tokens"],
+            usage_channel=usage_channel,
             company_member_id=company_member.get("id") if company_member else None,
             company_member_email=company_member.get("email") if company_member else None,
         )
@@ -554,12 +566,15 @@ class InteractBillingClient:
                 "chat_id": metadata.get("chat_id"),
                 "message_id": metadata.get("message_id"),
                 "model": form_data.get("model"),
+                "usage_channel": authorization.usage_channel,
                 "status": "completed",
                 "request_summary": (
                     f"Workflow: {workflow_metadata.get('name') or workflow_metadata.get('id')}"
                     if workflow_metadata
                     else "Open WebUI channel chat completion"
                     if channel_metadata
+                    else "External API chat completion"
+                    if authorization.usage_channel == "external_api"
                     else "Open WebUI chat completion"
                 ),
                 "provider_request_id": metadata.get("message_id"),
@@ -571,6 +586,8 @@ class InteractBillingClient:
                 },
                 "parameters": {
                     "openWebuiEmail": user.email,
+                    "usageChannel": authorization.usage_channel,
+                    "apiKeyId": metadata.get("api_key_id"),
                     **(
                         {
                             "companyMemberId": authorization.company_member_id,

@@ -245,6 +245,7 @@ from open_webui.utils.middleware import (
     build_chat_response_context,
     process_chat_payload,
     process_chat_response,
+    resolve_function_calling_mode,
 )
 from open_webui.utils.model_ids import strip_provider_model_prefix
 from open_webui.utils.models import (
@@ -253,6 +254,7 @@ from open_webui.utils.models import (
     get_all_models,
     get_filtered_models,
     refresh_runtime_model_cache_entry,
+    serialize_external_api_model,
 )
 from open_webui.utils.oauth import (
     OAuthClientInformationFull,
@@ -913,6 +915,37 @@ async def get_models(request: Request, refresh: bool = False, user=Depends(get_v
             )
         )
 
+    if getattr(request.state, 'auth_type', None) == 'api_key':
+        api_feature_config = await Config.get_many('web.search.enable', 'image_generation.enable')
+        for model in models:
+            info = model.get('info') if isinstance(model.get('info'), dict) else {}
+            meta = info.get('meta') if isinstance(info.get('meta'), dict) else {}
+            capabilities = meta.get('capabilities') if isinstance(meta.get('capabilities'), dict) else {}
+            default_feature_ids = set(meta.get('defaultFeatureIds') or [])
+            is_workspace_model = bool(model.get('preset'))
+            model['interact'] = {
+                'source': 'workspace' if is_workspace_model else 'enterprise_base',
+                'owned_by_current_user': bool(is_workspace_model and info.get('user_id') == user.id),
+                'capabilities': {
+                    'knowledge': bool(meta.get('knowledge')),
+                    'tools': bool(meta.get('toolIds') or meta.get('actionIds') or model.get('action_ids')),
+                    'skills': bool(meta.get('skillIds')),
+                    'filters': bool(meta.get('defaultFilterIds')),
+                    'terminal': bool(meta.get('terminalId')),
+                    'web_search': bool(
+                        capabilities.get('web_search')
+                        and 'web_search' in default_feature_ids
+                        and api_feature_config.get('web.search.enable')
+                    ),
+                    'image_generation': bool(
+                        capabilities.get('image_generation')
+                        and 'image_generation' in default_feature_ids
+                        and api_feature_config.get('image_generation.enable')
+                    ),
+                },
+            }
+        models = [serialize_external_api_model(model) for model in models]
+
     if log.isEnabledFor(logging.DEBUG):
         log.debug(
             f'/api/models returned filtered models accessible to the user: {json.dumps([model.get("id") for model in models])}'
@@ -1089,6 +1122,36 @@ async def chat_completion(
     form_data: dict,
     user=Depends(get_verified_user),
 ):
+    if getattr(request.state, 'auth_type', None) == 'api_key':
+        # External API calls are stateless model inference. Do not accept
+        # browser-only fields that could inject direct providers, channels,
+        # workflows, chats, files, or tools outside the selected model ACL.
+        for field in {
+            'model_item',
+            'background_tasks',
+            'workflow',
+            'interact_channel',
+            'chat_id',
+            'parent_id',
+            'new_chat',
+            'message_ids',
+            'id',
+            'user_message',
+            'parent_message',
+            'assistant_message_id',
+            'session_id',
+            'folder_id',
+            'filter_ids',
+            'tool_ids',
+            'tool_servers',
+            'terminal_id',
+            'files',
+            'features',
+            'variables',
+            '_billing_multiplier',
+        }:
+            form_data.pop(field, None)
+
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
 
@@ -1118,6 +1181,25 @@ async def chat_completion(
                     await check_model_access(user, model, model_info=model_info)
                 except Exception as e:
                     raise e
+
+            if getattr(request.state, 'auth_type', None) == 'api_key':
+                # Headless API clients do not have Chat.svelte to apply the
+                # selected model's configured defaults. Restore only defaults
+                # owned by the ACL-checked model; caller-supplied IDs were
+                # stripped above.
+                from open_webui.utils.automations import (
+                    _resolve_model_features,
+                    _resolve_model_filter_ids,
+                    _resolve_model_terminal_id,
+                    _resolve_model_tool_ids,
+                )
+
+                form_data['tool_ids'] = _resolve_model_tool_ids(request.app, model_id)
+                form_data['filter_ids'] = _resolve_model_filter_ids(request.app, model_id)
+                form_data['features'] = await _resolve_model_features(request.app, model_id)
+                terminal_id = _resolve_model_terminal_id(request.app, model_id)
+                if terminal_id:
+                    form_data['terminal_id'] = terminal_id
         else:
             model = model_item
             await _set_direct_model(request, model, user)
@@ -1220,6 +1302,8 @@ async def chat_completion(
 
         metadata = {
             'user_id': user.id,
+            'auth_type': getattr(request.state, 'auth_type', 'jwt'),
+            'api_key_id': getattr(request.state, 'api_key_id', None),
             'user_agent': request.headers.get('user-agent', '') or '',
             'internal': getattr(request.state, 'internal', False) is True,
             'chat_id': form_data.pop('chat_id', None) or '',
@@ -1244,16 +1328,9 @@ async def chat_completion(
                 'stream_delta_chunk_size': stream_delta_chunk_size,
                 'reasoning_tags': reasoning_tags,
                 'compact_token_threshold': compact_token_threshold,
-                'function_calling': (
-                    'native'
-                    if (
-                        requested_function_calling == 'native'
-                        or (
-                            requested_function_calling is None
-                            and model_info_params.get('function_calling') == 'native'
-                        )
-                    )
-                    else 'default'
+                'function_calling': resolve_function_calling_mode(
+                    requested_function_calling,
+                    model_info_params.get('function_calling'),
                 ),
             },
         }

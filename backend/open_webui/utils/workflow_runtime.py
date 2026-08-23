@@ -5,7 +5,9 @@ import operator
 import re
 from collections import deque
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
 WorkflowModelRunner = Callable[[str, str | None, str | None, list[dict[str, Any]]], Awaitable[dict[str, Any]]]
@@ -93,6 +95,24 @@ class WorkflowRuntimeError(RuntimeError):
     pass
 
 
+def _merge_usage_counts(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key, raw_value in source.items():
+        if isinstance(raw_value, dict):
+            current = target.get(key)
+            if not isinstance(current, dict):
+                current = {}
+                target[key] = current
+            _merge_usage_counts(current, raw_value)
+            continue
+        if isinstance(raw_value, bool):
+            continue
+        try:
+            value = max(0, int(raw_value))
+        except (TypeError, ValueError):
+            continue
+        target[key] = int(target.get(key) or 0) + value
+
+
 class WorkflowPause(RuntimeError):
     def __init__(
         self,
@@ -108,6 +128,253 @@ class WorkflowPause(RuntimeError):
         self.prompt = prompt
         self.state = state
         self.payload_hash = payload_hash
+
+
+PROSPECTING_DISCOVERY_CONTRACT_V1 = 'interact.crm.prospecting.discovery.v1'
+PROSPECTING_DISCOVERY_CONTRACT = 'interact.crm.prospecting.discovery.v2'
+_PROSPECTING_EVIDENCE_TYPES = {'website', 'directory', 'news', 'job_posting', 'trade_show'}
+_PROSPECTING_EMAIL_TYPES = {'personal', 'role', 'unknown'}
+_PROSPECTING_EMAIL_PATTERN = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+_PROSPECTING_PROFILE_FIELDS = {
+    'industries',
+    'productKeywords',
+    'needSignals',
+    'exclusionSignals',
+}
+
+
+def _contract_text(value: Any, *, maximum: int, nullable: bool = True) -> str | None:
+    if value is None:
+        return None if nullable else ''
+    text = str(value).strip()
+    if not text:
+        return None if nullable else ''
+    return text[:maximum]
+
+
+def _contract_url(value: Any) -> str | None:
+    text = _contract_text(value, maximum=2000)
+    if not text:
+        return None
+    parsed = urlparse(text)
+    return text if parsed.scheme in {'http', 'https'} and parsed.hostname else None
+
+
+def _contract_email(value: Any) -> str | None:
+    text = _contract_text(value, maximum=320)
+    if not text:
+        return None
+    normalized = text.lower()
+    return normalized if _PROSPECTING_EMAIL_PATTERN.fullmatch(normalized) else None
+
+
+def _contract_score(value: Any) -> int:
+    try:
+        return max(0, min(100, round(float(value))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _contract_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def _normalize_prospecting_evidence(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    url = _contract_url(value.get('url'))
+    title = _contract_text(value.get('title'), maximum=300, nullable=False)
+    excerpt = _contract_text(value.get('excerpt'), maximum=3000, nullable=False)
+    if not url or len(title or '') < 2 or len(excerpt or '') < 5:
+        return None
+    evidence_type = str(value.get('type') or 'website').strip()
+    observed_at = _contract_text(value.get('observedAt'), maximum=10)
+    if observed_at and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', observed_at):
+        observed_at = None
+    return {
+        'type': evidence_type if evidence_type in _PROSPECTING_EVIDENCE_TYPES else 'website',
+        'title': title,
+        'url': url,
+        'excerpt': excerpt,
+        'supportsNeed': _contract_bool(value.get('supportsNeed'), True),
+        'confidence': _contract_score(value.get('confidence', 50)),
+        'observedAt': observed_at,
+    }
+
+
+def _normalize_prospecting_contact(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    email = _contract_email(value.get('email'))
+    source_url = _contract_url(value.get('sourceUrl'))
+    source_excerpt = _contract_text(value.get('sourceExcerpt'), maximum=3000, nullable=False)
+    if not email or not source_url or len(source_excerpt or '') < 5:
+        return None
+    email_type = str(value.get('emailType') or 'unknown').strip()
+    return {
+        'name': _contract_text(value.get('name'), maximum=500),
+        'title': _contract_text(value.get('title'), maximum=500),
+        'department': _contract_text(value.get('department'), maximum=500),
+        'email': email,
+        'emailType': email_type if email_type in _PROSPECTING_EMAIL_TYPES else 'unknown',
+        'sourceUrl': source_url,
+        'sourceExcerpt': source_excerpt,
+        'confidence': _contract_score(value.get('confidence', 50)),
+        'verificationStatus': 'verified',
+    }
+
+
+def _normalize_prospecting_candidate(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    name = _contract_text(value.get('name'), maximum=200, nullable=False)
+    fit_summary = _contract_text(value.get('fitSummary'), maximum=3000, nullable=False)
+    uncertainty = _contract_text(value.get('uncertaintyNotes'), maximum=3000, nullable=False)
+    evidence = [
+        normalized
+        for item in (value.get('evidence') if isinstance(value.get('evidence'), list) else [])[:10]
+        if (normalized := _normalize_prospecting_evidence(item)) is not None
+    ]
+    if len(name or '') < 2 or len(fit_summary or '') < 10 or not evidence:
+        return None
+    if len(uncertainty or '') < 5:
+        uncertainty = '尚待人工確認採購需求、時程與聯絡窗口。'
+    contacts = [
+        normalized
+        for item in (value.get('contacts') if isinstance(value.get('contacts'), list) else [])[:10]
+        if (normalized := _normalize_prospecting_contact(item)) is not None
+    ]
+    scores = {
+        key: _contract_score(value.get(key))
+        for key in (
+            'structuralNeedScore',
+            'capabilityFitScore',
+            'timingScore',
+            'evidenceScore',
+            'commercialFitScore',
+        )
+    }
+    total_score = round(sum(scores.values()) / len(scores))
+    has_supporting_evidence = any(
+        item['supportsNeed'] and item['confidence'] >= 40 for item in evidence
+    )
+    policy_reasons = []
+    if scores['structuralNeedScore'] < 40:
+        policy_reasons.append('結構性需求證據不足')
+    if scores['capabilityFitScore'] < 45:
+        policy_reasons.append('能力適配度不足')
+    if scores['evidenceScore'] < 35 or not has_supporting_evidence:
+        policy_reasons.append('缺少可信的正向來源證據')
+    if total_score < 40:
+        policy_reasons.append('綜合適配分數過低')
+    excluded = _contract_bool(value.get('excluded')) or bool(policy_reasons)
+    exclusion_reason = _contract_text(value.get('exclusionReason'), maximum=500)
+    if policy_reasons and not exclusion_reason:
+        exclusion_reason = '；'.join(policy_reasons)
+    contact_email = _contract_email(value.get('contactEmail'))
+    tax_id_digits = re.sub(r'\D', '', str(value.get('taxId') or ''))
+    tax_id = tax_id_digits if re.fullmatch(r'\d{8}', tax_id_digits) else None
+    return {
+        'name': name,
+        'taxId': tax_id,
+        'industry': _contract_text(value.get('industry'), maximum=500),
+        'city': _contract_text(value.get('city'), maximum=500),
+        'address': _contract_text(value.get('address'), maximum=500),
+        'website': _contract_url(value.get('website')),
+        'contactEmail': contact_email,
+        'contacts': contacts,
+        'contactEnrichmentStatus': 'verified' if contacts else 'not_found',
+        'phone': _contract_text(value.get('phone'), maximum=500),
+        **scores,
+        'fitSummary': fit_summary,
+        'uncertaintyNotes': uncertainty,
+        'excluded': excluded,
+        'exclusionReason': exclusion_reason,
+        'evidence': evidence,
+    }
+
+
+def _normalize_profile_suggestion(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or str(value.get('action') or 'add').strip() != 'add':
+        return None
+    field = str(value.get('field') or '').strip()
+    term = _contract_text(value.get('term'), maximum=80, nullable=False)
+    reason = _contract_text(value.get('reason'), maximum=500, nullable=False)
+    if field not in _PROSPECTING_PROFILE_FIELDS or len(term or '') < 2 or len(reason or '') < 10:
+        return None
+    evidence_urls = []
+    for item in (value.get('evidenceUrls') if isinstance(value.get('evidenceUrls'), list) else [])[:5]:
+        url = _contract_url(item)
+        if url and url not in evidence_urls:
+            evidence_urls.append(url)
+    if not evidence_urls:
+        return None
+    return {
+        'action': 'add',
+        'field': field,
+        'term': term,
+        'reason': reason,
+        'confidence': _contract_score(value.get('confidence', 0)),
+        'evidenceUrls': evidence_urls,
+    }
+
+
+def _normalize_prospecting_discovery(
+    value: Any,
+    *,
+    include_profile_suggestions: bool = True,
+) -> dict[str, Any]:
+    if isinstance(value, list):
+        value = next(
+            (item for item in value if isinstance(item, dict) and isinstance(item.get('candidates'), list)),
+            None,
+        )
+    if not isinstance(value, dict) or not isinstance(value.get('candidates'), list):
+        raise WorkflowRuntimeError('Prospecting output must contain a candidates array.')
+    raw_candidates = value.get('candidates', [])[:50]
+    candidates = [
+        normalized
+        for item in raw_candidates
+        if (normalized := _normalize_prospecting_candidate(item)) is not None
+    ]
+    if raw_candidates and not candidates:
+        raise WorkflowRuntimeError('Prospecting output did not contain any structurally valid candidates.')
+    notes: list[str] = []
+    raw_notes = value.get('notes') if isinstance(value.get('notes'), list) else []
+    for item in raw_notes[:20]:
+        note_value = item.get('note') if isinstance(item, dict) else item
+        note = _contract_text(note_value, maximum=500)
+        if note:
+            notes.append(note)
+    dropped = len(raw_candidates) - len(candidates)
+    if dropped:
+        notes.append(f'已略過 {dropped} 筆缺少公司名稱、適配說明或公開來源的無效候選。')
+    result = {'version': '1', 'candidates': candidates, 'notes': notes[:20]}
+    if include_profile_suggestions:
+        suggestions = [
+            normalized
+            for item in (
+                value.get('profileSuggestions')
+                if isinstance(value.get('profileSuggestions'), list)
+                else []
+            )[:5]
+            if (normalized := _normalize_profile_suggestion(item)) is not None
+        ]
+        result['profileSuggestions'] = suggestions
+    return result
+
+
+def _normalize_output_contract(value: Any, contract: str) -> Any:
+    if contract in {PROSPECTING_DISCOVERY_CONTRACT_V1, PROSPECTING_DISCOVERY_CONTRACT}:
+        return _normalize_prospecting_discovery(
+            value,
+            include_profile_suggestions=contract == PROSPECTING_DISCOVERY_CONTRACT,
+        )
+    return value
 
 
 def node_semantic_type(node: dict[str, Any]) -> str:
@@ -440,7 +707,11 @@ async def execute_workflow_graph(
     active_edges: dict[str, bool] = {str(key): bool(value) for key, value in (state.get('active_edges') or {}).items()}
     outputs: list[dict[str, Any]] = []
     node_results = list(state.get('node_results') or [])
-    total_usage = dict(state.get('usage') or {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0})
+    total_usage = deepcopy(
+        state.get('usage') or {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+    )
+    execution_usage: dict[str, Any] = {}
+    model_calls = 0
     used_model_ids = list(state.get('model_ids') or [])
 
     def checkpoint_state() -> dict[str, Any]:
@@ -449,6 +720,8 @@ async def execute_workflow_graph(
             'active_edges': active_edges,
             'node_results': node_results,
             'usage': total_usage,
+            'execution_usage': execution_usage,
+            'model_calls': model_calls,
             'model_ids': used_model_ids,
             'input': workflow_input,
         }
@@ -490,21 +763,67 @@ async def execute_workflow_graph(
             prompt_input = incoming.get('value') if isinstance(incoming, dict) and 'value' in incoming else incoming
             system_prompt = str(config.get('system_prompt') or inherited_system or '').strip() or None
             prompt = _value_text(prompt_input) or workflow_input['message']
-            model_result = await model_runner(prompt, system_prompt, model_id, workflow_input['parts'])
-            value = {'type': 'text', 'text': str(model_result.get('text') or '')}
-            usage = model_result.get('usage') if isinstance(model_result.get('usage'), dict) else {}
-            for key in total_usage:
-                total_usage[key] += int(usage.get(key) or 0)
-            resolved_model_id = str(model_result.get('model_id') or model_id or '')
-            if resolved_model_id and resolved_model_id not in used_model_ids:
-                used_model_ids.append(resolved_model_id)
+            output_contract = str(config.get('output_contract') or '').strip()
+            max_attempts = max(1, min(3, int(config.get('max_attempts') or 1)))
+            last_contract_error: WorkflowRuntimeError | None = None
+            value = {'type': 'text', 'text': ''}
+            for attempt in range(max_attempts):
+                retry_prompt = prompt
+                if attempt:
+                    retry_prompt += (
+                        '\n\n前次回應為空白或不符合指定 JSON 契約。'
+                        '請重新輸出單一 JSON 物件，不要加入 Markdown、說明文字或額外欄位。'
+                    )
+                model_result = await model_runner(
+                    retry_prompt,
+                    system_prompt,
+                    model_id,
+                    workflow_input['parts'],
+                )
+                usage = model_result.get('usage') if isinstance(model_result.get('usage'), dict) else {}
+                _merge_usage_counts(total_usage, usage)
+                _merge_usage_counts(execution_usage, usage)
+                model_calls += 1
+                resolved_model_id = str(model_result.get('model_id') or model_id or '')
+                if resolved_model_id and resolved_model_id not in used_model_ids:
+                    used_model_ids.append(resolved_model_id)
+                text = str(model_result.get('text') or '').strip()
+                diagnostic = str(model_result.get('diagnostic') or '').strip()
+                if not output_contract:
+                    value = {'type': 'text', 'text': text}
+                    break
+                if not text:
+                    last_contract_error = WorkflowRuntimeError(
+                        'Model provider returned no public output text.'
+                        + (f' Response shape: {diagnostic}' if diagnostic else '')
+                    )
+                    continue
+                try:
+                    parsed = _parse_json_value({'type': 'text', 'text': text})
+                    normalized = _normalize_output_contract(parsed, output_contract)
+                    value = {
+                        'type': 'text',
+                        'text': json.dumps(normalized, ensure_ascii=False),
+                    }
+                    last_contract_error = None
+                    break
+                except WorkflowRuntimeError as exc:
+                    last_contract_error = exc
+            if last_contract_error is not None:
+                raise WorkflowRuntimeError(
+                    f'Model output failed the required contract after {max_attempts} attempts: '
+                    f'{last_contract_error}'
+                ) from last_contract_error
         elif node_type == 'calculator':
             expression = _render_template(str(config.get('expression') or '{{input}}'), workflow_input, incoming)
             value = {'type': 'text', 'text': str(_safe_calculate(expression))}
         elif node_type == 'transform_json':
             value = config.get('value', incoming)
         elif node_type == 'json_parse':
-            value = _parse_json_value(incoming)
+            value = _normalize_output_contract(
+                _parse_json_value(incoming),
+                str(config.get('output_contract') or '').strip(),
+            )
         elif node_type == 'extract_fields':
             text = _value_text(incoming)
             fields = config.get('fields') if isinstance(config.get('fields'), list) else []
@@ -676,6 +995,8 @@ async def execute_workflow_graph(
         'outputs': outputs,
         'nodes': node_results,
         'usage': total_usage,
+        'execution_usage': execution_usage,
+        'model_calls': model_calls,
         'model_ids': used_model_ids,
         'input': workflow_input,
         'status': 'success',

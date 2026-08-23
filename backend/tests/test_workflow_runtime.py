@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from open_webui.routers.interact_channels import (
 from open_webui.utils.interact_billing import estimate_reserved_tokens
 from open_webui.utils.line_rich_menu import parse_line_postback_data
 from open_webui.utils.workflow_runtime import (
+    PROSPECTING_DISCOVERY_CONTRACT,
     WorkflowPause,
     WorkflowRuntimeError,
     execute_workflow_graph,
@@ -376,6 +378,145 @@ async def test_json_parse_accepts_fenced_model_output_and_rejects_invalid_json()
         await execute_workflow_graph(invalid_graph, {'message': 'not json'})
 
 
+@pytest.mark.asyncio
+async def test_prospecting_contract_retries_empty_output_and_normalizes_schema_drift():
+    calls = 0
+
+    async def model_runner(prompt, system_prompt, model_id, parts):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {'text': '', 'model_id': model_id, 'usage': {'total_tokens': 1}}
+        return {
+            'text': '''{
+                "version": 1,
+                "candidates": [{
+                    "name": "範例自動化有限公司",
+                    "taxId": "22099131",
+                    "industry": "自動化設備",
+                    "website": "https://example.com",
+                    "structuralNeedScore": 60,
+                    "capabilityFitScore": 70,
+                    "timingScore": 20,
+                    "evidenceScore": 60,
+                    "commercialFitScore": 55,
+                    "fitSummary": "官方網站顯示該公司設計及製造客製自動化設備。",
+                    "uncertaintyNotes": "尚未確認目前採購時程。",
+                    "evidence": [{
+                        "type": "website",
+                        "title": "產品服務",
+                        "url": "https://example.com",
+                        "excerpt": "提供客製自動化設備設計與製造服務。",
+                        "supportsNeed": true,
+                        "confidence": 80
+                    }]
+                }],
+                "notes": [{"note": "僅使用公開來源。"}],
+                "profileSuggestions": [{
+                    "action": "add",
+                    "field": "productKeywords",
+                    "term": "客製自動化設備",
+                    "reason": "公開來源顯示候選公司持續提供客製自動化設備。",
+                    "confidence": 88,
+                    "evidenceUrls": ["https://example.com"]
+                }]
+            }''',
+            'model_id': model_id,
+            'usage': {'total_tokens': 2},
+        }
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'form_input'}},
+            {
+                'id': 'model',
+                'data': {
+                    'type': 'agent',
+                    'config': {
+                        'model_id': 'model-a',
+                        'output_contract': PROSPECTING_DISCOVERY_CONTRACT,
+                        'max_attempts': 2,
+                    },
+                },
+            },
+            {
+                'id': 'parse',
+                'data': {
+                    'type': 'json_parse',
+                    'config': {'output_contract': PROSPECTING_DISCOVERY_CONTRACT},
+                },
+            },
+            {'id': 'output', 'data': {'type': 'webhook_response'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'model'},
+            {'source': 'model', 'target': 'parse'},
+            {'source': 'parse', 'target': 'output'},
+        ],
+    }
+
+    result = await execute_workflow_graph(graph, {'message': 'find prospects'}, model_runner=model_runner)
+
+    assert calls == 2
+    assert result['outputs'][0]['value']['version'] == '1'
+    assert result['outputs'][0]['value']['notes'] == ['僅使用公開來源。']
+    assert result['outputs'][0]['value']['candidates'][0]['excluded'] is False
+    assert result['outputs'][0]['value']['candidates'][0]['taxId'] == '22099131'
+    assert result['outputs'][0]['value']['profileSuggestions'][0]['term'] == '客製自動化設備'
+
+
+@pytest.mark.asyncio
+async def test_prospecting_contract_excludes_low_fit_candidates_before_enrichment():
+    async def model_runner(prompt, system_prompt, model_id, parts):
+        return {
+            'text': '''{
+                "version": "1",
+                "candidates": [{
+                    "name": "範例電鍍有限公司",
+                    "structuralNeedScore": 20,
+                    "capabilityFitScore": 15,
+                    "timingScore": 20,
+                    "evidenceScore": 35,
+                    "commercialFitScore": 20,
+                    "fitSummary": "該公司提供表面處理代工，並非目標設備製造商。",
+                    "uncertaintyNotes": "未發現自有設備設計或製造能力。",
+                    "excluded": false,
+                    "evidence": [{
+                        "title": "公司服務",
+                        "url": "https://plating.example.com",
+                        "excerpt": "提供金屬表面處理與電鍍代工服務。",
+                        "supportsNeed": false,
+                        "confidence": 60
+                    }]
+                }],
+                "notes": []
+            }''',
+            'model_id': model_id,
+            'usage': {},
+        }
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'form_input'}},
+            {'id': 'model', 'data': {'type': 'agent', 'config': {
+                'model_id': 'model-a',
+                'output_contract': PROSPECTING_DISCOVERY_CONTRACT,
+            }}},
+            {'id': 'output', 'data': {'type': 'webhook_response'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'model'},
+            {'source': 'model', 'target': 'output'},
+        ],
+    }
+
+    result = await execute_workflow_graph(graph, {'message': 'find prospects'}, model_runner=model_runner)
+    candidate = result['outputs'][0]['value']
+    parsed = json.loads(candidate['text'])
+    assert parsed['candidates'][0]['excluded'] is True
+    assert '能力適配度不足' in parsed['candidates'][0]['exclusionReason']
+
+
 def test_line_adapter_uses_native_image_and_falls_back_for_files():
     messages = _line_result_messages(
         {
@@ -499,6 +640,80 @@ async def test_approval_checkpoint_rejects_changed_payload_hash():
                 'payload_hash': 'tampered',
             },
         )
+
+
+@pytest.mark.asyncio
+async def test_resumed_runtime_reports_only_the_current_stage_for_billing():
+    calls = 0
+
+    async def model_runner(prompt, system_prompt, model_id, parts):
+        nonlocal calls
+        calls += 1
+        usage = (
+            {'prompt_tokens': 10, 'completion_tokens': 4, 'total_tokens': 14}
+            if calls == 1
+            else {
+                'input_tokens': 6,
+                'output_tokens': 3,
+                'total_tokens': 9,
+                'output_tokens_details': {'reasoning_tokens': 2},
+            }
+        )
+        return {'text': f'model output {calls}', 'model_id': model_id, 'usage': usage}
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'chat_input'}},
+            {'id': 'draft', 'data': {'type': 'agent', 'config': {'model_id': 'model-a'}}},
+            {'id': 'approval', 'data': {'type': 'approval_gate'}},
+            {'id': 'finalize', 'data': {'type': 'agent', 'config': {'model_id': 'model-a'}}},
+            {'id': 'output', 'data': {'type': 'chat_output'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'draft'},
+            {'source': 'draft', 'target': 'approval'},
+            {'source': 'approval', 'target': 'finalize'},
+            {'source': 'finalize', 'target': 'output'},
+        ],
+    }
+
+    with pytest.raises(WorkflowPause) as paused:
+        await execute_workflow_graph(graph, {'message': 'prepare and approve'}, model_runner=model_runner)
+
+    assert paused.value.state['execution_usage'] == {
+        'prompt_tokens': 10,
+        'completion_tokens': 4,
+        'total_tokens': 14,
+    }
+    assert paused.value.state['model_calls'] == 1
+
+    result = await execute_workflow_graph(
+        graph,
+        {'message': 'prepare and approve'},
+        model_runner=model_runner,
+        resume_state=paused.value.state,
+        resume={
+            'node_id': 'approval',
+            'decision': 'approved',
+            'payload_hash': paused.value.payload_hash,
+        },
+    )
+
+    assert result['usage'] == {
+        'prompt_tokens': 10,
+        'completion_tokens': 4,
+        'total_tokens': 23,
+        'input_tokens': 6,
+        'output_tokens': 3,
+        'output_tokens_details': {'reasoning_tokens': 2},
+    }
+    assert result['execution_usage'] == {
+        'input_tokens': 6,
+        'output_tokens': 3,
+        'total_tokens': 9,
+        'output_tokens_details': {'reasoning_tokens': 2},
+    }
+    assert result['model_calls'] == 1
 
 
 def test_line_adapter_converts_generic_markdown_table_to_mobile_list():

@@ -1,17 +1,18 @@
 import asyncio
 import base64
-import html
 import hashlib
 import hmac
+import html
 import json
 import logging
 import mimetypes
 import os
 import re
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 from uuid import NAMESPACE_URL, uuid5
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -38,6 +39,7 @@ from open_webui.models.workflows import (
     WorkflowValidateResponse,
     WorkflowVersionModel,
 )
+from open_webui.retrieval.utils import get_public_page_links
 from open_webui.routers.interact_email import (
     EmailSendRequest,
     ensure_email_connector_allowed,
@@ -57,7 +59,11 @@ from open_webui.semantic_query.service import (
 from open_webui.storage.provider import Storage
 from open_webui.tools.builtin import (
     fetch_url as builtin_fetch_url,
+)
+from open_webui.tools.builtin import (
     query_knowledge_files,
+)
+from open_webui.tools.builtin import (
     search_web as builtin_search_web,
 )
 from open_webui.tools.interact_database import (
@@ -69,6 +75,7 @@ from open_webui.tools.interact_database import (
 )
 from open_webui.utils.access_control import has_permission
 from open_webui.utils.access_control.files import has_access_to_file
+from open_webui.utils.assistant_content import response_text
 from open_webui.utils.auth import get_verified_user
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.interact_billing import (
@@ -94,6 +101,7 @@ from open_webui.utils.workflow_launch import (
     workflow_requires_confirmation,
 )
 from open_webui.utils.workflow_runtime import (
+    PROSPECTING_DISCOVERY_CONTRACT,
     RUNTIME_MODEL_TYPES,
     WorkflowPause,
     WorkflowRuntimeError,
@@ -124,11 +132,51 @@ from sqlalchemy.ext.asyncio import AsyncSession
 router = APIRouter()
 log = logging.getLogger(__name__)
 
+_DISCOVERY_TRACKING_QUERY_KEYS = {
+    'fbclid',
+    'gclid',
+    'dclid',
+    'msclkid',
+    'mc_cid',
+    'mc_eid',
+}
+
+
+def _normalize_discovery_source_url(value: str) -> str:
+    parsed = urlparse(str(value or '').strip())
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+        return ''
+    host = parsed.hostname.lower()
+    if parsed.port and not (
+        (parsed.scheme == 'http' and parsed.port == 80)
+        or (parsed.scheme == 'https' and parsed.port == 443)
+    ):
+        host = f'{host}:{parsed.port}'
+    path = parsed.path.rstrip('/') or '/'
+    query = urlencode(sorted(
+        (key, item)
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.lower().startswith('utm_')
+        and key.lower() not in _DISCOVERY_TRACKING_QUERY_KEYS
+    ))
+    return f'{parsed.scheme}://{host}{path}' + (f'?{query}' if query else '')
+
 PAGE_ITEM_COUNT = 30
 MANAGED_PROSPECTING_WORKFLOW_KEY = 'interact.crm.prospecting.discovery'
-MANAGED_PROSPECTING_WORKFLOW_VERSION = 1
+MANAGED_PROSPECTING_WORKFLOW_VERSION = 7
 MANAGED_PROSPECTING_MODEL_USE_CASE = 'prospecting_discovery'
 _managed_workflow_locks: dict[str, asyncio.Lock] = {}
+_deferred_workflow_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _schedule_deferred_workflow(factory: Callable[[], Awaitable[None]]) -> None:
+    def start() -> None:
+        task = asyncio.create_task(factory())
+        _deferred_workflow_tasks.add(task)
+        task.add_done_callback(_deferred_workflow_tasks.discard)
+
+    # Let the ASGI response flush before a search provider performs any blocking setup.
+    asyncio.get_running_loop().call_later(0.5, start)
 
 
 def _managed_prospecting_workflow_id(company_user_id: str) -> str:
@@ -189,11 +237,24 @@ def _managed_prospecting_workflow_graph(model_id: str) -> dict[str, Any]:
 CRM 探索條件：
 {{search_brief}}
 
+先檢查 search_brief.mode：
+- 若為 candidate_contact_enrichment，只能處理 targetCandidates 中明確列出的公司。
+  公司正式名稱必須與清單相符，不得新增、替換或推薦其他公司。
+  優先查找官方網站、公開企業 Email、聯絡人與可逐筆驗證的來源。
+  找不到時保留該公司並將聯絡欄位填 null，不得猜測 Email。
+- 其他模式才可依目標客群探索新的候選公司。
+- excludedIdentitySummary 是 CRM 已有的公司身分摘要。不得再次推薦名稱、統編或官網網域相同的公司。
+- commercialEntryPoints 由 CRM「產品與切入點中心」即時計算，應用其中的產品、材料、設備與訊號擴展搜尋方向。
+  這些關聯只代表可能的業務切入點，不代表候選公司已確認有採購需求；仍須以公開頁面逐筆提供命中證據。
+- 優先探索本輪指定且尚未覆蓋的地區、應用、名錄或需求訊號，不要退回泛用熱門公司清單。
+- 若 search_brief.profileOptimization.mode 為 off，profileSuggestions 必須回傳空陣列。
+
 輸出單一 JSON 物件，不要使用 Markdown。格式必須是：
 {
   "version": "1",
   "candidates": [{
     "name": "公司正式名稱",
+    "taxId": "公開來源可確認的台灣 8 位統編或 null",
     "industry": "產業或 null",
     "city": "城市或 null",
     "address": "公開地址或 null",
@@ -230,13 +291,29 @@ CRM 探索條件：
       "observedAt": null
     }]
   }],
-  "notes": []
+  "notes": [],
+  "profileSuggestions": [{
+    "action": "add",
+    "field": "needSignals",
+    "term": "可重複使用的一般化搜尋條件",
+    "reason": "至少兩家候選與哪些公開證據支持這項調整",
+    "confidence": 0,
+    "evidenceUrls": ["https://本輪搜尋結果中的實際網址"]
+  }]
 }
 
 每家公司至少要有一筆含公開 URL 的證據。evidence.url 必須逐字複製本次搜尋結果中的 URL，不得自行組合或猜測。
-website 只有在搜尋資料能確認為公司官方網站時填寫，否則填 null。Email 與電話只有在本次讀取的公開頁文字中出現時才能填寫。
+website 只有在搜尋資料能確認為公司官方網站時填寫，否則填 null。
+Email 與電話只有在本次讀取的公開頁文字中出現時才能填寫。
+統編只有在本次搜尋內容明確出現 8 位數字時才能填寫；CRM 仍會再向官方登記資料驗證，不得猜測。
 辨識不出正式公司名稱、只有社群帳號、只有產品名、或沒有來源 URL 時不要列入。
-排除條件命中時仍可列出，但 excluded 必須為 true 並說明原因。分數必須保守，沒有採購或擴產時機證據時 timingScore 不得高於 35。"""
+排除條件命中時仍可列出，但 excluded 必須為 true 並說明原因。
+分數必須保守，沒有採購或擴產時機證據時 timingScore 不得高於 35。
+
+profileSuggestions 只用於改善未來搜尋輪廓，最多 5 項；candidate_contact_enrichment 模式必須回傳空陣列。
+field 只能是 industries、productKeywords、needSignals、exclusionSignals 其中一個。
+只有同一個一般化條件獲得至少兩家候選的公開證據支持時才能建議。不得放入公司名稱、Email、電話、地址、統編、客戶名稱、圖面、尺寸、公差或其他機密資訊。
+只可建議新增條件，不得要求刪除或改寫既有條件。evidenceUrls 必須逐字複製本輪搜尋結果中的 URL。"""
     node_specs = [
         (
             'input-guidance',
@@ -254,15 +331,32 @@ website 只有在搜尋資料能確認為公司官方網站時填寫，否則填
                 'queries_input_key': 'search_queries',
                 'max_queries': 6,
                 'result_count': 6,
+                'retry_attempts': 2,
                 'fetch_pages': 6,
                 'max_content_chars': 6000,
                 'allowed_domains': [],
                 'blocked_domains': [],
+                'blocked_domains_input_key': 'excluded_domains',
+                'blocked_urls_input_key': 'seen_source_urls',
             },
         ),
         ('candidate-policy', 'system_prompt', '候選判斷規則', {'text': prompt}),
-        ('candidate-agent', 'agent', 'AI 結構化候選', {'model_id': model_id}),
-        ('candidate-json', 'json_parse', '驗證候選 JSON', {}),
+        (
+            'candidate-agent',
+            'agent',
+            'AI 結構化候選',
+            {
+                'model_id': model_id,
+                'output_contract': PROSPECTING_DISCOVERY_CONTRACT,
+                'max_attempts': 2,
+            },
+        ),
+        (
+            'candidate-json',
+            'json_parse',
+            '驗證候選 JSON',
+            {'output_contract': PROSPECTING_DISCOVERY_CONTRACT},
+        ),
         (
             'contact-enrichment',
             'prospect_contact_enrichment',
@@ -272,6 +366,7 @@ website 只有在搜尋資料能確認為公司官方網站時填寫，否則填
                 'result_count': 5,
                 'pages_per_candidate': 3,
                 'max_content_chars': 12000,
+                'concurrency': 2,
             },
         ),
         ('result-merge', 'merge', '合併候選與實際來源', {}),
@@ -335,7 +430,11 @@ def _prioritize_web_search_fetch_results(
 
 
 PROSPECT_EMAIL_PATTERN = re.compile(
-    r'(?i)(?<![\w.+-])([\w.+-]{1,64}@(?:[a-z0-9-]+\.)+[a-z]{2,})(?![\w.-])'
+    r'(?i)(?<![a-z0-9_.+-])([a-z0-9_.+-]{1,64}@(?:[a-z0-9-]+\.)+[a-z]{2,})(?![a-z0-9_.-])'
+)
+PROSPECT_JOINED_EMAIL_BOUNDARY_PATTERN = re.compile(
+    r'(?i)(\.(?:com|net|org|edu|gov|mil|biz|info|io|ai|co)(?:\.[a-z]{2})?)'
+    r'(?=[a-z0-9][a-z0-9_.+-]{0,63}@)'
 )
 PROSPECT_ROLE_LOCALS = {
     'business',
@@ -368,7 +467,7 @@ def _normalized_company_identity(value: Any) -> str:
         r'[\W_]+|股份有限公司|有限公司|企業有限公司|公司$',
         '',
         str(value or '').strip().lower(),
-)
+    )
 
 
 def _campaign_email_idempotency_material(
@@ -419,8 +518,7 @@ def _validate_email_campaign_policy(campaign: dict[str, Any], connector: Any) ->
         recipient_count = 1
     if recipient_count > policy['max_campaign_recipients']:
         raise WorkflowRuntimeError(
-            'Campaign recipient count exceeds the connector limit of '
-            f'{policy["max_campaign_recipients"]}.'
+            f'Campaign recipient count exceeds the connector limit of {policy["max_campaign_recipients"]}.'
         )
     cooldown_days = _bounded_runtime_int(
         campaign.get('cooldown_days'),
@@ -430,8 +528,7 @@ def _validate_email_campaign_policy(campaign: dict[str, Any], connector: Any) ->
     )
     if cooldown_days < policy['campaign_cooldown_days']:
         raise WorkflowRuntimeError(
-            'Campaign cooldown is shorter than the connector minimum of '
-            f'{policy["campaign_cooldown_days"]} days.'
+            f'Campaign cooldown is shorter than the connector minimum of {policy["campaign_cooldown_days"]} days.'
         )
     if policy['require_unsubscribe'] and not campaign.get('unsubscribe_url'):
         raise WorkflowRuntimeError('Campaign email is missing the required unsubscribe URL.')
@@ -472,15 +569,18 @@ def _public_contacts_from_text(
     identity = _normalized_company_identity(company_name)
     source_domain = (urlparse(source_url).hostname or '').lower().removeprefix('www.')
     official_source = bool(
-        official_domain
-        and (source_domain == official_domain or source_domain.endswith(f'.{official_domain}'))
+        official_domain and (source_domain == official_domain or source_domain.endswith(f'.{official_domain}'))
     )
     if not official_source and (not identity or identity not in normalized_text):
         return []
 
+    # Some HTML-to-text loaders remove the separator between adjacent email
+    # elements. Restore only an unambiguous boundary after a common public
+    # suffix when another complete local part and @ immediately follow.
+    searchable_text = PROSPECT_JOINED_EMAIL_BOUNDARY_PATTERN.sub(r'\1 ', text)
     contacts: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for match in PROSPECT_EMAIL_PATTERN.finditer(text):
+    for match in PROSPECT_EMAIL_PATTERN.finditer(searchable_text):
         email = match.group(1).strip('.,;:，；：').lower()
         if email in seen:
             continue
@@ -492,7 +592,11 @@ def _public_contacts_from_text(
         ):
             continue
         seen.add(email)
-        excerpt = re.sub(r'\s+', ' ', text[max(0, match.start() - 180) : match.end() + 180]).strip()
+        excerpt = re.sub(
+            r'\s+',
+            ' ',
+            searchable_text[max(0, match.start() - 180) : match.end() + 180],
+        ).strip()
         contacts.append(
             {
                 'name': _contact_name_from_excerpt(excerpt),
@@ -507,6 +611,191 @@ def _public_contacts_from_text(
             }
         )
     return contacts
+
+
+def _contact_enrichment_should_skip(candidate: dict[str, Any], *, contact_only_mode: bool) -> bool:
+    return bool(candidate.get('excluded')) and not contact_only_mode
+
+
+def _official_website_variants(website: str) -> list[str]:
+    parsed = urlparse(str(website or '').strip())
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+        return []
+    variants = [parsed.geturl()]
+    if parsed.scheme == 'http':
+        variants.insert(0, parsed._replace(scheme='https').geturl())
+    return variants
+
+
+def _official_contact_page_urls(website: str) -> list[str]:
+    parsed = urlparse(str(website or '').strip())
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+        return []
+
+    origins = [
+        f'{urlparse(variant).scheme}://{urlparse(variant).netloc}/'
+        for variant in _official_website_variants(website)
+    ]
+    path_segments = [segment for segment in parsed.path.split('/') if segment]
+    locale_prefix = ''
+    if path_segments and re.fullmatch(r'[a-z]{2}(?:-[a-z]{2})?', path_segments[0], re.IGNORECASE):
+        locale_prefix = f'{path_segments[0]}/'
+
+    common_paths = (
+        'contact-us.htm',
+        'contact-us.html',
+        'contact-us',
+        'contact',
+        'contact.html',
+        'contact.htm',
+    )
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for origin in origins:
+        for prefix in (locale_prefix, ''):
+            for path in common_paths:
+                url = urljoin(origin, f'{prefix}{path}')
+                if url not in seen:
+                    seen.add(url)
+                    candidates.append(url)
+    return candidates
+
+
+def _contact_official_websites(
+    candidate: dict[str, Any],
+    search_brief: dict[str, Any],
+) -> list[str]:
+    websites: list[str] = []
+    candidate_name = _normalized_company_identity(candidate.get('name'))
+    values: list[Any] = [candidate.get('website')]
+    if search_brief.get('mode') == 'candidate_contact_enrichment':
+        for target in search_brief.get('targetCandidates') or []:
+            if (
+                isinstance(target, dict)
+                and candidate_name
+                and _normalized_company_identity(target.get('name')) == candidate_name
+            ):
+                values.append(target.get('website'))
+    for value in values:
+        website = str(value or '').strip()
+        parsed = urlparse(website)
+        if parsed.scheme in {'http', 'https'} and parsed.hostname and website not in websites:
+            websites.append(website)
+    return websites
+
+
+def _contact_target_candidate(
+    candidate: dict[str, Any],
+    search_brief: dict[str, Any],
+) -> dict[str, Any] | None:
+    candidate_identity = _normalized_company_identity(candidate.get('name'))
+    candidate_domain = (
+        urlparse(str(candidate.get('website') or '')).hostname or ''
+    ).lower().removeprefix('www.')
+    for raw_target in search_brief.get('targetCandidates') or []:
+        if not isinstance(raw_target, dict):
+            continue
+        target_identity = _normalized_company_identity(raw_target.get('name'))
+        if candidate_identity and candidate_identity == target_identity:
+            return raw_target
+        target_domain = (
+            urlparse(str(raw_target.get('website') or '')).hostname or ''
+        ).lower().removeprefix('www.')
+        if candidate_domain and target_domain and (
+            candidate_domain == target_domain
+            or candidate_domain.endswith(f'.{target_domain}')
+            or target_domain.endswith(f'.{candidate_domain}')
+        ):
+            return raw_target
+    return None
+
+
+def _usable_fetched_page_content(content: str) -> bool:
+    normalized = re.sub(r'\s+', ' ', str(content or '')).strip().lower()
+    if not normalized:
+        return False
+    blocked_markers = (
+        '403 forbidden',
+        '404 not found',
+        '500 internal server error',
+        '502 bad gateway',
+        '503 service unavailable',
+        'access denied',
+    )
+    return not any(normalized.startswith(marker) for marker in blocked_markers)
+
+
+def _contact_navigation_links(
+    links: list[dict[str, Any]],
+    official_domains: list[str],
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    exact_labels = {
+        '聯絡我們',
+        '聯繫我們',
+        '聯絡資訊',
+        '聯絡方式',
+        '联系我们',
+        '联系信息',
+        'contact',
+        'contactus',
+        'getintouch',
+        'inquiry',
+        'enquiry',
+        'お問い合わせ',
+    }
+    partial_labels = (*exact_labels, '洽詢', '客服中心', '業務洽詢')
+    blocked_tokens = (
+        'privacy',
+        'terms',
+        'career',
+        'jobs',
+        'login',
+        'signin',
+        'facebook',
+        'youtube',
+    )
+    ranked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    normalized_domains = [
+        str(domain or '').strip().lower().removeprefix('www.')
+        for domain in official_domains
+        if str(domain or '').strip()
+    ]
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        url = str(link.get('url') or '').strip()
+        parsed = urlparse(url)
+        source_domain = (parsed.hostname or '').lower().removeprefix('www.')
+        if (
+            parsed.scheme not in {'http', 'https'}
+            or not source_domain
+            or url in seen
+            or not any(
+                source_domain == domain or source_domain.endswith(f'.{domain}')
+                for domain in normalized_domains
+            )
+        ):
+            continue
+        text = re.sub(r'[\s\-_｜|/]+', '', str(link.get('text') or '').strip().lower())
+        path = parsed.path.lower()
+        combined = f'{path}?{parsed.query}'.lower()
+        if any(token in combined for token in blocked_tokens):
+            continue
+        score = 0
+        if text in exact_labels:
+            score += 120
+        elif any(label in text for label in partial_labels):
+            score += 80
+        if re.search(r'(?:^|[/_.-])(contact(?:-?us)?|contacts?|inquiry|enquiry)(?:[/_.-]|$)', path):
+            score += 70
+        if score <= 0:
+            continue
+        seen.add(url)
+        ranked.append({'url': url, 'text': str(link.get('text') or '').strip(), 'score': score})
+    ranked.sort(key=lambda item: (-int(item['score']), len(item['url']), item['url']))
+    return ranked[: max(1, min(limit, 10))]
 
 
 def _service_token() -> str:
@@ -547,15 +836,9 @@ def _authorize_service_or_crm(
     supplied_service_token = (x_interact_service_token or '').strip()
     bearer = _bearer_token(authorization)
     service_header_valid = bool(
-        expected
-        and supplied_service_token
-        and hmac.compare_digest(supplied_service_token, expected)
+        expected and supplied_service_token and hmac.compare_digest(supplied_service_token, expected)
     )
-    service_bearer_valid = bool(
-        expected
-        and bearer
-        and hmac.compare_digest(bearer, expected)
-    )
+    service_bearer_valid = bool(expected and bearer and hmac.compare_digest(bearer, expected))
     if service_header_valid or service_bearer_valid:
         return None
     if supplied_service_token:
@@ -785,8 +1068,10 @@ def _managed_model_id_for_use_case(
     models: list[dict[str, Any]],
     accessible_ids: list[str],
     use_case: str,
+    preferred_user_id: str | None = None,
 ) -> str | None:
     accessible = set(accessible_ids)
+    matches: list[tuple[bool, str]] = []
     for model in models:
         if not isinstance(model, dict):
             continue
@@ -801,8 +1086,42 @@ def _managed_model_id_for_use_case(
         if isinstance(use_cases, str):
             use_cases = [use_cases]
         if use_case in use_cases:
-            return model_id
-    return None
+            owner_id = str(info.get('user_id') or model.get('user_id') or '').strip()
+            matches.append((bool(preferred_user_id and owner_id == preferred_user_id), model_id))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: not item[0])
+    return matches[0][1]
+
+
+def _runnable_model_ids(
+    models: list[dict[str, Any]],
+    accessible_ids: list[str],
+) -> list[str]:
+    models_by_id = {
+        str(model.get('id') or '').strip(): model
+        for model in models
+        if isinstance(model, dict) and str(model.get('id') or '').strip()
+    }
+
+    def is_runnable(model_id: str, seen: set[str] | None = None) -> bool:
+        model = models_by_id.get(model_id)
+        if not model:
+            return False
+        info = model.get('info') if isinstance(model.get('info'), dict) else {}
+        base_model_id = str(info.get('base_model_id') or '').strip()
+        if not base_model_id:
+            return True
+        visited = set(seen or ())
+        if model_id in visited:
+            return False
+        visited.add(model_id)
+        if base_model_id in models_by_id:
+            return is_runnable(base_model_id, visited)
+        base_name = base_model_id.split(':', 1)[0]
+        return base_name != base_model_id and base_name in models_by_id
+
+    return [model_id for model_id in accessible_ids if is_runnable(model_id)]
 
 
 async def _managed_prospecting_model_id(
@@ -823,24 +1142,26 @@ async def _managed_prospecting_model_id(
         for model in accessible_models
         if isinstance(model, dict) and str(model.get('id') or '').strip()
     ]
-    if current_model_id and current_model_id in accessible_ids:
-        return current_model_id
+    runnable_ids = _runnable_model_ids(all_models, accessible_ids)
     use_case_model_id = _managed_model_id_for_use_case(
         accessible_models,
-        accessible_ids,
+        runnable_ids,
         MANAGED_PROSPECTING_MODEL_USE_CASE,
+        preferred_user_id=str(getattr(user, 'id', '') or '').strip() or None,
     )
     if use_case_model_id:
         return use_case_model_id
+    if current_model_id and current_model_id in runnable_ids:
+        return current_model_id
     configured_defaults = str(await Config.get('ui.default_models') or '')
     for model_id in (item.strip() for item in configured_defaults.split(',')):
-        if model_id and model_id in accessible_ids:
+        if model_id and model_id in runnable_ids:
             return model_id
-    if accessible_ids:
-        return accessible_ids[0]
+    if runnable_ids:
+        return runnable_ids[0]
     raise HTTPException(
         status_code=status.HTTP_409_CONFLICT,
-        detail='企業 WebUI 帳號目前沒有可用模型，無法啟動 AI 潛客探索。',
+        detail='企業 WebUI 帳號目前沒有底層模型可用的 AI 模型，無法啟動潛客探索。',
     )
 
 
@@ -950,12 +1271,8 @@ def _workflow_context_for_service_user(
             if crm_claims
             else (getattr(form_data, 'companyUserId', None) or user.id)
         ),
-        company_member_id=(
-            None if crm_claims else getattr(form_data, 'companyMemberId', None)
-        ),
-        company_member_role=(
-            None if crm_claims else getattr(form_data, 'companyMemberRole', None)
-        ),
+        company_member_id=(None if crm_claims else getattr(form_data, 'companyMemberId', None)),
+        company_member_role=(None if crm_claims else getattr(form_data, 'companyMemberRole', None)),
         channel_id=getattr(form_data, 'channelId', None) or getattr(form_data, 'channel_id', None),
         model_id=getattr(form_data, 'modelId', None) or getattr(form_data, 'model_id', None),
         service_principal=bool(crm_claims),
@@ -1031,9 +1348,7 @@ def _validate_workflow_configuration(
             predecessors = [node_types.get(source) for source in incoming.get(node_id, [])]
             expected_gate = 'campaign_approval_gate' if node_type == 'email_campaign_send' else 'approval_gate'
             if predecessors != [expected_gate]:
-                errors.append(
-                    f'Email send node {node_id} must have exactly one {expected_gate} directly before it.'
-                )
+                errors.append(f'Email send node {node_id} must have exactly one {expected_gate} directly before it.')
             if not str(config.get('connector_id') or '').strip():
                 errors.append(f'Email send node {node_id} requires an email connector.')
         elif node_type == 'customer_contact_lookup':
@@ -1492,13 +1807,46 @@ def _response_data(response: Any) -> dict[str, Any]:
 
 
 def _response_text(response_data: dict[str, Any]) -> str:
+    text = response_text(response_data)
+    if text:
+        return text
+
+    # A few OpenAI-compatible providers still use the legacy completion shape.
     choices = response_data.get('choices') if isinstance(response_data.get('choices'), list) else []
-    if choices:
-        message = choices[0].get('message') if isinstance(choices[0], dict) else {}
-        content = message.get('content') if isinstance(message, dict) else ''
-        if isinstance(content, str):
-            return content
-    return ''
+    if choices and isinstance(choices[0], dict):
+        legacy_text = choices[0].get('text')
+        if isinstance(legacy_text, str):
+            return legacy_text
+    output_text = response_data.get('output_text')
+    return output_text if isinstance(output_text, str) else ''
+
+
+def _response_shape(response_data: dict[str, Any]) -> str:
+    """Describe a provider envelope without logging user or model content."""
+    details: dict[str, Any] = {
+        'keys': sorted(str(key) for key in response_data.keys()),
+    }
+    choices = response_data.get('choices')
+    if isinstance(choices, list):
+        details['choices'] = len(choices)
+        if choices and isinstance(choices[0], dict):
+            choice = choices[0]
+            details['finish_reason'] = choice.get('finish_reason')
+            message = choice.get('message')
+            if isinstance(message, dict):
+                details['message_keys'] = sorted(str(key) for key in message.keys())
+                content = message.get('content')
+                details['content_type'] = type(content).__name__
+                if isinstance(content, str):
+                    details['content_length'] = len(content)
+                elif isinstance(content, list):
+                    details['content_parts'] = [
+                        str(part.get('type') or '') for part in content if isinstance(part, dict)
+                    ]
+    output = response_data.get('output')
+    if isinstance(output, list):
+        details['output_items'] = [str(item.get('type') or '') for item in output if isinstance(item, dict)]
+    return json.dumps(details, ensure_ascii=False, separators=(',', ':'))
 
 
 def _as_bool(value: Any) -> bool:
@@ -1788,6 +2136,10 @@ async def _execute_workflow(
         channel_id=form_data.channel_id,
         model_id=form_data.model_id,
     )
+    managed_meta = version_meta.get('managed') if isinstance(version_meta, dict) else {}
+    is_managed_prospecting = bool(
+        isinstance(managed_meta, dict) and managed_meta.get('key') == MANAGED_PROSPECTING_WORKFLOW_KEY
+    )
 
     async def model_runner(
         prompt: str,
@@ -1809,12 +2161,15 @@ async def _execute_workflow(
             request,
             {'model': resolved_model_id, 'messages': messages, 'stream': False},
             user=user,
+            bypass_system_prompt=is_managed_prospecting,
         )
         response_data = _response_data(response)
         if response_data.get('error'):
             raise WorkflowRuntimeError(str(response_data['error']))
+        text = _response_text(response_data)
         return {
-            'text': _response_text(response_data),
+            'text': text,
+            'diagnostic': _response_shape(response_data) if not text.strip() else '',
             'usage': response_data.get('usage') or {},
             'model_id': response_data.get('model') or resolved_model_id,
         }
@@ -1875,6 +2230,12 @@ async def _execute_workflow(
 
             raw_allowed_domains = config.get('allowed_domains')
             raw_blocked_domains = config.get('blocked_domains')
+            dynamic_blocked_domains = data.get(
+                str(config.get('blocked_domains_input_key') or 'blocked_domains')
+            )
+            dynamic_blocked_urls = data.get(
+                str(config.get('blocked_urls_input_key') or 'blocked_urls')
+            )
             allowed_domains = {
                 str(item).strip().lower()
                 for item in (raw_allowed_domains if isinstance(raw_allowed_domains, list) else [])
@@ -1882,8 +2243,16 @@ async def _execute_workflow(
             }
             blocked_domains = {
                 str(item).strip().lower()
-                for item in (raw_blocked_domains if isinstance(raw_blocked_domains, list) else [])
+                for item in [
+                    *(raw_blocked_domains if isinstance(raw_blocked_domains, list) else []),
+                    *(dynamic_blocked_domains if isinstance(dynamic_blocked_domains, list) else []),
+                ]
                 if str(item).strip()
+            }
+            blocked_urls = {
+                normalized
+                for item in (dynamic_blocked_urls if isinstance(dynamic_blocked_urls, list) else [])
+                if (normalized := _normalize_discovery_source_url(str(item)))
             }
 
             def domain_allowed(url: str) -> bool:
@@ -1903,28 +2272,49 @@ async def _execute_workflow(
 
             results: list[dict[str, Any]] = []
             seen_urls: set[str] = set()
+            query_errors: list[dict[str, str]] = []
+            retry_attempts = _bounded_runtime_int(config.get('retry_attempts'), 2, 1, 3)
             for query_order, query in enumerate(queries):
-                raw_results = await builtin_search_web(
-                    query,
-                    result_count,
-                    __request__=request,
-                    __user__=user.model_dump(),
-                )
-                try:
-                    parsed_results = json.loads(raw_results)
-                except (TypeError, json.JSONDecodeError) as exc:
-                    raise WorkflowRuntimeError('Web search returned an invalid response.') from exc
-                if isinstance(parsed_results, dict) and parsed_results.get('error'):
-                    raise WorkflowRuntimeError(str(parsed_results['error']))
-                if not isinstance(parsed_results, list):
-                    raise WorkflowRuntimeError('Web search returned an invalid result list.')
+                parsed_results: Any = None
+                query_error = '搜尋服務沒有回傳結果'
+                for search_attempt in range(retry_attempts):
+                    raw_results = await builtin_search_web(
+                        query,
+                        result_count,
+                        __request__=request,
+                        __user__=user.model_dump(),
+                    )
+                    try:
+                        parsed_results = json.loads(raw_results)
+                    except (TypeError, json.JSONDecodeError):
+                        parsed_results = None
+                        query_error = '搜尋服務回傳格式不正確'
+                    if isinstance(parsed_results, dict) and parsed_results.get('error'):
+                        query_error = str(parsed_results['error'])[:500]
+                        parsed_results = None
+                    elif isinstance(parsed_results, list) and parsed_results:
+                        break
+                    elif parsed_results is not None and not isinstance(parsed_results, list):
+                        query_error = '搜尋服務未回傳結果清單'
+                        parsed_results = None
+                    if search_attempt + 1 < retry_attempts:
+                        await asyncio.sleep(0.4 * (search_attempt + 1))
+                if not isinstance(parsed_results, list) or not parsed_results:
+                    query_errors.append({'query': query, 'error': query_error})
+                    continue
                 for result_rank, item in enumerate(parsed_results):
                     if not isinstance(item, dict):
                         continue
                     url = str(item.get('link') or '').strip()
-                    if not url or url in seen_urls or not domain_allowed(url):
+                    normalized_url = _normalize_discovery_source_url(url)
+                    if (
+                        not normalized_url
+                        or normalized_url in seen_urls
+                        or normalized_url in blocked_urls
+                        or not domain_allowed(url)
+                    ):
                         continue
-                    seen_urls.add(url)
+                    seen_urls.add(normalized_url)
                     results.append(
                         {
                             'query': query,
@@ -1935,6 +2325,12 @@ async def _execute_workflow(
                             '_result_rank': result_rank,
                         }
                     )
+
+            if not results:
+                details = '；'.join(item['error'] for item in query_errors[:3])
+                raise WorkflowRuntimeError(
+                    'Public web search did not return any usable results.' + (f' {details}' if details else '')
+                )
 
             fetch_pages = _bounded_runtime_int(config.get('fetch_pages'), 0, 0, 8)
             max_content_chars = _bounded_runtime_int(
@@ -1964,6 +2360,7 @@ async def _execute_workflow(
                 'results': results,
                 'result_count': len(results),
                 'search_brief': data.get('search_brief'),
+                'query_errors': query_errors,
             }
         if node_type == 'fetch_url':
             input_path = str(config.get('input_path') or 'url').strip()
@@ -1998,26 +2395,57 @@ async def _execute_workflow(
             if not isinstance(payload, dict) or not isinstance(payload.get('candidates'), list):
                 raise WorkflowRuntimeError('Prospect contact enrichment requires a candidate payload.')
             max_candidates = _bounded_runtime_int(config.get('max_candidates'), 20, 1, 30)
+            input_data = workflow_input.get('data') if isinstance(workflow_input.get('data'), dict) else {}
+            requested_limit = _bounded_runtime_int(
+                input_data.get('candidate_limit'),
+                max_candidates,
+                1,
+                max_candidates,
+            )
+            max_candidates = min(max_candidates, requested_limit)
             result_count = _bounded_runtime_int(config.get('result_count'), 5, 2, 8)
             pages_per_candidate = _bounded_runtime_int(config.get('pages_per_candidate'), 3, 1, 5)
+            concurrency = _bounded_runtime_int(config.get('concurrency'), 2, 1, 4)
             max_content_chars = _bounded_runtime_int(
                 config.get('max_content_chars'),
                 12_000,
                 1000,
                 30_000,
             )
+            search_brief = input_data.get('search_brief') if isinstance(input_data.get('search_brief'), dict) else {}
+            contact_only_mode = search_brief.get('mode') == 'candidate_contact_enrichment'
             enriched_candidates: list[dict[str, Any]] = []
             source_results: list[dict[str, Any]] = []
+            semaphore = asyncio.Semaphore(concurrency)
 
-            for raw_candidate in payload.get('candidates', [])[:max_candidates]:
+            async def enrich_candidate(raw_candidate: Any) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
                 if not isinstance(raw_candidate, dict):
-                    continue
+                    return None, []
                 candidate = dict(raw_candidate)
+                target_candidate = (
+                    _contact_target_candidate(candidate, search_brief)
+                    if contact_only_mode
+                    else None
+                )
+                if target_candidate:
+                    target_website = str(target_candidate.get('website') or '').strip()
+                    if urlparse(target_website).scheme in {'http', 'https'}:
+                        candidate['website'] = target_website
                 company_name = str(candidate.get('name') or '').strip()
-                website = str(candidate.get('website') or '').strip()
+                official_websites = _contact_official_websites(candidate, search_brief)
+                website = official_websites[0] if official_websites else ''
                 official_domain = (urlparse(website).hostname or '').lower().removeprefix('www.')
                 if not company_name:
-                    continue
+                    return None, []
+
+                if _contact_enrichment_should_skip(candidate, contact_only_mode=contact_only_mode):
+                    candidate['contacts'] = []
+                    candidate['contactEmail'] = None
+                    candidate['contactEnrichmentStatus'] = 'not_found'
+                    return candidate, []
+                if contact_only_mode:
+                    candidate['excluded'] = False
+                    candidate['exclusionReason'] = None
 
                 contacts_by_email: dict[str, dict[str, Any]] = {}
                 for raw_contact in candidate.get('contacts') or []:
@@ -2053,75 +2481,192 @@ async def _execute_workflow(
                                 },
                             )
 
+                for evidence in candidate.get('evidence') or []:
+                    if not isinstance(evidence, dict):
+                        continue
+                    source_url = str(evidence.get('url') or '').strip()
+                    excerpt = str(evidence.get('excerpt') or '').strip()
+                    if not source_url or not excerpt:
+                        continue
+                    for contact in _public_contacts_from_text(
+                        excerpt,
+                        source_url=source_url,
+                        official_domain=official_domain,
+                        company_name=company_name,
+                    ):
+                        current = contacts_by_email.get(contact['email'])
+                        if not current or int(contact.get('confidence') or 0) > int(current.get('confidence') or 0):
+                            contacts_by_email[contact['email']] = contact
+
                 queries = [f'{company_name} 聯絡人 Email 業務']
                 if official_domain:
                     queries.append(f'site:{official_domain} 聯絡 Email')
                 search_items: list[dict[str, Any]] = []
                 seen_urls: set[str] = set()
-                for query in queries[:2]:
-                    raw_results = await builtin_search_web(
-                        query,
-                        result_count,
-                        __request__=request,
-                        __user__=user.model_dump(),
-                    )
-                    try:
-                        parsed_results = json.loads(raw_results)
-                    except (TypeError, json.JSONDecodeError):
-                        parsed_results = []
-                    if not isinstance(parsed_results, list):
-                        continue
-                    for item in parsed_results:
-                        if not isinstance(item, dict):
-                            continue
-                        source_url = str(item.get('link') or '').strip()
-                        parsed_url = urlparse(source_url)
-                        if (
-                            parsed_url.scheme not in {'http', 'https'}
-                            or not parsed_url.hostname
-                            or source_url in seen_urls
+                candidate_sources: list[dict[str, Any]] = []
+                async with semaphore:
+                    for website_order, official_website in enumerate(official_websites):
+                        source_domain = (urlparse(official_website).hostname or '').lower().removeprefix('www.')
+                        navigation_links: list[dict[str, Any]] = []
+                        for variant_order, website_variant in enumerate(
+                            _official_website_variants(official_website)
                         ):
+                            if website_variant not in seen_urls:
+                                seen_urls.add(website_variant)
+                                search_items.append(
+                                    {
+                                        'query': 'official_website',
+                                        'title': f'{company_name} 官方網站',
+                                        'url': website_variant,
+                                        'snippet': '',
+                                        '_official': True,
+                                        '_official_domain': source_domain,
+                                        '_fetch_priority': 2,
+                                        '_probe_order': website_order * 100 + variant_order,
+                                    }
+                                )
+                            try:
+                                page = await get_public_page_links(website_variant, max_links=200)
+                            except Exception as exc:
+                                log.info('Unable to inspect official navigation url=%s error=%s', website_variant, exc)
+                                continue
+                            if not isinstance(page, dict):
+                                continue
+                            page_domain = (
+                                urlparse(str(page.get('source_url') or '')).hostname or ''
+                            ).lower().removeprefix('www.')
+                            navigation_links = _contact_navigation_links(
+                                page.get('links')
+                                if isinstance(page.get('links'), list)
+                                else [],
+                                [source_domain, page_domain],
+                            )
+                            if navigation_links:
+                                break
+                        if navigation_links:
+                            for link_order, link in enumerate(navigation_links):
+                                contact_url = str(link.get('url') or '').strip()
+                                if not contact_url or contact_url in seen_urls:
+                                    continue
+                                seen_urls.add(contact_url)
+                                search_items.append(
+                                    {
+                                        'query': 'official_contact_navigation',
+                                        'title': str(link.get('text') or '').strip()
+                                        or f'{company_name} 官方聯絡頁',
+                                        'url': contact_url,
+                                        'snippet': '',
+                                        '_official': True,
+                                        '_official_domain': source_domain,
+                                        '_fetch_priority': 0,
+                                        '_probe_order': website_order * 100 + link_order,
+                                    }
+                                )
+                        else:
+                            for probe_order, contact_url in enumerate(
+                                _official_contact_page_urls(official_website)
+                            ):
+                                if contact_url in seen_urls:
+                                    continue
+                                seen_urls.add(contact_url)
+                                search_items.append(
+                                    {
+                                        'query': 'official_contact_page_probe',
+                                        'title': f'{company_name} 官方聯絡頁',
+                                        'url': contact_url,
+                                        'snippet': '',
+                                        '_official': True,
+                                        '_official_domain': source_domain,
+                                        '_fetch_priority': 1,
+                                        '_probe_order': website_order * 100 + probe_order,
+                                    }
+                                )
+                    for query in queries[:2]:
+                        try:
+                            raw_results = await builtin_search_web(
+                                query,
+                                result_count,
+                                __request__=request,
+                                __user__=user.model_dump(),
+                            )
+                            parsed_results = json.loads(raw_results)
+                        except (TypeError, json.JSONDecodeError, RuntimeError):
                             continue
-                        seen_urls.add(source_url)
-                        source_domain = parsed_url.hostname.lower().removeprefix('www.')
-                        search_items.append(
-                            {
-                                'query': query,
-                                'title': str(item.get('title') or '').strip(),
-                                'url': source_url,
-                                'snippet': str(item.get('snippet') or '').strip(),
-                                '_official': bool(
-                                    official_domain
-                                    and (
-                                        source_domain == official_domain
-                                        or source_domain.endswith(f'.{official_domain}')
-                                    )
-                                ),
-                            }
+                        if not isinstance(parsed_results, list):
+                            continue
+                        for item in parsed_results:
+                            if not isinstance(item, dict):
+                                continue
+                            source_url = str(item.get('link') or '').strip()
+                            parsed_url = urlparse(source_url)
+                            if (
+                                parsed_url.scheme not in {'http', 'https'}
+                                or not parsed_url.hostname
+                                or source_url in seen_urls
+                            ):
+                                continue
+                            seen_urls.add(source_url)
+                            source_domain = parsed_url.hostname.lower().removeprefix('www.')
+                            search_items.append(
+                                {
+                                    'query': query,
+                                    'title': str(item.get('title') or '').strip(),
+                                    'url': source_url,
+                                    'snippet': str(item.get('snippet') or '').strip(),
+                                    '_official': bool(
+                                        official_domain
+                                        and (
+                                            source_domain == official_domain
+                                            or source_domain.endswith(f'.{official_domain}')
+                                        )
+                                    ),
+                                    '_fetch_priority': (
+                                        3
+                                        if official_domain
+                                        and (
+                                            source_domain == official_domain
+                                            or source_domain.endswith(f'.{official_domain}')
+                                        )
+                                        else 4
+                                    ),
+                                }
+                            )
+                    search_items.sort(
+                        key=lambda item: (
+                            int(item.get('_fetch_priority') or 0),
+                            int(item.get('_probe_order') or 0),
+                            item['url'],
                         )
-                search_items.sort(key=lambda item: (not item['_official'], item['url']))
-                for item in search_items[:pages_per_candidate]:
-                    fetched = await builtin_fetch_url(
-                        item['url'],
-                        __request__=request,
-                        __user__=user.model_dump(),
                     )
-                    content = str(fetched or '').strip()
-                    if content.startswith('{') and '"error"' in content:
-                        continue
-                    item['content'] = content[:max_content_chars]
-                    for contact in _public_contacts_from_text(
-                        item['content'],
-                        source_url=item['url'],
-                        official_domain=official_domain,
-                        company_name=company_name,
-                    ):
-                        current = contacts_by_email.get(contact['email'])
-                        if not current or int(contact.get('confidence') or 0) > int(
-                            current.get('confidence') or 0
+                    fetched_pages = 0
+                    for item in search_items:
+                        if fetched_pages >= pages_per_candidate:
+                            break
+                        try:
+                            fetched = await builtin_fetch_url(
+                                item['url'],
+                                __request__=request,
+                                __user__=user.model_dump(),
+                            )
+                        except RuntimeError:
+                            continue
+                        content = str(fetched or '').strip()
+                        if content.startswith('{') and '"error"' in content:
+                            continue
+                        if not _usable_fetched_page_content(content):
+                            continue
+                        fetched_pages += 1
+                        item['content'] = content[:max_content_chars]
+                        for contact in _public_contacts_from_text(
+                            item['content'],
+                            source_url=item['url'],
+                            official_domain=str(item.get('_official_domain') or official_domain),
+                            company_name=company_name,
                         ):
-                            contacts_by_email[contact['email']] = contact
-                    source_results.append({key: value for key, value in item.items() if not key.startswith('_')})
+                            current = contacts_by_email.get(contact['email'])
+                            if not current or int(contact.get('confidence') or 0) > int(current.get('confidence') or 0):
+                                contacts_by_email[contact['email']] = contact
+                        candidate_sources.append({key: value for key, value in item.items() if not key.startswith('_')})
 
                 contacts = sorted(
                     contacts_by_email.values(),
@@ -2155,7 +2700,16 @@ async def _execute_workflow(
                 else:
                     candidate['contactEmail'] = None
                     candidate['contactEnrichmentStatus'] = 'not_found'
+                return candidate, candidate_sources
+
+            enrichment_results = await asyncio.gather(
+                *(enrich_candidate(raw_candidate) for raw_candidate in payload.get('candidates', [])[:max_candidates])
+            )
+            for candidate, candidate_sources in enrichment_results:
+                if candidate is None:
+                    continue
                 enriched_candidates.append(candidate)
+                source_results.extend(candidate_sources)
 
             return {
                 **payload,
@@ -2319,9 +2873,11 @@ async def _execute_workflow(
             data = workflow_input.get('data') if isinstance(workflow_input.get('data'), dict) else {}
             values = {**data, **source}
             to_value = values.get('to') or values.get('email')
-            to = [str(item).strip().lower() for item in to_value] if isinstance(to_value, list) else [
-                str(to_value or '').strip().lower()
-            ]
+            to = (
+                [str(item).strip().lower() for item in to_value]
+                if isinstance(to_value, list)
+                else [str(to_value or '').strip().lower()]
+            )
             to = [item for item in to if PROSPECT_EMAIL_PATTERN.fullmatch(item)]
             if len(to) != 1:
                 raise WorkflowRuntimeError('Campaign email requires exactly one verified recipient.')
@@ -2510,8 +3066,7 @@ async def _execute_workflow(
                     workflow_id=workflow.id,
                     workflow_run_id=run_id,
                     channel_id=form_data.channel_id,
-                    idempotency_key='wf-'
-                    + hashlib.sha256(idempotency_material.encode()).hexdigest(),
+                    idempotency_key='wf-' + hashlib.sha256(idempotency_material.encode()).hexdigest(),
                     payload_hash=str(approval.get('payload_hash') or ''),
                 ),
             )
@@ -2724,6 +3279,8 @@ async def _save_workflow_pause(
         'checkpoint': card['data'],
         'outputs': [card],
         'usage': pause.state.get('usage') or {},
+        'execution_usage': pause.state.get('execution_usage') or {},
+        'model_calls': int(pause.state.get('model_calls') or 0),
     }
     return await Workflows.complete_run(run.id, wait_status, output=output, db=db)
 
@@ -3273,6 +3830,7 @@ async def service_ensure_managed_prospecting_workflow(
     workflow_id = _managed_prospecting_workflow_id(company_user_id)
     lock = _managed_workflow_locks.setdefault(workflow_id, asyncio.Lock())
     async with lock:
+        template_changed = False
         existing = await Workflows.get_by_id(workflow_id, db=db)
         if existing and existing.user_id != service_user.id:
             raise HTTPException(
@@ -3358,8 +3916,9 @@ async def service_ensure_managed_prospecting_workflow(
                 if not updated:
                     raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
                 workflow = updated
+                template_changed = True
 
-        if workflow.status != 'published' or not workflow.default_version_id:
+        if template_changed or workflow.status != 'published' or not workflow.default_version_id:
             try:
                 version = await Workflows.publish_version(workflow.id, service_user.id, db=db)
             except IntegrityError:
@@ -3416,10 +3975,7 @@ async def service_get_workflow_items(
             context,
             allow_public_template=not crm_claims,
         )
-        and (
-            not crm_claims
-            or _crm_token_allows_workflow(crm_claims, workflow)
-        )
+        and (not crm_claims or _crm_token_allows_workflow(crm_claims, workflow))
     ]
     if crm_claims:
         published_items = []
@@ -3431,9 +3987,7 @@ async def service_get_workflow_items(
             )
             if not version or version.workflow_id != workflow.id:
                 continue
-            published_items.append(
-                workflow.model_copy(update={'graph': version.graph, 'meta': version.meta})
-            )
+            published_items.append(workflow.model_copy(update={'graph': version.graph, 'meta': version.meta}))
         items = published_items
     return _paginate_workflows(items, page, limit)
 
@@ -3500,9 +4054,7 @@ async def service_select_agent_workflows(
         db=db,
     )
     items = [
-        workflow
-        for workflow in result.items
-        if not crm_claims or _crm_token_allows_workflow(crm_claims, workflow)
+        workflow for workflow in result.items if not crm_claims or _crm_token_allows_workflow(crm_claims, workflow)
     ]
     return _selector_response(items, context, form_data.message, form_data.maxItems)
 
@@ -3526,10 +4078,7 @@ async def service_list_email_deliveries_for_crm(
     if not company_user_id:
         raise HTTPException(status_code=400, detail='Company context is required.')
     workflow_ids = {item.strip() for item in form_data.workflowIds if item.strip()}
-    if crm_claims and any(
-        not workflow_allowed_by_crm_token(crm_claims, workflow_id)
-        for workflow_id in workflow_ids
-    ):
+    if crm_claims and any(not workflow_allowed_by_crm_token(crm_claims, workflow_id) for workflow_id in workflow_ids):
         raise HTTPException(status_code=403, detail=ERROR_MESSAGES.UNAUTHORIZED)
     return await InteractEmail.list_deliveries(
         company_user_id,
@@ -3627,11 +4176,7 @@ async def service_preflight_workflow_launch(
     context = _workflow_context_for_service_user(service_user, form_data, crm_claims)
     request_form = WorkflowLaunchPreflightRequest(
         input=form_data.input,
-        workflow_version_id=(
-            workflow.default_version_id
-            if crm_claims
-            else form_data.workflow_version_id
-        ),
+        workflow_version_id=(workflow.default_version_id if crm_claims else form_data.workflow_version_id),
         model_id=form_data.model_id or form_data.modelId,
         channel_id=form_data.channel_id or form_data.channelId,
         surface=form_data.surface,
@@ -3830,6 +4375,181 @@ async def service_run_workflow(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=completed.error)
 
 
+async def _complete_deferred_service_workflow_run(
+    request: Request,
+    service_user: Any,
+    workflow: WorkflowModel,
+    run_form: WorkflowRunForm,
+    run: WorkflowRunModel,
+    context: WorkflowAccessContext,
+    billing_client: InteractBillingClient | None,
+    billing_authorization: BillingAuthorization | None,
+    billing_form_data: dict[str, Any],
+    billing_metadata: dict[str, Any],
+) -> None:
+    try:
+        output = await _execute_workflow(request, service_user, workflow, run_form, run_id=run.id)
+        if billing_client and billing_authorization:
+            await billing_client.commit(
+                service_user,
+                billing_authorization,
+                billing_form_data,
+                billing_metadata,
+                output.get('usage') if isinstance(output, dict) else None,
+                (
+                    json.dumps(output.get('outputs') or [], ensure_ascii=False, default=str)
+                    if isinstance(output, dict)
+                    else ''
+                ),
+            )
+        await Workflows.complete_run(run.id, 'success', output=output)
+    except WorkflowPause as pause:
+        completed = await _save_workflow_pause(run, workflow, context, pause)
+        output = completed.output or {}
+        if billing_client and billing_authorization:
+            await billing_client.commit(
+                service_user,
+                billing_authorization,
+                billing_form_data,
+                billing_metadata,
+                output.get('usage') if isinstance(output, dict) else None,
+                json.dumps(output.get('outputs') or [], ensure_ascii=False, default=str),
+            )
+    except Exception as exc:
+        if billing_client and billing_authorization:
+            try:
+                await billing_client.cancel(billing_authorization, 'crm-workflow-error')
+            except Exception:
+                log.exception('Unable to cancel billing reservation for deferred workflow run %s', run.id)
+        await Workflows.complete_run(run.id, 'error', error=str(exc))
+        log.exception('Deferred service workflow failed run_id=%s workflow_id=%s', run.id, workflow.id)
+
+
+@router.post('/service/{id}/run-async', response_model=WorkflowRunModel)
+async def service_run_workflow_async(
+    request: Request,
+    id: str,
+    form_data: ServiceCompanyRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_async_session),
+):
+    crm_claims = _authorize_service_or_crm(
+        authorization,
+        x_interact_service_token,
+        'workflow:run',
+    )
+    service_user = await _resolve_service_user(form_data.companyEmail, db)
+    _assert_crm_request_context(crm_claims, form_data, service_user)
+    context = _workflow_context_for_service_user(service_user, form_data, crm_claims)
+    workflow = await Workflows.get_by_id(id, db=db)
+    if crm_claims and not _crm_token_allows_workflow(crm_claims, workflow):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.UNAUTHORIZED)
+    check_workflow_access(workflow, service_user, context, allow_public_template=False)
+    if crm_claims and (workflow.status != 'published' or not workflow.default_version_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='CRM Agent tokens can only execute published workflow versions.',
+        )
+    trigger_type = 'crm_agent' if crm_claims else form_data.trigger_type
+    run_form = WorkflowRunForm(
+        input=form_data.input,
+        trigger_type=trigger_type,
+        workflow_version_id=(
+            workflow.default_version_id
+            if crm_claims
+            else (
+                form_data.workflow_version_id
+                or (None if trigger_type in {'manual_test', 'test.editor'} else workflow.default_version_id)
+            )
+        ),
+        model_id=form_data.model_id or form_data.modelId,
+        channel_id=form_data.channel_id or form_data.channelId,
+        confirmed=form_data.confirmed,
+    )
+    run_form = await _hydrate_workflow_run_form(workflow, run_form)
+    try:
+        run = await Workflows.insert_run(id, service_user.id, run_form, db=db)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    billing_client = None
+    billing_authorization = None
+    billing_form_data: dict[str, Any] = {}
+    billing_metadata: dict[str, Any] = {}
+    if crm_claims:
+        try:
+            (
+                billing_client,
+                billing_authorization,
+                billing_form_data,
+                billing_metadata,
+            ) = await _authorize_crm_workflow_billing(
+                service_user,
+                workflow,
+                run,
+                run_form,
+                crm_claims,
+            )
+        except Exception as exc:
+            await Workflows.complete_run(
+                run.id,
+                'error',
+                error=str(getattr(exc, 'detail', None) or exc),
+                db=db,
+            )
+            raise
+
+    background_request = Request(
+        {
+            **request.scope,
+            'state': dict(request.scope.get('state') or {}),
+        }
+    )
+    _schedule_deferred_workflow(
+        lambda: _complete_deferred_service_workflow_run(
+            background_request,
+            service_user,
+            workflow,
+            run_form,
+            run,
+            context,
+            billing_client,
+            billing_authorization,
+            billing_form_data,
+            billing_metadata,
+        )
+    )
+    return run
+
+
+@router.post('/service/{id}/runs/{run_id}/status', response_model=WorkflowRunModel)
+async def service_get_workflow_run_status(
+    id: str,
+    run_id: str,
+    form_data: ServiceCompanyLifecycleRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_async_session),
+):
+    crm_claims = _authorize_service_or_crm(
+        authorization,
+        x_interact_service_token,
+        'workflow:run',
+    )
+    service_user = await _resolve_service_user(form_data.companyEmail, db)
+    _assert_crm_request_context(crm_claims, form_data, service_user)
+    workflow = await Workflows.get_by_id(id, db=db)
+    if crm_claims and not _crm_token_allows_workflow(crm_claims, workflow):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.UNAUTHORIZED)
+    context = _workflow_context_for_service_user(service_user, form_data, crm_claims)
+    check_workflow_access(workflow, service_user, context, allow_public_template=False)
+    run = await Workflows.get_run(run_id, db=db)
+    if not run or run.workflow_id != id or run.user_id != service_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Workflow run not found.')
+    return run
+
+
 @router.post('/service/{id}/runs/{run_id}/resume', response_model=WorkflowRunModel)
 async def service_resume_workflow_run(
     request: Request,
@@ -3862,26 +4582,69 @@ async def service_resume_workflow_run(
     run = await Workflows.get_run(run_id, db=db)
     if not run or run.workflow_id != id or run.user_id != service_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Workflow run not found.')
+    billing_client = None
+    billing_authorization = None
+    billing_form_data: dict[str, Any] = {}
+    billing_metadata: dict[str, Any] = {}
+    if crm_claims and form_data.decision not in {'rejected', 'cancelled'}:
+        original_context = run.input.get('context') if isinstance(run.input, dict) else {}
+        original_context = original_context if isinstance(original_context, dict) else {}
+        resume_billing_form = WorkflowRunForm(
+            input={
+                'workflow_input': run.input or {},
+                'resume': {
+                    'decision': form_data.decision,
+                    'value': form_data.value,
+                    'revision': form_data.revision,
+                },
+            },
+            trigger_type='crm_agent',
+            workflow_version_id=run.workflow_version_id,
+            model_id=str(original_context.get('model_id') or context.model_id or '').strip() or None,
+            channel_id=str(original_context.get('channel_id') or context.channel_id or '').strip() or None,
+            confirmed=True,
+        )
+        (
+            billing_client,
+            billing_authorization,
+            billing_form_data,
+            billing_metadata,
+        ) = await _authorize_crm_workflow_billing(
+            service_user,
+            workflow,
+            run,
+            resume_billing_form,
+            crm_claims,
+        )
     actor_id = (
         f'crm:{crm_claims.get("crm_instance_id")}:{crm_claims.get("crm_user_id") or "system"}'
         if crm_claims
         else service_user.id
     )
-    return await _resume_workflow_run_internal(
-        request,
-        workflow,
-        run,
-        WorkflowResumeRequest(
-            decision=form_data.decision,
-            value=form_data.value,
-            revision=form_data.revision,
-            reason=form_data.reason,
-        ),
-        service_user,
-        context,
-        actor_id,
-        db=db,
-    )
+    try:
+        return await _resume_workflow_run_internal(
+            request,
+            workflow,
+            run,
+            WorkflowResumeRequest(
+                decision=form_data.decision,
+                value=form_data.value,
+                revision=form_data.revision,
+                reason=form_data.reason,
+            ),
+            service_user,
+            context,
+            actor_id,
+            db=db,
+            billing_client=billing_client,
+            billing_authorization=billing_authorization,
+            billing_form_data=billing_form_data,
+            billing_metadata=billing_metadata,
+        )
+    except Exception:
+        if billing_client and billing_authorization:
+            await billing_client.cancel(billing_authorization, 'crm-workflow-resume-error')
+        raise
 
 
 @router.get('/list', response_model=WorkflowListResponse)
@@ -4174,6 +4937,30 @@ async def run_workflow_by_id(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=completed.error)
 
 
+async def _settle_crm_resume_billing(
+    billing_client: InteractBillingClient,
+    billing_authorization: BillingAuthorization,
+    user: Any,
+    billing_form_data: dict[str, Any],
+    billing_metadata: dict[str, Any],
+    output: dict[str, Any],
+) -> None:
+    if int(output.get('model_calls') or 0) <= 0:
+        await billing_client.cancel(
+            billing_authorization,
+            'crm-workflow-resume-no-model-call',
+        )
+        return
+    await billing_client.commit(
+        user,
+        billing_authorization,
+        billing_form_data,
+        billing_metadata,
+        output.get('execution_usage') or {},
+        json.dumps(output.get('outputs') or [], ensure_ascii=False, default=str),
+    )
+
+
 async def _resume_workflow_run_internal(
     request: Request,
     workflow: WorkflowModel,
@@ -4183,6 +4970,10 @@ async def _resume_workflow_run_internal(
     context: WorkflowAccessContext,
     actor_id: str,
     db: AsyncSession | None = None,
+    billing_client: InteractBillingClient | None = None,
+    billing_authorization: BillingAuthorization | None = None,
+    billing_form_data: dict[str, Any] | None = None,
+    billing_metadata: dict[str, Any] | None = None,
 ) -> WorkflowRunModel:
     run_id = run.id
     checkpoint = await InteractEmail.get_checkpoint(run_id)
@@ -4246,10 +5037,37 @@ async def _resume_workflow_run_internal(
             resume=resume,
             access_context_override=context,
         )
+        if billing_client and billing_authorization:
+            await _settle_crm_resume_billing(
+                billing_client,
+                billing_authorization,
+                user,
+                billing_form_data or {},
+                billing_metadata or {},
+                output,
+            )
         return await Workflows.complete_run(run_id, 'success', output=output, db=db)
     except WorkflowPause as pause:
-        return await _save_workflow_pause(run, workflow, context, pause, db=db)
+        completed = await _save_workflow_pause(run, workflow, context, pause, db=db)
+        output = completed.output or {}
+        if billing_client and billing_authorization:
+            try:
+                await _settle_crm_resume_billing(
+                    billing_client,
+                    billing_authorization,
+                    user,
+                    billing_form_data or {},
+                    billing_metadata or {},
+                    output,
+                )
+            except Exception as exc:
+                await billing_client.cancel(billing_authorization, 'crm-workflow-resume-billing-error')
+                failed = await Workflows.complete_run(run_id, 'error', error=str(exc), db=db)
+                raise HTTPException(status_code=502, detail=failed.error) from exc
+        return completed
     except Exception as exc:
+        if billing_client and billing_authorization:
+            await billing_client.cancel(billing_authorization, 'crm-workflow-resume-error')
         completed = await Workflows.complete_run(run_id, 'error', error=str(exc), db=db)
         raise HTTPException(status_code=400, detail=completed.error) from exc
 

@@ -1,6 +1,7 @@
 from open_webui.utils.interact_billing import (
     BillingAuthorization,
     InteractBillingClient,
+    _base_url,
     current_user_question,
     estimate_reserved_tokens,
     image_usage_estimate,
@@ -10,6 +11,20 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+
+
+def test_billing_base_url_uses_environment_override(monkeypatch):
+    monkeypatch.setenv("INTERACT_BILLING_BASE_URL", "http://localhost:3000/")
+    monkeypatch.delenv("OPEN_WEBUI_BILLING_BASE_URL", raising=False)
+
+    assert _base_url() == "http://localhost:3000"
+
+
+def test_billing_base_url_supports_legacy_environment_name(monkeypatch):
+    monkeypatch.delenv("INTERACT_BILLING_BASE_URL", raising=False)
+    monkeypatch.setenv("OPEN_WEBUI_BILLING_BASE_URL", "https://billing.example.com/")
+
+    assert _base_url() == "https://billing.example.com"
 
 
 def test_internal_context_summary_hides_transcript_from_usage_log():
@@ -91,6 +106,10 @@ class CaptureBillingClient(InteractBillingClient):
                     "role": "member",
                     "status": "active",
                 },
+                "model_entitlement": {
+                    "activeModelLimit": 3,
+                    "ownerUserIds": ["webui-user"],
+                },
             }
         if path == "/api/integrations/open-webui/usage/authorize":
             return {
@@ -114,6 +133,7 @@ async def test_resolve_identity_preserves_company_member():
 
     assert identity.company_user["id"] == "company-1"
     assert identity.company_member["id"] == "member-1"
+    assert identity.model_entitlement["activeModelLimit"] == 3
 
 
 @pytest.mark.asyncio
@@ -137,6 +157,29 @@ async def test_authorize_sends_company_member_context():
     assert authorize_payload["metadata"]["companyMemberRole"] == "member"
     assert authorization.company_member_id == "member-1"
     assert authorization.company_member_email == "member@example.com"
+
+
+@pytest.mark.asyncio
+async def test_api_key_authorize_marks_external_api_usage():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-user", email="member@example.com")
+    authorization = await client.authorize(
+        user,
+        {
+            "model": "workspace-agent",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 10,
+        },
+        {
+            "auth_type": "api_key",
+            "api_key_id": "key-1",
+        },
+    )
+
+    authorize_payload = client.requests[-1][2]
+    assert authorize_payload["usage_channel"] == "external_api"
+    assert authorize_payload["metadata"]["apiKeyId"] == "key-1"
+    assert authorization.usage_channel == "external_api"
 
 
 @pytest.mark.asyncio
@@ -266,6 +309,36 @@ async def test_commit_sends_authorized_company_member_context():
     assert commit_payload["company_member_email"] == "member@example.com"
     assert commit_payload["parameters"]["companyMemberId"] == "member-1"
     assert commit_payload["parameters"]["companyMemberEmail"] == "member@example.com"
+
+
+@pytest.mark.asyncio
+async def test_external_api_commit_keeps_authorized_usage_channel():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-user", email="member@example.com")
+    authorization = BillingAuthorization(
+        request_id="request-1",
+        company_user_id="company-1",
+        reservation_id="reservation-1",
+        estimated_input_tokens=5,
+        max_output_tokens=10,
+        reserved_tokens=55,
+        usage_channel="external_api",
+    )
+
+    await client.commit(
+        user,
+        authorization,
+        {"model": "workspace-agent", "messages": [{"role": "user", "content": "hello"}]},
+        {"api_key_id": "key-1"},
+        {"prompt_tokens": 5, "completion_tokens": 2},
+        "answer",
+    )
+
+    commit_payload = client.requests[-1][2]
+    assert commit_payload["usage_channel"] == "external_api"
+    assert commit_payload["request_summary"] == "External API chat completion"
+    assert commit_payload["parameters"]["usageChannel"] == "external_api"
+    assert commit_payload["parameters"]["apiKeyId"] == "key-1"
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ import json
 import pytest
 from open_webui.routers.interact_channels import (
     _channel_runtime_failure,
+    _incomplete_semantic_tool_response,
     _rate_limit_text,
     _tool_failure_from_items,
 )
@@ -151,6 +152,32 @@ def test_channel_runtime_failures_are_distinct():
     assert _channel_runtime_failure('Interact Web Ai user not found.')[0] == 'AI-ACCOUNT-NOT-FOUND'
     assert _channel_runtime_failure('Interact Web Ai user is pending approval.')[0] == 'AI-ACCOUNT-PENDING'
     assert _channel_runtime_failure('unexpected internal detail')[0] == 'AI-RUNTIME-FAILED'
+
+
+def test_channel_rejects_catalog_only_transition_as_final_answer():
+    output = [
+        {
+            'type': 'function_call',
+            'call_id': 'catalog-1',
+            'name': 'interact_semantic_catalog',
+        },
+        {
+            'type': 'function_call_output',
+            'call_id': 'catalog-1',
+            'output': [{'type': 'input_text', 'text': '{"ok":true,"datasets":[{}]}'}],
+        },
+    ]
+
+    assert _incomplete_semantic_tool_response(output, '我先查詢已發布資料集的欄位定義。') is True
+
+
+def test_channel_accepts_answer_after_semantic_query():
+    output = [
+        {'type': 'function_call', 'call_id': 'catalog-1', 'name': 'interact_semantic_catalog'},
+        {'type': 'function_call', 'call_id': 'query-1', 'name': 'interact_semantic_query'},
+    ]
+
+    assert _incomplete_semantic_tool_response(output, '查詢結果共有三家公司。') is False
 
 
 def test_channel_rate_limit_messages_include_stable_codes():

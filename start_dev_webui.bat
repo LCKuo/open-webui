@@ -7,7 +7,11 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
 set "BACKEND_DIR=%ROOT%\backend"
-set "DATA_DIR=%BACKEND_DIR%\data"
+if defined WEBUI_DATA_DIR (
+    set "DATA_DIR=%WEBUI_DATA_DIR%"
+) else (
+    set "DATA_DIR=%BACKEND_DIR%\open_webui\recovery-test-data"
+)
 set "PYTHON_EXE=%ROOT%\.venv\Scripts\python.exe"
 set "WEBUI_SECRET_KEY_FILE=%ROOT%\.webui_secret_key"
 
@@ -24,6 +28,7 @@ echo ==========================================
 echo Project : %ROOT%
 echo Backend : %BACKEND_URL%
 echo Frontend: %FRONTEND_URL%
+echo Data    : %DATA_DIR%
 echo ==========================================
 echo.
 
@@ -98,15 +103,12 @@ if not exist "%BACKEND_DIR%" (
     exit /b 1
 )
 
-if not exist "%DATA_DIR%" (
-    echo Creating backend data directory: %DATA_DIR%
-    mkdir "%DATA_DIR%"
-    if errorlevel 1 (
-        echo.
-        echo Failed to create backend data directory.
-        pause
-        exit /b 1
-    )
+"%PYTHON_EXE%" "%ROOT%\scripts\validate_webui_data.py" "%DATA_DIR%"
+if errorlevel 1 (
+    echo.
+    echo WebUI was not started because the configured database failed validation.
+    pause
+    exit /b 1
 )
 
 echo Starting backend window ...
