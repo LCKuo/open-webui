@@ -483,6 +483,50 @@ async def test_prospecting_contract_retries_empty_output_and_normalizes_schema_d
 
 
 @pytest.mark.asyncio
+async def test_runtime_exposes_usage_when_contract_retries_still_fail():
+    async def model_runner(prompt, system_prompt, model_id, parts):
+        return {
+            'text': 'not-json',
+            'model_id': model_id,
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 2, 'total_tokens': 12},
+        }
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'form_input'}},
+            {
+                'id': 'model',
+                'data': {
+                    'type': 'agent',
+                    'config': {
+                        'model_id': 'model-a',
+                        'output_contract': PROSPECTING_DISCOVERY_CONTRACT,
+                        'max_attempts': 2,
+                    },
+                },
+            },
+        ],
+        'edges': [{'source': 'input', 'target': 'model'}],
+    }
+    meter = {}
+
+    with pytest.raises(WorkflowRuntimeError, match='after 2 attempts'):
+        await execute_workflow_graph(
+            graph,
+            {'message': 'find prospects'},
+            model_runner=model_runner,
+            execution_meter=meter,
+        )
+
+    assert meter['model_calls'] == 2
+    assert meter['usage'] == {
+        'prompt_tokens': 20,
+        'completion_tokens': 4,
+        'total_tokens': 24,
+    }
+
+
+@pytest.mark.asyncio
 async def test_prospecting_contract_excludes_low_fit_candidates_before_enrichment():
     async def model_runner(prompt, system_prompt, model_id, parts):
         return {

@@ -1,6 +1,7 @@
 import logging
 import re
 from typing import Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -20,6 +21,8 @@ from open_webui.models.config import Config
 from open_webui.routers.pipelines import process_pipeline_inlet_filter
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.chat import generate_chat_completion
+from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
+from open_webui.utils.response import record_auxiliary_usage
 from open_webui.utils.task import (
     autocomplete_generation_template,
     emoji_generation_template,
@@ -57,6 +60,58 @@ TASK_CONFIG_KEYS = {
     'ENABLE_VOICE_MODE_PROMPT': 'task.voice.prompt.enable',
     'VOICE_MODE_PROMPT_TEMPLATE': 'task.voice.prompt_template',
 }
+
+
+async def _generate_task_completion(request: Request, payload: dict, user):
+    if getattr(request.state, 'interact_billing_parent_active', False) or not is_billing_enabled():
+        response = await generate_chat_completion(request, form_data=payload, user=user)
+        return record_auxiliary_usage(request, response, payload)
+
+    metadata = {
+        **(payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}),
+        'auth_type': getattr(request.state, 'auth_type', 'jwt'),
+    }
+    metadata.setdefault('message_id', f'task:{uuid4()}')
+    billing_client = InteractBillingClient()
+    billing_authorization = await billing_client.authorize(user, payload, metadata)
+    response = None
+    model_execution_started = False
+    request.state.interact_billing_parent_active = True
+    request.state.interact_billing_aux_usage = {}
+    try:
+        model_execution_started = True
+        response = await generate_chat_completion(request, form_data=payload, user=user)
+        record_auxiliary_usage(request, response, payload)
+        response_status = int(getattr(response, 'status_code', 200) or 200)
+        await billing_client.commit(
+            user,
+            billing_authorization,
+            payload,
+            metadata,
+            request.state.interact_billing_aux_usage or None,
+            '',
+            status_value='failed' if response_status >= 400 else 'completed',
+        )
+        return response
+    except Exception:
+        if model_execution_started:
+            await billing_client.commit(
+                user,
+                billing_authorization,
+                payload,
+                metadata,
+                request.state.interact_billing_aux_usage or None,
+                '',
+                status_value='failed',
+            )
+        else:
+            await billing_client.cancel(
+                billing_authorization,
+                'task-error-before-model-use',
+            )
+        raise
+    finally:
+        request.state.interact_billing_parent_active = False
 
 
 async def get_config_values(key_map: dict[str, str]) -> dict:
@@ -182,7 +237,7 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
         raise e
 
     try:
-        return await generate_chat_completion(request, form_data=payload, user=user)
+        return await _generate_task_completion(request, payload, user)
     except Exception as e:
         log.error('Exception occurred', exc_info=True)
         return JSONResponse(
@@ -252,7 +307,7 @@ async def generate_follow_ups(request: Request, form_data: dict, user=Depends(ge
         raise e
 
     try:
-        return await generate_chat_completion(request, form_data=payload, user=user)
+        return await _generate_task_completion(request, payload, user)
     except Exception as e:
         log.error('Exception occurred', exc_info=True)
         return JSONResponse(
@@ -322,7 +377,7 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
         raise e
 
     try:
-        return await generate_chat_completion(request, form_data=payload, user=user)
+        return await _generate_task_completion(request, payload, user)
     except Exception as e:
         log.error(f'Error generating chat completion: {e}')
         return JSONResponse(
@@ -386,7 +441,7 @@ async def generate_image_prompt(request: Request, form_data: dict, user=Depends(
         raise e
 
     try:
-        return await generate_chat_completion(request, form_data=payload, user=user)
+        return await _generate_task_completion(request, payload, user)
     except Exception as e:
         log.error('Exception occurred', exc_info=True)
         return JSONResponse(
@@ -468,7 +523,7 @@ async def generate_queries(request: Request, form_data: dict, user=Depends(get_v
         raise e
 
     try:
-        return await generate_chat_completion(request, form_data=payload, user=user)
+        return await _generate_task_completion(request, payload, user)
     except Exception as e:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -549,7 +604,7 @@ async def generate_autocompletion(request: Request, form_data: dict, user=Depend
         raise e
 
     try:
-        return await generate_chat_completion(request, form_data=payload, user=user)
+        return await _generate_task_completion(request, payload, user)
     except Exception as e:
         log.error(f'Error generating chat completion: {e}')
         return JSONResponse(
@@ -616,7 +671,7 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
         raise e
 
     try:
-        return await generate_chat_completion(request, form_data=payload, user=user)
+        return await _generate_task_completion(request, payload, user)
     except Exception as e:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -669,7 +724,7 @@ async def generate_moa_response(request: Request, form_data: dict, user=Depends(
         raise e
 
     try:
-        return await generate_chat_completion(request, form_data=payload, user=user)
+        return await _generate_task_completion(request, payload, user)
     except Exception as e:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,

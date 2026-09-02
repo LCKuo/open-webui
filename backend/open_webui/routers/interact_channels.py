@@ -1439,6 +1439,9 @@ async def _generate_context_summary(
 
     billing_client = InteractBillingClient() if is_billing_enabled() else None
     billing_authorization = None
+    model_execution_started = False
+    response_data: dict[str, Any] | None = None
+    summary = ''
     try:
         if billing_client:
             billing_authorization = await billing_client.authorize(
@@ -1447,6 +1450,7 @@ async def _generate_context_summary(
                 metadata,
             )
 
+        model_execution_started = True
         response = await generate_chat_completion(
             request,
             provider_form_data,
@@ -1484,16 +1488,43 @@ async def _generate_context_summary(
         return summary, token_counts[3]
     except asyncio.CancelledError:
         if billing_client and billing_authorization:
-            await asyncio.shield(
-                billing_client.cancel(
-                    billing_authorization,
-                    'context-summary-cancelled',
+            if model_execution_started:
+                await asyncio.shield(
+                    billing_client.commit(
+                        user,
+                        billing_authorization,
+                        provider_form_data,
+                        metadata,
+                        response_data.get('usage') if isinstance(response_data, dict) else None,
+                        summary,
+                        status_value='cancelled',
+                    )
                 )
-            )
+            else:
+                await asyncio.shield(
+                    billing_client.cancel(
+                        billing_authorization,
+                        'context-summary-cancelled-before-model-use',
+                    )
+                )
         raise
     except Exception:
         if billing_client and billing_authorization:
-            await billing_client.cancel(billing_authorization, 'context-summary-error')
+            if model_execution_started:
+                await billing_client.commit(
+                    user,
+                    billing_authorization,
+                    provider_form_data,
+                    metadata,
+                    response_data.get('usage') if isinstance(response_data, dict) else None,
+                    summary,
+                    status_value='failed',
+                )
+            else:
+                await billing_client.cancel(
+                    billing_authorization,
+                    'context-summary-error-before-model-use',
+                )
         raise
 
 

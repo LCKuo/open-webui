@@ -761,6 +761,7 @@ async def execute_workflow_graph(
     default_model_id: str | None = None,
     resume_state: dict[str, Any] | None = None,
     resume: dict[str, Any] | None = None,
+    execution_meter: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     nodes = graph.get('nodes') if isinstance(graph.get('nodes'), list) else []
     edges = graph.get('edges') if isinstance(graph.get('edges'), list) else []
@@ -798,6 +799,9 @@ async def execute_workflow_graph(
     execution_usage: dict[str, Any] = {}
     model_calls = 0
     used_model_ids = list(state.get('model_ids') or [])
+    if execution_meter is not None:
+        execution_meter['usage'] = execution_usage
+        execution_meter['model_calls'] = model_calls
 
     def checkpoint_state() -> dict[str, Any]:
         return {
@@ -869,6 +873,8 @@ async def execute_workflow_graph(
                 _merge_usage_counts(total_usage, usage)
                 _merge_usage_counts(execution_usage, usage)
                 model_calls += 1
+                if execution_meter is not None:
+                    execution_meter['model_calls'] = model_calls
                 resolved_model_id = str(model_result.get('model_id') or model_id or '')
                 if resolved_model_id and resolved_model_id not in used_model_ids:
                     used_model_ids.append(resolved_model_id)

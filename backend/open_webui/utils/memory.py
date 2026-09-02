@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from typing import Any
+from uuid import uuid4
 
 from fastapi import HTTPException
 
@@ -527,6 +528,7 @@ async def _generate_memory_operations(
     transcript: str,
 ) -> list[dict[str, Any]]:
     from open_webui.utils.chat import generate_chat_completion
+    from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
 
     review_prompt = f"""Review the completed conversation turn and decide whether long-term memory should change.
 
@@ -558,26 +560,85 @@ Conversation:
 {transcript}
 """
 
-    response = await generate_chat_completion(
-        request,
-        form_data={
-            'model': model_id,
-            'messages': [
-                {
-                    'role': 'system',
-                    'content': "You are Open WebUI's private memory reviewer. Return only valid JSON.",
-                },
-                {'role': 'user', 'content': review_prompt},
-            ],
-            'stream': False,
-            'metadata': {
-                'task': 'memory_review',
-                'chat_id': metadata.get('chat_id'),
-                'message_id': metadata.get('message_id'),
+    provider_form_data = {
+        'model': model_id,
+        'messages': [
+            {
+                'role': 'system',
+                'content': "You are Open WebUI's private memory reviewer. Return only valid JSON.",
             },
+            {'role': 'user', 'content': review_prompt},
+        ],
+        'stream': False,
+        'metadata': {
+            'task': 'memory_review',
+            'chat_id': metadata.get('chat_id'),
+            'message_id': metadata.get('message_id'),
         },
-        user=user,
-    )
+    }
+    billing_metadata = {
+        'chat_id': metadata.get('chat_id'),
+        'message_id': f'memory-review:{metadata.get("message_id") or uuid4()}',
+        'session_id': metadata.get('session_id'),
+        'auth_type': metadata.get('auth_type'),
+        'user_message': {'role': 'user', 'content': '[Internal memory review]'},
+        **(
+            {'interact_channel': metadata['interact_channel']}
+            if isinstance(metadata.get('interact_channel'), dict)
+            else {}
+        ),
+    }
+    billing_client = InteractBillingClient() if is_billing_enabled() else None
+    billing_authorization = None
+    model_execution_started = False
+    response = None
+    try:
+        if billing_client:
+            billing_authorization = await billing_client.authorize(
+                user,
+                provider_form_data,
+                billing_metadata,
+            )
+        model_execution_started = True
+        response = await generate_chat_completion(
+            request,
+            form_data=provider_form_data,
+            user=user,
+        )
+        if billing_client and billing_authorization:
+            response_usage = response.get('usage') if isinstance(response, dict) else None
+            response_message = (
+                response.get('choices', [{}])[0].get('message', {})
+                if isinstance(response, dict) and response.get('choices')
+                else {}
+            )
+            await billing_client.commit(
+                user,
+                billing_authorization,
+                provider_form_data,
+                billing_metadata,
+                response_usage,
+                response_message.get('content') or response_message.get('reasoning_content') or '',
+            )
+    except Exception:
+        if billing_client and billing_authorization:
+            if model_execution_started:
+                response_usage = response.get('usage') if isinstance(response, dict) else None
+                await billing_client.commit(
+                    user,
+                    billing_authorization,
+                    provider_form_data,
+                    billing_metadata,
+                    response_usage,
+                    '',
+                    status_value='failed',
+                )
+            else:
+                await billing_client.cancel(
+                    billing_authorization,
+                    'memory-review-error-before-model-use',
+                )
+        raise
 
     if not isinstance(response, dict) or not response.get('choices'):
         return []

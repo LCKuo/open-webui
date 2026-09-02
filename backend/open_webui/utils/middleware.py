@@ -124,7 +124,7 @@ from open_webui.utils.misc import (
 )
 from open_webui.utils.payload import apply_system_prompt_to_body, resolve_system_prompt
 from open_webui.utils.plugin import load_function_module_by_id
-from open_webui.utils.response import merge_usage, normalize_usage
+from open_webui.utils.response import merge_usage, normalize_usage, record_auxiliary_usage
 from open_webui.utils.sanitize import sanitize_code
 from open_webui.utils.task import (
     get_task_model_id,
@@ -1331,6 +1331,7 @@ async def chat_completion_tools_handler(
 
     try:
         response = await generate_chat_completion(request, form_data=payload, user=user)
+        record_auxiliary_usage(request, response, payload)
         log.debug(f'{response=}')
         content = await get_content_from_response(response)
         log.debug(f'{content=}')

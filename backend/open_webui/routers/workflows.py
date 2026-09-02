@@ -81,8 +81,11 @@ from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.interact_billing import (
     BillingAuthorization,
     InteractBillingClient,
+    estimate_prompt_tokens,
+    estimate_text_tokens,
     is_billing_enabled,
 )
+from open_webui.utils.response import merge_usage
 from open_webui.utils.interact_crm_auth import (
     assert_crm_company_context,
     decode_crm_access_token,
@@ -2185,20 +2188,53 @@ async def _execute_workflow(
         if system_prompt:
             messages.append({'role': 'system', 'content': system_prompt})
         messages.append({'role': 'user', 'content': content})
-        response = await generate_chat_completion(
-            request,
-            {'model': resolved_model_id, 'messages': messages, 'stream': False},
-            user=user,
-            bypass_system_prompt=is_managed_prospecting,
-        )
+        estimated_input = estimate_prompt_tokens(messages)
+        try:
+            response = await generate_chat_completion(
+                request,
+                {'model': resolved_model_id, 'messages': messages, 'stream': False},
+                user=user,
+                bypass_system_prompt=is_managed_prospecting,
+            )
+        except Exception as exc:
+            exc.execution_usage = {
+                'input_tokens': estimated_input,
+                'output_tokens': 0,
+                'total_tokens': estimated_input,
+                'measurement': 'estimated',
+            }
+            exc.model_calls = 1
+            raise
         response_data = _response_data(response)
         if response_data.get('error'):
-            raise WorkflowRuntimeError(str(response_data['error']))
+            error = WorkflowRuntimeError(str(response_data['error']))
+            error_usage = response_data.get('usage')
+            error.execution_usage = (
+                error_usage
+                if isinstance(error_usage, dict) and error_usage
+                else {
+                    'input_tokens': estimated_input,
+                    'output_tokens': 0,
+                    'total_tokens': estimated_input,
+                    'measurement': 'estimated',
+                }
+            )
+            error.model_calls = 1
+            raise error
         text = _response_text(response_data)
+        usage = response_data.get('usage') if isinstance(response_data.get('usage'), dict) else {}
+        if not usage:
+            estimated_output = estimate_text_tokens(text)
+            usage = {
+                'input_tokens': estimated_input,
+                'output_tokens': estimated_output,
+                'total_tokens': estimated_input + estimated_output,
+                'measurement': 'estimated',
+            }
         return {
             'text': text,
             'diagnostic': _response_shape(response_data) if not text.strip() else '',
-            'usage': response_data.get('usage') or {},
+            'usage': usage,
             'model_id': response_data.get('model') or resolved_model_id,
         }
 
@@ -3206,15 +3242,26 @@ async def _execute_workflow(
             raise WorkflowRuntimeError(str(result.get('error') or 'Database query failed.'))
         return result
 
-    result = await execute_workflow_graph(
-        graph,
-        form_data.input,
-        model_runner=model_runner,
-        node_runner=node_runner,
-        default_model_id=form_data.model_id,
-        resume_state=resume_state,
-        resume=resume,
-    )
+    execution_meter: dict[str, Any] = {}
+    try:
+        result = await execute_workflow_graph(
+            graph,
+            form_data.input,
+            model_runner=model_runner,
+            node_runner=node_runner,
+            default_model_id=form_data.model_id,
+            resume_state=resume_state,
+            resume=resume,
+            execution_meter=execution_meter,
+        )
+    except Exception as exc:
+        completed_usage = execution_meter.get('usage') or {}
+        failed_attempt_usage = getattr(exc, 'execution_usage', None) or {}
+        exc.execution_usage = merge_usage(completed_usage, failed_attempt_usage)
+        exc.model_calls = int(execution_meter.get('model_calls') or 0) + int(
+            getattr(exc, 'model_calls', 0) or 0
+        )
+        raise
     result['workflow_id'] = workflow.id
     result['workflow_name'] = workflow.name
     result['workflow_version_id'] = version_id
@@ -3482,20 +3529,32 @@ async def execute_chat_workflow(
     }
 
 
+def _workflow_model_attempts(graph: dict[str, Any]) -> int:
+    nodes = graph.get('nodes') if isinstance(graph.get('nodes'), list) else []
+    return sum(
+        max(1, min(3, int(_node_config(node).get('max_attempts') or 1)))
+        for node in nodes
+        if isinstance(node, dict) and node_semantic_type(node) in RUNTIME_MODEL_TYPES
+    )
+
+
 async def workflow_billing_form_data(
     workflow_request: dict[str, Any],
     form_data: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return a billing-only payload scaled to the immutable model-step count."""
+    """Return a billing payload reserved for every possible model attempt."""
     workflow_id = str(workflow_request.get('id') or '').strip()
     workflow = await Workflows.get_by_id(workflow_id) if workflow_id else None
     version_id = workflow_request.get('versionId') or (workflow.default_version_id if workflow else None)
     version = await Workflows.get_version_by_id(version_id) if version_id else None
     if not workflow or workflow.status != 'published' or not version or version.workflow_id != workflow.id:
         raise HTTPException(status_code=400, detail='Published workflow version was not found.')
-    nodes = version.graph.get('nodes') if isinstance(version.graph.get('nodes'), list) else []
-    model_steps = sum(1 for node in nodes if isinstance(node, dict) and node_semantic_type(node) in RUNTIME_MODEL_TYPES)
-    return {**form_data, '_billing_multiplier': max(1, min(8, model_steps))}
+    model_attempts = _workflow_model_attempts(version.graph)
+    return {
+        **form_data,
+        '_billing_model_attempts': model_attempts,
+        '_billing_multiplier': max(1, min(24, model_attempts)),
+    }
 
 
 async def _authorize_crm_workflow_billing(
@@ -3504,13 +3563,17 @@ async def _authorize_crm_workflow_billing(
     run: WorkflowRunModel,
     run_form: WorkflowRunForm,
     crm_claims: dict[str, Any],
-) -> tuple[InteractBillingClient, BillingAuthorization, dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    InteractBillingClient | None,
+    BillingAuthorization | None,
+    dict[str, Any],
+    dict[str, Any],
+]:
     if not is_billing_enabled():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail='Interact billing is not configured.',
         )
-
     input_text = json.dumps(run_form.input, ensure_ascii=False, default=str)
     billing_form_data = await workflow_billing_form_data(
         {
@@ -3535,6 +3598,8 @@ async def _authorize_crm_workflow_billing(
             'trigger': run_form.trigger_type,
         },
     }
+    if int(billing_form_data.get('_billing_model_attempts', 1) or 0) <= 0:
+        return None, None, billing_form_data, billing_metadata
     billing_client = InteractBillingClient()
     billing_authorization = await billing_client.authorize(
         service_user,
@@ -3555,6 +3620,32 @@ async def _authorize_crm_workflow_billing(
         billing_authorization,
         billing_form_data,
         billing_metadata,
+    )
+
+
+async def _settle_failed_workflow_billing(
+    billing_client: InteractBillingClient,
+    billing_authorization: BillingAuthorization,
+    user: Any,
+    billing_form_data: dict[str, Any],
+    billing_metadata: dict[str, Any],
+    error: Exception,
+    cancel_reason: str,
+) -> None:
+    model_calls = int(getattr(error, 'model_calls', 0) or 0)
+    usage = getattr(error, 'execution_usage', None)
+    if model_calls <= 0:
+        await billing_client.cancel(billing_authorization, cancel_reason)
+        return
+
+    await billing_client.commit(
+        user,
+        billing_authorization,
+        billing_form_data,
+        billing_metadata,
+        usage if isinstance(usage, dict) and usage else None,
+        str(error),
+        status_value='failed',
     )
 
 
@@ -4400,7 +4491,18 @@ async def service_run_workflow(
         return completed
     except Exception as exc:
         if billing_client and billing_authorization:
-            await billing_client.cancel(billing_authorization, 'crm-workflow-error')
+            try:
+                await _settle_failed_workflow_billing(
+                    billing_client,
+                    billing_authorization,
+                    service_user,
+                    billing_form_data,
+                    billing_metadata,
+                    exc,
+                    'crm-workflow-error-before-model-use',
+                )
+            except Exception:
+                log.exception('Unable to settle failed CRM workflow usage for run %s', run.id)
         completed = await Workflows.complete_run(run.id, 'error', error=str(exc), db=db)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=completed.error)
 
@@ -4448,9 +4550,17 @@ async def _complete_deferred_service_workflow_run(
     except Exception as exc:
         if billing_client and billing_authorization:
             try:
-                await billing_client.cancel(billing_authorization, 'crm-workflow-error')
+                await _settle_failed_workflow_billing(
+                    billing_client,
+                    billing_authorization,
+                    service_user,
+                    billing_form_data,
+                    billing_metadata,
+                    exc,
+                    'crm-workflow-error-before-model-use',
+                )
             except Exception:
-                log.exception('Unable to cancel billing reservation for deferred workflow run %s', run.id)
+                log.exception('Unable to settle billing for deferred workflow run %s', run.id)
         await Workflows.complete_run(run.id, 'error', error=str(exc))
         log.exception('Deferred service workflow failed run_id=%s workflow_id=%s', run.id, workflow.id)
 
@@ -4957,12 +5067,86 @@ async def run_workflow_by_id(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
+    billing_client = None
+    billing_authorization = None
+    billing_form_data: dict[str, Any] = {}
+    billing_metadata: dict[str, Any] = {}
+    billing_graph = workflow.graph
+    if run_form.workflow_version_id:
+        billing_version = await Workflows.get_version_by_id(run_form.workflow_version_id, db=db)
+        if billing_version and billing_version.workflow_id == workflow.id:
+            billing_graph = billing_version.graph
+    model_attempts = _workflow_model_attempts(billing_graph)
+    if is_billing_enabled() and model_attempts > 0:
+        input_text = json.dumps(run_form.input, ensure_ascii=False, default=str)
+        billing_form_data = {
+            'model': run_form.model_id,
+            'messages': [{'role': 'user', 'content': input_text}],
+            '_billing_model_attempts': model_attempts,
+            '_billing_multiplier': min(24, model_attempts),
+        }
+        billing_metadata = {
+            'chat_id': f'workflow:{workflow.id}',
+            'message_id': f'workflow-run:{run.id}',
+            'user_message': {'role': 'user', 'content': input_text},
+            'workflow': {
+                'id': workflow.id,
+                'name': workflow.name,
+                'versionId': run_form.workflow_version_id,
+                'runId': run.id,
+                'trigger': run_form.trigger_type,
+            },
+        }
+        billing_client = InteractBillingClient()
+        try:
+            billing_authorization = await billing_client.authorize(
+                user,
+                billing_form_data,
+                billing_metadata,
+            )
+        except Exception as exc:
+            await Workflows.complete_run(run.id, 'error', error=str(exc), db=db)
+            raise
+
     try:
         output = await _execute_workflow(request, user, workflow, run_form, run_id=run.id)
+        if billing_client and billing_authorization:
+            await billing_client.commit(
+                user,
+                billing_authorization,
+                billing_form_data,
+                billing_metadata,
+                output.get('usage') if isinstance(output, dict) else None,
+                json.dumps(output.get('outputs') or [], ensure_ascii=False, default=str),
+            )
         return await Workflows.complete_run(run.id, 'success', output=output, db=db)
     except WorkflowPause as pause:
-        return await _save_workflow_pause(run, workflow, context, pause, db=db)
+        completed = await _save_workflow_pause(run, workflow, context, pause, db=db)
+        output = completed.output or {}
+        if billing_client and billing_authorization:
+            await billing_client.commit(
+                user,
+                billing_authorization,
+                billing_form_data,
+                billing_metadata,
+                output.get('usage') if isinstance(output, dict) else None,
+                json.dumps(output.get('outputs') or [], ensure_ascii=False, default=str),
+            )
+        return completed
     except Exception as exc:
+        if billing_client and billing_authorization:
+            try:
+                await _settle_failed_workflow_billing(
+                    billing_client,
+                    billing_authorization,
+                    user,
+                    billing_form_data,
+                    billing_metadata,
+                    exc,
+                    'workflow-error-before-model-use',
+                )
+            except Exception:
+                log.exception('Unable to settle failed workflow usage for run %s', run.id)
         completed = await Workflows.complete_run(run.id, 'error', error=str(exc), db=db)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=completed.error)
 
@@ -5097,7 +5281,18 @@ async def _resume_workflow_run_internal(
         return completed
     except Exception as exc:
         if billing_client and billing_authorization:
-            await billing_client.cancel(billing_authorization, 'crm-workflow-resume-error')
+            try:
+                await _settle_failed_workflow_billing(
+                    billing_client,
+                    billing_authorization,
+                    user,
+                    billing_form_data or {},
+                    billing_metadata or {},
+                    exc,
+                    'crm-workflow-resume-error-before-model-use',
+                )
+            except Exception:
+                log.exception('Unable to settle failed CRM workflow resume usage for run %s', run_id)
         completed = await Workflows.complete_run(run_id, 'error', error=str(exc), db=db)
         raise HTTPException(status_code=400, detail=completed.error) from exc
 

@@ -17,6 +17,7 @@ from open_webui.utils.task import (
     replace_messages_variable,
     replace_prompt_variable,
 )
+from open_webui.utils.response import record_auxiliary_usage
 
 log = logging.getLogger(__name__)
 
@@ -412,6 +413,7 @@ async def _generate_summary(
     }
 
     response = await generate_chat_completion(request, form_data=payload, user=user)
+    record_auxiliary_usage(request, response, payload)
     summary = _response_text(response).strip()
     if summary:
         return summary

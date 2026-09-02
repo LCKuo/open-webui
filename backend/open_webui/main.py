@@ -269,6 +269,7 @@ from open_webui.utils.oauth import (
     resolve_oauth_client_info,
 )
 from open_webui.utils.plugin import install_tool_and_function_dependencies
+from open_webui.utils.response import merge_usage
 from open_webui.utils.redis import get_redis_client
 from open_webui.utils.security_headers import SecurityHeadersMiddleware
 from open_webui.utils.session_pool import cleanup_response, get_session, stream_wrapper
@@ -1674,17 +1675,57 @@ async def chat_completion(
     async def process_chat(request, form_data, user, metadata, model, tasks=None):
         billing_client = InteractBillingClient() if is_billing_enabled() else None
         billing_authorization = None
+        billing_form_data = form_data
+        ctx = None
+        model_execution_started = False
+        request.state.interact_billing_parent_active = bool(billing_client)
+        request.state.interact_billing_aux_usage = {}
         try:
             if billing_client:
+                try:
+                    billing_reservation_attempts = max(
+                        1,
+                        min(
+                            24,
+                            int(os.environ.get('INTERACT_BILLING_CHAT_RESERVATION_ATTEMPTS', 12)),
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    billing_reservation_attempts = 12
                 billing_form_data = (
                     await workflows.workflow_billing_form_data(workflow_request, form_data)
                     if isinstance(workflow_request, dict)
-                    else form_data
+                    else {
+                        **form_data,
+                        # Reserve enough wallet capacity for the main response,
+                        # tool continuations, and hidden query/title tasks. The
+                        # final charge still uses measured provider usage only.
+                        '_billing_multiplier': billing_reservation_attempts,
+                    }
                 )
-                billing_authorization = await billing_client.authorize(user, billing_form_data, metadata)
+                if not isinstance(workflow_request, dict):
+                    try:
+                        billing_tool_limit = max(
+                            1,
+                            min(
+                                16,
+                                int(os.environ.get('INTERACT_BILLING_MAX_TOOL_ITERATIONS', 8)),
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        billing_tool_limit = 8
+                    existing_tool_limit = getattr(request.state, 'max_tool_call_iterations', None)
+                    request.state.max_tool_call_iterations = (
+                        min(existing_tool_limit, billing_tool_limit)
+                        if isinstance(existing_tool_limit, int) and existing_tool_limit > 0
+                        else billing_tool_limit
+                    )
+                if int(billing_form_data.get('_billing_model_attempts', 1) or 0) > 0:
+                    billing_authorization = await billing_client.authorize(user, billing_form_data, metadata)
 
             if isinstance(workflow_request, dict):
                 events = []
+                model_execution_started = True
                 response = await workflows.execute_chat_workflow(
                     request,
                     user,
@@ -1694,6 +1735,7 @@ async def chat_completion(
                 )
             else:
                 form_data, metadata, events = await process_chat_payload(request, form_data, user, metadata, model)
+                model_execution_started = True
                 response = await chat_completion_handler(request, form_data, user)
 
             # When the upstream provider returns an error (e.g. HTTP 400
@@ -1717,7 +1759,10 @@ async def chat_completion(
 
             if billing_client and billing_authorization:
                 assistant_message = ctx.get('assistant_message') or {}
-                usage = assistant_message.get('usage')
+                usage = merge_usage(
+                    getattr(request.state, 'interact_billing_aux_usage', None),
+                    assistant_message.get('usage'),
+                )
                 answer_content = assistant_message.get('content')
                 if not answer_content and metadata.get('chat_id') and metadata.get('message_id'):
                     stored_assistant = await Chats.get_message_by_id_and_message_id(
@@ -1751,7 +1796,30 @@ async def chat_completion(
         except asyncio.CancelledError:
             log.info('Chat processing was cancelled')
             if billing_client and billing_authorization:
-                await billing_client.cancel(billing_authorization, 'chat-cancelled')
+                assistant_message = (ctx or {}).get('assistant_message') or {}
+                cancellation_usage = merge_usage(
+                    getattr(request.state, 'interact_billing_aux_usage', None),
+                    assistant_message.get('usage'),
+                )
+                if cancellation_usage or model_execution_started:
+                    try:
+                        await asyncio.shield(
+                            billing_client.commit(
+                                user,
+                                billing_authorization,
+                                billing_form_data,
+                                metadata,
+                                cancellation_usage or None,
+                                assistant_message.get('content') or '',
+                                status_value='cancelled',
+                            )
+                        )
+                    except Exception:
+                        log.exception('Unable to settle cancelled chat usage with billing service')
+                else:
+                    await asyncio.shield(
+                        billing_client.cancel(billing_authorization, 'chat-cancelled-before-model-use')
+                    )
             try:
 
                 async def emit_cancel_event():
@@ -1765,7 +1833,33 @@ async def chat_completion(
             raise  # re-raise to ensure proper task cancellation handling
         except Exception as e:
             if billing_client and billing_authorization:
-                await billing_client.cancel(billing_authorization, 'chat-error')
+                assistant_message = (ctx or {}).get('assistant_message') or {}
+                failure_usage = merge_usage(
+                    getattr(request.state, 'interact_billing_aux_usage', None),
+                    getattr(e, 'execution_usage', None),
+                )
+                failure_usage = merge_usage(failure_usage, assistant_message.get('usage'))
+                model_calls = int(getattr(e, 'model_calls', 0) or 0)
+                should_settle_failure = bool(failure_usage) or model_calls > 0 or (
+                    not isinstance(workflow_request, dict) and model_execution_started
+                )
+                if should_settle_failure:
+                    try:
+                        await billing_client.commit(
+                            user,
+                            billing_authorization,
+                            form_data,
+                            metadata,
+                            failure_usage or None,
+                            assistant_message.get('content') or '',
+                            status_value='failed',
+                        )
+                    except Exception:
+                        # Keep the reservation for reconciliation. Cancelling here
+                        # would erase provider cost that has already been incurred.
+                        log.exception('Unable to settle failed chat usage with billing service')
+                else:
+                    await billing_client.cancel(billing_authorization, 'chat-error-before-model-use')
             error_detail = e.detail if isinstance(e, HTTPException) else str(e)
             log.exception('Error processing chat payload: %s', error_detail)
             if metadata.get('chat_id') and metadata.get('message_id'):
@@ -1805,6 +1899,7 @@ async def chat_completion(
                     detail=error_detail,
                 )
         finally:
+            request.state.interact_billing_parent_active = False
             # Clean up MCP clients.  Each client is isolated so one
             # failure doesn't skip the rest.
             #

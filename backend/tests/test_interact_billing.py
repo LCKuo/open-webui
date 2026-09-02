@@ -3,10 +3,12 @@ from open_webui.utils.interact_billing import (
     InteractBillingClient,
     _base_url,
     current_user_question,
+    estimate_prompt_tokens,
     estimate_reserved_tokens,
     image_usage_estimate,
     usage_token_counts,
 )
+from open_webui.utils.response import merge_usage, record_auxiliary_usage
 from types import SimpleNamespace
 
 import pytest
@@ -42,7 +44,7 @@ def test_reserved_tokens_use_weighted_output_credits():
         }
     )
 
-    assert reserved_tokens == input_tokens + max_output_tokens * 5
+    assert reserved_tokens == input_tokens + max_output_tokens * 6
 
 
 def test_openai_reasoning_tokens_are_not_double_counted():
@@ -56,7 +58,7 @@ def test_openai_reasoning_tokens_are_not_double_counted():
     )
 
     assert (input_tokens, output_tokens, compute_tokens) == (1_000, 300, 200)
-    assert billable_tokens == 1_000 + 300 * 5 + 200 * 5
+    assert billable_tokens == 1_000 + 300 * 6 + 200 * 6
 
 
 def test_missing_usage_uses_estimated_input_and_output():
@@ -64,7 +66,7 @@ def test_missing_usage_uses_estimated_input_and_output():
         None,
         fallback_input_tokens=800,
         fallback_output_tokens=120,
-    ) == (800, 120, 0, 1_400)
+    ) == (800, 120, 0, 1_520)
 
 
 def test_anthropic_cache_tokens_are_added_to_input():
@@ -76,14 +78,81 @@ def test_anthropic_cache_tokens_are_added_to_input():
             "output_tokens": 10,
         },
         fallback_input_tokens=1,
-    ) == (600, 10, 0, 650)
+    ) == (600, 10, 0, 660)
+
+
+def test_gemini_usage_includes_thoughts_and_tool_prompt_tokens():
+    assert usage_token_counts(
+        {
+            "promptTokenCount": 27,
+            "candidatesTokenCount": 45,
+            "thoughtsTokenCount": 31,
+            "toolUsePromptTokenCount": 10_309,
+            "totalTokenCount": 10_412,
+        },
+        fallback_input_tokens=1,
+    ) == (10_336, 45, 31, 10_336 + 45 * 6 + 31 * 6)
+
+
+def test_unknown_provider_token_class_is_not_dropped():
+    assert usage_token_counts(
+        {
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "total_tokens": 150,
+        },
+        fallback_input_tokens=1,
+    ) == (100, 10, 40, 400)
+
+
+def test_top_level_reasoning_tokens_use_provider_total_to_avoid_double_counting():
+    assert usage_token_counts(
+        {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "reasoning_tokens": 20,
+            "total_tokens": 150,
+        },
+        fallback_input_tokens=1,
+    ) == (100, 30, 20, 400)
+
+
+def test_auxiliary_usage_is_merged_into_parent_request():
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            interact_billing_parent_active=True,
+            interact_billing_aux_usage={},
+        )
+    )
+
+    record_auxiliary_usage(
+        request,
+        {"usage": {"prompt_tokens": 100, "completion_tokens": 20}},
+    )
+    record_auxiliary_usage(
+        request,
+        {"usage": {"promptTokenCount": 30, "candidatesTokenCount": 5}},
+    )
+
+    assert request.state.interact_billing_aux_usage["input_tokens"] == 130
+    assert request.state.interact_billing_aux_usage["output_tokens"] == 25
+    assert request.state.interact_billing_aux_usage["total_tokens"] == 155
+
+
+def test_merge_usage_preserves_mixed_measurement():
+    merged = merge_usage(
+        {"input_tokens": 10, "output_tokens": 2, "measurement": "estimated"},
+        {"input_tokens": 20, "output_tokens": 3},
+    )
+
+    assert merged["measurement"] == "mixed"
 
 
 def test_image_estimate_uses_weighted_compute_credits():
     usage = image_usage_estimate("prompt", 512, 512, 1)
 
     assert usage["billable_tokens"] == (
-        usage["input_tokens"] + usage["output_tokens"] * 5 + usage["compute_tokens"] * 5
+        usage["input_tokens"] + usage["output_tokens"] * 6 + usage["compute_tokens"] * 6
     )
 
 
@@ -157,6 +226,31 @@ async def test_authorize_sends_company_member_context():
     assert authorize_payload["metadata"]["companyMemberRole"] == "member"
     assert authorization.company_member_id == "member-1"
     assert authorization.company_member_email == "member@example.com"
+
+
+@pytest.mark.asyncio
+async def test_reservation_multiplier_does_not_inflate_missing_usage_fallback():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-user", email="member@example.com")
+    messages = [{"role": "user", "content": "hello"}]
+
+    authorization = await client.authorize(
+        user,
+        {
+            "model": "model",
+            "messages": messages,
+            "max_completion_tokens": 10,
+            "_billing_multiplier": 3,
+        },
+        {"chat_id": "chat", "message_id": "message"},
+    )
+
+    authorize_payload = client.requests[-1][2]
+    base_input_tokens = estimate_prompt_tokens(messages)
+    assert authorize_payload["estimated_input_tokens"] == base_input_tokens * 3
+    assert authorize_payload["max_output_tokens"] == 30
+    assert authorization.estimated_input_tokens == base_input_tokens
+    assert authorization.max_output_tokens == 10
 
 
 @pytest.mark.asyncio

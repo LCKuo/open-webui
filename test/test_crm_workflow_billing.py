@@ -93,3 +93,61 @@ async def test_crm_billing_company_mismatch_cancels_reservation(monkeypatch):
 
     assert error.value.status_code == 403
     assert cancelled['reason'] == 'crm-company-context-mismatch'
+
+
+@pytest.mark.asyncio
+async def test_failed_crm_workflow_commits_usage_already_consumed():
+    captured = {}
+
+    class FakeBillingClient:
+        async def commit(self, *args, **kwargs):
+            captured['args'] = args
+            captured['kwargs'] = kwargs
+
+        async def cancel(self, authorization, reason):
+            raise AssertionError(f'unexpected cancellation: {reason}')
+
+    error = RuntimeError('contract validation failed')
+    error.model_calls = 2
+    error.execution_usage = {
+        'prompt_tokens': 20,
+        'completion_tokens': 4,
+        'total_tokens': 24,
+    }
+
+    await workflows._settle_failed_workflow_billing(
+        FakeBillingClient(),
+        SimpleNamespace(reservation_id='reservation-1'),
+        SimpleNamespace(id='webui-user-1'),
+        {'model': 'model-1', 'messages': []},
+        {'message_id': 'message-1'},
+        error,
+        'before-model-use',
+    )
+
+    assert captured['args'][4] == error.execution_usage
+    assert captured['kwargs']['status_value'] == 'failed'
+
+
+@pytest.mark.asyncio
+async def test_failed_crm_workflow_without_model_use_cancels_reservation():
+    captured = {}
+
+    class FakeBillingClient:
+        async def commit(self, *args, **kwargs):
+            raise AssertionError('commit should not run')
+
+        async def cancel(self, authorization, reason):
+            captured['reason'] = reason
+
+    await workflows._settle_failed_workflow_billing(
+        FakeBillingClient(),
+        SimpleNamespace(reservation_id='reservation-1'),
+        SimpleNamespace(id='webui-user-1'),
+        {'model': 'model-1', 'messages': []},
+        {'message_id': 'message-1'},
+        RuntimeError('validation failed'),
+        'before-model-use',
+    )
+
+    assert captured['reason'] == 'before-model-use'

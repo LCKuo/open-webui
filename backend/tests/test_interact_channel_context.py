@@ -1656,7 +1656,7 @@ def test_channel_limits_use_weighted_billable_tokens():
                 'completion_tokens': 20,
             }
         )
-        == 200
+        == 220
     )
     assert _estimated_reservation_tokens('hello') > 2048
 
@@ -1840,7 +1840,7 @@ async def test_summary_generation_uses_internal_channel_operation(monkeypatch):
     )
 
     assert summary == 'compact memory'
-    assert billable_tokens == 35
+    assert billable_tokens == 38
     assert captured['metadata']['interact_channel']['operation'] == 'context-summary'
 
 

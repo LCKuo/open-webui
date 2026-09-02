@@ -1,3 +1,5 @@
+import asyncio
+import json
 import logging
 import os
 import time
@@ -12,10 +14,11 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://interact-vision.com.tw"
 DEFAULT_TIMEOUT_SECONDS = 15
+DEFAULT_REQUEST_ATTEMPTS = 3
 DEFAULT_MAX_OUTPUT_TOKENS = 2048
 DEFAULT_IMAGE_BASE_TOKENS = 1800
-OUTPUT_CREDIT_MULTIPLIER = 5
-COMPUTE_CREDIT_MULTIPLIER = 5
+OUTPUT_CREDIT_MULTIPLIER = 6
+COMPUTE_CREDIT_MULTIPLIER = 6
 
 
 def _base_url() -> str:
@@ -80,7 +83,7 @@ def estimate_reserved_tokens(form_data: dict[str, Any]) -> tuple[int, int, int]:
         max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS
 
     try:
-        reservation_multiplier = max(1, min(8, int(form_data.get("_billing_multiplier") or 1)))
+        reservation_multiplier = max(1, min(24, int(form_data.get("_billing_multiplier") or 1)))
     except (TypeError, ValueError):
         reservation_multiplier = 1
     input_tokens *= reservation_multiplier
@@ -111,9 +114,14 @@ def usage_token_counts(
     fallback_output_tokens: int = 0,
 ) -> tuple[int, int, int, int]:
     usage = usage or {}
+    usage_metadata = usage.get("usageMetadata")
+    if isinstance(usage_metadata, dict):
+        usage = {**usage, **usage_metadata}
+
     input_tokens = _non_negative_int(
         usage.get("input_tokens")
         or usage.get("prompt_tokens")
+        or usage.get("promptTokenCount")
         or fallback_input_tokens
         or 0
     )
@@ -121,16 +129,22 @@ def usage_token_counts(
     # cached_tokens is a subset of prompt_tokens and must not be added.
     input_tokens += _non_negative_int(usage.get("cache_creation_input_tokens"))
     input_tokens += _non_negative_int(usage.get("cache_read_input_tokens"))
+    input_tokens += _non_negative_int(
+        usage.get("tool_use_input_tokens")
+        or usage.get("toolUsePromptTokenCount")
+    )
 
     output_tokens = _non_negative_int(
         usage.get("output_tokens")
         or usage.get("completion_tokens")
+        or usage.get("candidatesTokenCount")
         or fallback_output_tokens
     )
     compute_tokens = _non_negative_int(
         usage.get("compute_tokens")
         or usage.get("thoughts_token_count")
         or usage.get("thoughtsTokenCount")
+        or usage.get("thoughts_tokens")
         or usage.get("reasoning_tokens")
     )
 
@@ -140,9 +154,31 @@ def usage_token_counts(
         _nested_int(usage, "completion_tokens_details", "reasoning_tokens")
         or _nested_int(usage, "output_tokens_details", "reasoning_tokens")
     )
-    if compute_tokens == 0 and reasoning_tokens > 0:
-        compute_tokens = reasoning_tokens
+    if reasoning_tokens > 0:
+        if compute_tokens == 0:
+            compute_tokens = reasoning_tokens
         output_tokens = max(0, output_tokens - reasoning_tokens)
+
+    provider_total = _non_negative_int(
+        usage.get("total_tokens")
+        or usage.get("totalTokenCount")
+        or usage.get("total_token_count")
+    )
+    if (
+        reasoning_tokens == 0
+        and compute_tokens > 0
+        and provider_total > 0
+        and input_tokens + output_tokens >= provider_total
+    ):
+        # Some OpenAI-compatible providers expose reasoning_tokens separately
+        # while still including them in output_tokens. The provider total lets
+        # us split that class without counting it twice.
+        output_tokens = max(0, output_tokens - compute_tokens)
+    classified_total = input_tokens + output_tokens + compute_tokens
+    if provider_total > classified_total:
+        # Unknown provider-specific token classes still cost money. Classify
+        # the residual conservatively at the output/compute rate.
+        compute_tokens += provider_total - classified_total
 
     billable_tokens = (
         input_tokens
@@ -266,13 +302,52 @@ class InteractBillingClient:
             raise RuntimeError("Interact billing is not configured.")
 
         url = f"{self.base_url}{path}"
-        async with aiohttp.ClientSession(timeout=self.timeout, trust_env=True) as session:
-            async with session.request(method, url, headers=self._headers(), json=payload) as response:
-                data = await response.json(content_type=None)
-                if response.status >= 400:
-                    detail = data.get("error") or data.get("detail") or f"Billing API returned HTTP {response.status}"
-                    raise HTTPException(status_code=response.status, detail=detail)
-                return data
+        try:
+            attempts = max(
+                1,
+                min(
+                    5,
+                    int(os.environ.get("INTERACT_BILLING_REQUEST_ATTEMPTS", DEFAULT_REQUEST_ATTEMPTS)),
+                ),
+            )
+        except (TypeError, ValueError):
+            attempts = DEFAULT_REQUEST_ATTEMPTS
+        retryable_statuses = {408, 425, 429}
+        last_error: Exception | None = None
+
+        for attempt in range(attempts):
+            try:
+                async with aiohttp.ClientSession(timeout=self.timeout, trust_env=True) as session:
+                    async with session.request(method, url, headers=self._headers(), json=payload) as response:
+                        raw_body = await response.text()
+                        try:
+                            data = json.loads(raw_body) if raw_body else {}
+                        except json.JSONDecodeError as exc:
+                            raise RuntimeError(
+                                f"Billing API returned a non-JSON response (HTTP {response.status})."
+                            ) from exc
+                        if not isinstance(data, dict):
+                            raise RuntimeError("Billing API returned an invalid JSON payload.")
+                        if response.status >= 400:
+                            detail = data.get("error") or data.get("detail") or f"Billing API returned HTTP {response.status}"
+                            if (
+                                attempt + 1 < attempts
+                                and (response.status in retryable_statuses or response.status >= 500)
+                            ):
+                                last_error = RuntimeError(str(detail))
+                            else:
+                                raise HTTPException(status_code=response.status, detail=detail)
+                        else:
+                            return data
+            except HTTPException:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+                last_error = exc
+
+            if attempt + 1 < attempts:
+                await asyncio.sleep(min(2 ** attempt, 4))
+
+        raise RuntimeError(f"Interact billing request failed after {attempts} attempts: {last_error}")
 
     async def resolve_identity(self, user: Any) -> BillingIdentity:
         if not getattr(user, "email", None):
@@ -343,6 +418,11 @@ class InteractBillingClient:
         )
 
     async def authorize(self, user: Any, form_data: dict[str, Any], metadata: dict[str, Any]) -> BillingAuthorization:
+        base_input_tokens = estimate_prompt_tokens(form_data.get("messages", []))
+        try:
+            reservation_multiplier = max(1, min(24, int(form_data.get("_billing_multiplier") or 1)))
+        except (TypeError, ValueError):
+            reservation_multiplier = 1
         input_tokens, max_output_tokens, reserved_tokens = estimate_reserved_tokens(form_data)
         usage_channel = "external_api" if metadata.get("auth_type") == "api_key" else "webui"
         channel_metadata = metadata.get('interact_channel') or {}
@@ -470,8 +550,8 @@ class InteractBillingClient:
             request_id=request_id,
             company_user_id=company_user["id"],
             reservation_id=data["reservation_id"],
-            estimated_input_tokens=input_tokens,
-            max_output_tokens=max_output_tokens,
+            estimated_input_tokens=base_input_tokens,
+            max_output_tokens=max(1, max_output_tokens // reservation_multiplier),
             reserved_tokens=data["reserved_tokens"],
             usage_channel=usage_channel,
             company_member_id=company_member.get("id") if company_member else None,
@@ -565,6 +645,7 @@ class InteractBillingClient:
         metadata: dict[str, Any],
         usage: Optional[dict[str, Any]],
         answer: Any = None,
+        status_value: str = "completed",
     ) -> dict[str, Any]:
         channel_metadata = metadata.get("interact_channel") or {}
         workflow_metadata = billing_workflow_metadata(metadata)
@@ -577,7 +658,10 @@ class InteractBillingClient:
         )
         input_tokens, output_tokens, compute_tokens, billable_tokens = usage_token_counts(
             usage,
-            authorization.estimated_input_tokens,
+            max(
+                authorization.estimated_input_tokens,
+                estimate_prompt_tokens(form_data.get("messages") or []),
+            ),
             estimate_text_tokens(answer_text),
         )
         data = await self._request(
@@ -600,7 +684,7 @@ class InteractBillingClient:
                 "message_id": metadata.get("message_id"),
                 "model": form_data.get("model"),
                 "usage_channel": authorization.usage_channel,
-                "status": "completed",
+                "status": status_value,
                 "request_summary": (
                     f"Workflow: {workflow_metadata.get('name') or workflow_metadata.get('id')}"
                     if workflow_metadata
@@ -620,6 +704,11 @@ class InteractBillingClient:
                 "parameters": {
                     "openWebuiEmail": user.email,
                     "usageChannel": authorization.usage_channel,
+                    "usageMeasurement": (
+                        str((usage or {}).get("measurement") or "provider")
+                        if usage
+                        else "estimated"
+                    ),
                     "apiKeyId": metadata.get("api_key_id"),
                     **(
                         {

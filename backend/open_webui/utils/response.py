@@ -14,12 +14,14 @@ from open_webui.utils.misc import (
 def normalize_usage(usage: dict) -> dict:
     """
     Normalize usage statistics to standard format.
-    Handles OpenAI, Ollama, and llama.cpp formats.
+    Handles OpenAI, Gemini, Ollama, and llama.cpp formats, including
+    separately reported reasoning/compute tokens.
 
     Adds standardized token fields to the original data:
     - input_tokens: Number of tokens in the prompt
     - output_tokens: Number of tokens generated
-    - total_tokens: Sum of input and output tokens
+    - compute_tokens: Number of separately reported reasoning tokens
+    - total_tokens: Provider total, or the sum of input, output, and compute
     """
     if not usage:
         return {}
@@ -28,6 +30,7 @@ def normalize_usage(usage: dict) -> dict:
     input_tokens = (
         usage.get('input_tokens')  # Already standard
         or usage.get('prompt_tokens')  # OpenAI
+        or usage.get('promptTokenCount')  # Gemini
         or usage.get('prompt_eval_count')  # Ollama
         or usage.get('prompt_n')  # llama.cpp
         or 0
@@ -36,18 +39,34 @@ def normalize_usage(usage: dict) -> dict:
     output_tokens = (
         usage.get('output_tokens')  # Already standard
         or usage.get('completion_tokens')  # OpenAI
+        or usage.get('candidatesTokenCount')  # Gemini
         or usage.get('eval_count')  # Ollama
         or usage.get('predicted_n')  # llama.cpp
         or 0
     )
 
-    total_tokens = usage.get('total_tokens') or (input_tokens + output_tokens)
+    compute_tokens = (
+        usage.get('compute_tokens')
+        or usage.get('thoughts_token_count')
+        or usage.get('thoughtsTokenCount')
+        or usage.get('thoughts_tokens')
+        or usage.get('reasoning_tokens')
+        or 0
+    )
+    total_tokens = (
+        usage.get('total_tokens')
+        or usage.get('totalTokenCount')
+        or usage.get('total_token_count')
+        or (input_tokens + output_tokens + compute_tokens)
+    )
 
     # Add standardized fields to original data
     result = dict(usage)
     result['input_tokens'] = int(input_tokens)
     result['output_tokens'] = int(output_tokens)
+    result['compute_tokens'] = int(compute_tokens)
     result['total_tokens'] = int(total_tokens)
+    result.setdefault('measurement', 'provider')
 
     return result
 
@@ -55,7 +74,12 @@ def normalize_usage(usage: dict) -> dict:
 USAGE_TOKEN_KEYS = {
     'input_tokens',
     'output_tokens',
+    'compute_tokens',
     'total_tokens',
+    'cache_creation_input_tokens',
+    'cache_read_input_tokens',
+    'tool_use_input_tokens',
+    'toolUsePromptTokenCount',
 }
 
 USAGE_COST_KEYS = {
@@ -144,8 +168,57 @@ def merge_usage(current: dict | None, incoming: dict | None) -> dict:
         or incoming_usage.get('output_tokens')
         or current_usage.get('completion_tokens', 0)
     )
+    measurements = {
+        str(value)
+        for value in (current_usage.get('measurement'), incoming_usage.get('measurement'))
+        if value
+    }
+    if measurements:
+        result['measurement'] = next(iter(measurements)) if len(measurements) == 1 else 'mixed'
 
     return result
+
+
+def record_auxiliary_usage(request, response, form_data: dict | None = None):
+    """Attach an internal model call's usage to the active parent billing request."""
+    state = getattr(request, 'state', None)
+    if not state or not getattr(state, 'interact_billing_parent_active', False):
+        return response
+
+    response_data = response if isinstance(response, dict) else None
+    if response_data is None and getattr(response, 'body', None):
+        try:
+            decoded = json.loads(response.body.decode('utf-8', 'replace'))
+            response_data = decoded if isinstance(decoded, dict) else None
+        except (AttributeError, TypeError, ValueError):
+            response_data = None
+
+    usage = response_data.get('usage') if isinstance(response_data, dict) else None
+    if (not isinstance(usage, dict) or not usage) and form_data:
+        from open_webui.utils.interact_billing import estimate_prompt_tokens, estimate_text_tokens
+
+        output_value = None
+        if isinstance(response_data, dict):
+            choices = response_data.get('choices')
+            if isinstance(choices, list) and choices:
+                message = choices[0].get('message') if isinstance(choices[0], dict) else None
+                output_value = message.get('content') if isinstance(message, dict) else None
+            if output_value is None:
+                output_value = response_data.get('output')
+        estimated_input = estimate_prompt_tokens(form_data.get('messages') or [])
+        estimated_output = estimate_text_tokens(output_value)
+        usage = {
+            'input_tokens': estimated_input,
+            'output_tokens': estimated_output,
+            'total_tokens': estimated_input + estimated_output,
+            'measurement': 'estimated',
+        }
+    if isinstance(usage, dict) and usage:
+        state.interact_billing_aux_usage = merge_usage(
+            getattr(state, 'interact_billing_aux_usage', None),
+            usage,
+        )
+    return response
 
 
 def convert_ollama_tool_call_to_openai(tool_calls: list) -> list:
