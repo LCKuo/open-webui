@@ -7,7 +7,7 @@ from open_webui.routers.interact_channels import (
     _rate_limit_text,
     _tool_failure_from_items,
 )
-from open_webui.tools.interact_database import _build_where_sql, _database_error_result
+from open_webui.tools.interact_database import _build_where_sql, _context, _database_error_result
 
 
 def test_database_filter_builder_supports_parameterized_in_and_not_in_lists():
@@ -21,6 +21,26 @@ def test_database_filter_builder_supports_parameterized_in_and_not_in_lists():
 
     assert where_sql == ' WHERE "id" IN (?, ?, ?) AND "status" NOT IN (?, ?)'
     assert values == [8, 14, 20, 'disabled', 'deleted']
+
+
+def test_database_context_uses_verified_product_access_subject():
+    context = _context(
+        None,
+        {
+            'interact_channel': {
+                'source': 'channel',
+                'channelId': 'am-channel',
+                'companyUserId': 'company-1',
+                'companyMemberId': None,
+                'accessSubjectId': 'product:crm:crm-instance-a:7',
+                'companyMemberRole': 'member',
+            },
+        },
+    )
+
+    assert context.company_user_id == 'company-1'
+    assert context.company_member_id == 'product:crm:crm-instance-a:7'
+    assert context.channel_id == 'am-channel'
 
 
 @pytest.mark.parametrize('operand', [[], '1,2,3', list(range(101))])

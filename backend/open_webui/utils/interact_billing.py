@@ -322,6 +322,10 @@ class InteractBillingClient:
         company_member_id: str | None,
         member_email: str,
         channel_id: str,
+        identity_source: str = 'company_portal',
+        product_key: str | None = None,
+        product_instance_id: str | None = None,
+        product_user_id: str | None = None,
     ) -> dict[str, Any]:
         return await self._request(
             'POST',
@@ -331,6 +335,10 @@ class InteractBillingClient:
                 'company_member_id': company_member_id,
                 'member_email': member_email,
                 'channel_id': channel_id,
+                'identity_source': identity_source,
+                'product_key': product_key,
+                'product_instance_id': product_instance_id,
+                'product_user_id': product_user_id,
             },
         )
 
@@ -338,6 +346,7 @@ class InteractBillingClient:
         input_tokens, max_output_tokens, reserved_tokens = estimate_reserved_tokens(form_data)
         usage_channel = "external_api" if metadata.get("auth_type") == "api_key" else "webui"
         channel_metadata = metadata.get('interact_channel') or {}
+        product_actor: dict[str, Any] | None = None
         if (
             isinstance(channel_metadata, dict)
             and channel_metadata.get('identitySource') == 'line-binding'
@@ -348,7 +357,29 @@ class InteractBillingClient:
             company_user = {'id': str(channel_metadata['companyUserId'])}
             company_member_id = str(channel_metadata.get('companyMemberId') or '').strip()
             company_member_role = str(channel_metadata['companyMemberRole']).strip().lower()
-            if company_member_id:
+            identity_subject = str(channel_metadata.get('identitySubject') or 'company_portal').strip()
+            if identity_subject == 'product':
+                product_actor = {
+                    'identitySource': 'product',
+                    'productKey': str(channel_metadata.get('productKey') or ''),
+                    'productInstanceId': str(channel_metadata.get('productInstanceId') or ''),
+                    'productUserId': str(channel_metadata.get('productUserId') or ''),
+                    'productTeamCodes': [
+                        str(item) for item in channel_metadata.get('productTeamCodes') or [] if str(item)
+                    ],
+                    'email': str(channel_metadata['companyMemberEmail']),
+                    'role': company_member_role,
+                }
+                if not all(
+                    product_actor.get(key)
+                    for key in ('productKey', 'productInstanceId', 'productUserId')
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail='LINE product identity binding is incomplete. Please relink the LINE account.',
+                    )
+                company_member = None
+            elif company_member_id:
                 company_member = {
                     'id': company_member_id,
                     'email': str(channel_metadata['companyMemberEmail']),
@@ -377,6 +408,7 @@ class InteractBillingClient:
                 if company_member
                 else {}
             ),
+            **({'productActor': product_actor} if product_actor else {}),
         }
         request_id = f"{metadata.get('chat_id') or 'direct'}:{metadata.get('message_id') or uuid4()}"
         workflow_metadata = billing_workflow_metadata(metadata)
@@ -415,6 +447,7 @@ class InteractBillingClient:
                         if company_member
                         else {}
                     ),
+                    **({'productActor': product_actor} if product_actor else {}),
                     "openWebuiMessageId": metadata.get("message_id"),
                     "openWebuiSessionId": metadata.get("session_id"),
                     **({"source": "channel", "channel": channel_metadata} if channel_metadata else {}),

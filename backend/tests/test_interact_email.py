@@ -3,13 +3,16 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import open_webui.models.interact_email as email_models
+import open_webui.routers.interact_email as email_router
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 from open_webui.routers.interact_email import (
+    EmailSendRequest,
     _apply_recipient_policy,
     _resend_error_response,
     ensure_email_connector_allowed,
+    send_resend_email,
 )
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -328,6 +331,106 @@ def test_resend_server_error_is_reported_as_service_unavailable():
 
     assert status == 503
     assert detail == 'Resend 服務目前暫時無法完成寄送，請稍後再試。'
+
+
+@pytest.mark.asyncio
+async def test_campaign_delivery_reaches_provider_and_records_sent_status(monkeypatch):
+    connector = SimpleNamespace(
+        id='connector-1',
+        company_user_id='company-1',
+        enabled=True,
+        status='ready',
+        control_plane_status='active',
+        allowed_workflow_ids=['workflow-1'],
+        allowed_channel_ids=[],
+        access_mode='company_admins',
+        allowed_member_ids=[],
+        allowed_group_ids=[],
+        recipient_policy={'allowed_domains': [], 'blocked_domains': []},
+        cc_policy={'default_cc': [], 'allowed_domains': [], 'max_cc': 10},
+        max_recipients_per_send=20,
+        daily_send_limit=100,
+        from_name='Chengsyin Team',
+        from_address='noreply@example.com',
+        reply_to='owner@example.com',
+    )
+    delivery = SimpleNamespace(
+        id='delivery-1',
+        company_user_id='company-1',
+        payload_hash='a' * 64,
+        status='sending',
+        provider_message_id=None,
+    )
+    recorded = {}
+
+    async def no_existing_delivery(_key):
+        return None
+
+    async def create_delivery(**values):
+        recorded['created'] = values
+        return delivery, True
+
+    async def update_delivery(_delivery_id, **values):
+        recorded['updated'] = values
+        for key, value in values.items():
+            setattr(delivery, key, value)
+        return delivery
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def text(self):
+            return json.dumps({'id': 'resend-message-1'})
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def post(self, url, **kwargs):
+            recorded['provider_url'] = url
+            recorded['provider_request'] = kwargs
+            return FakeResponse()
+
+    monkeypatch.setattr(email_router.InteractEmail, 'decrypt_connector_api_key', lambda _connector: 're_test_key')
+    monkeypatch.setattr(email_router.InteractEmail, 'get_delivery_by_idempotency_key', no_existing_delivery)
+    monkeypatch.setattr(email_router.InteractEmail, 'create_delivery', create_delivery)
+    monkeypatch.setattr(email_router.InteractEmail, 'update_delivery', update_delivery)
+    monkeypatch.setattr(email_router, 'is_billing_enabled', lambda: False)
+    monkeypatch.setattr(email_router, '_encrypt', lambda value: f'encrypted:{value}')
+    monkeypatch.setattr(email_router.aiohttp, 'ClientSession', FakeSession)
+
+    result = await send_resend_email(
+        connector,
+        {'company_user_id': 'company-1', 'service_principal': True},
+        EmailSendRequest(
+            connector_id='connector-1',
+            to=['buyer@example.com'],
+            subject='Campaign validation',
+            text='This is a controlled campaign delivery test.',
+            workflow_id='workflow-1',
+            workflow_run_id='run-1',
+            idempotency_key='campaign-validation-1',
+            payload_hash='a' * 64,
+        ),
+    )
+
+    assert recorded['provider_url'].endswith('/emails')
+    assert recorded['provider_request']['json']['to'] == ['buyer@example.com']
+    assert recorded['created']['workflow_id'] == 'workflow-1'
+    assert result.status == 'sent'
+    assert result.provider_message_id == 'resend-message-1'
 
 
 @pytest.mark.asyncio

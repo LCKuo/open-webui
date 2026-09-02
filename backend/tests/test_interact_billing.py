@@ -252,6 +252,52 @@ async def test_authorize_line_member_keeps_verified_member_context():
 
 
 @pytest.mark.asyncio
+async def test_authorize_crm_employee_bills_company_without_website_member():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-company", email="company@example.com")
+    metadata = {
+        "chat_id": "chat",
+        "message_id": "message",
+        "interact_channel": {
+            "identitySource": "line-binding",
+            "identitySubject": "product",
+            "companyUserId": "company-1",
+            "companyMemberId": None,
+            "companyMemberEmail": "employee@example.com",
+            "companyMemberRole": "member",
+            "productKey": "crm",
+            "productInstanceId": "crm-instance-a",
+            "productUserId": "7",
+            "productTeamCodes": ["am"],
+        },
+    }
+
+    authorization = await client.authorize(
+        user,
+        {
+            "model": "am-agent",
+            "messages": [{"role": "user", "content": "新增跟進紀錄"}],
+            "max_completion_tokens": 10,
+        },
+        metadata,
+    )
+
+    authorize_payload = client.requests[-1][2]
+    assert authorize_payload["company_user_id"] == "company-1"
+    assert "company_member_id" not in authorize_payload
+    assert authorize_payload["metadata"]["productActor"] == {
+        "identitySource": "product",
+        "productKey": "crm",
+        "productInstanceId": "crm-instance-a",
+        "productUserId": "7",
+        "productTeamCodes": ["am"],
+        "email": "employee@example.com",
+        "role": "member",
+    }
+    assert authorization.company_member_id is None
+
+
+@pytest.mark.asyncio
 async def test_authorize_line_member_without_member_id_fails_closed():
     client = CaptureBillingClient()
     user = SimpleNamespace(id="webui-owner", email="owner@example.com")

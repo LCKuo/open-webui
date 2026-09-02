@@ -395,6 +395,21 @@ async def test_prospecting_contract_retries_empty_output_and_normalizes_schema_d
                     "taxId": "22099131",
                     "industry": "自動化設備",
                     "website": "https://example.com",
+                    "businessActivities": [{
+                        "category": "equipment",
+                        "label": "客製自動化設備",
+                        "evidenceUrl": "https://example.com",
+                        "evidenceExcerpt": "提供客製自動化設備設計與製造服務。",
+                        "confidence": 82
+                    }],
+                    "suggestedEntryPoints": [{
+                        "name": "PEEK 耐磨件",
+                        "rationale": "客製自動化設備可能使用滑塊、軸套或耐磨導引件。",
+                        "supportingFacts": ["公開網站證實設計及製造客製自動化設備"],
+                        "assumptions": ["是否使用 PEEK 或其他工程塑料仍需確認"],
+                        "evidenceUrls": ["https://example.com"],
+                        "confidence": 68
+                    }],
                     "structuralNeedScore": 60,
                     "capabilityFitScore": 70,
                     "timingScore": 20,
@@ -462,6 +477,8 @@ async def test_prospecting_contract_retries_empty_output_and_normalizes_schema_d
     assert result['outputs'][0]['value']['notes'] == ['僅使用公開來源。']
     assert result['outputs'][0]['value']['candidates'][0]['excluded'] is False
     assert result['outputs'][0]['value']['candidates'][0]['taxId'] == '22099131'
+    assert result['outputs'][0]['value']['candidates'][0]['businessActivities'][0]['category'] == 'equipment'
+    assert result['outputs'][0]['value']['candidates'][0]['suggestedEntryPoints'][0]['name'] == 'PEEK 耐磨件'
     assert result['outputs'][0]['value']['profileSuggestions'][0]['term'] == '客製自動化設備'
 
 

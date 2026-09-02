@@ -66,6 +66,7 @@ from open_webui.tools.builtin import (
     grep_knowledge_files,
     interact_database_query,
     interact_database_schema,
+    interact_crm_bd_candidates_list,
     interact_crm_bd_discovery_start,
     interact_crm_bd_profile_suggestion_create,
     interact_crm_follow_up_create,
@@ -753,7 +754,11 @@ async def get_builtin_tools(
     if crm_tools.get('crm_am_actions') is True:
         builtin_functions.extend([interact_crm_follow_up_create, interact_crm_follow_up_update])
     if crm_tools.get('crm_bd_actions') is True:
-        builtin_functions.extend([interact_crm_bd_discovery_start, interact_crm_bd_profile_suggestion_create])
+        builtin_functions.extend([
+            interact_crm_bd_candidates_list,
+            interact_crm_bd_discovery_start,
+            interact_crm_bd_profile_suggestion_create,
+        ])
 
     # Skills tools - view_skill allows model to load full skill instructions on demand
     if extra_params.get('__skill_ids__'):

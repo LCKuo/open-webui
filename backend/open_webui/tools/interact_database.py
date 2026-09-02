@@ -90,9 +90,19 @@ def _context(__user__: dict | None, __metadata__: dict | None) -> QueryContext:
         company_member_id=(
             _string_value(user.get('companyMemberId'))
             or _string_value(user.get('company_member_id'))
+            or _string_value(interact_company.get('accessSubjectId'))
+            or _string_value(interact_company.get('access_subject_id'))
             or _string_value(interact_company.get('companyMemberId'))
             or _string_value(interact_company.get('company_member_id'))
-            or _string_value(_metadata_value(metadata, 'companyMemberId', 'company_member_id'))
+            or _string_value(
+                _metadata_value(
+                    metadata,
+                    'accessSubjectId',
+                    'access_subject_id',
+                    'companyMemberId',
+                    'company_member_id',
+                )
+            )
         ),
         company_member_role=(
             _string_value(user.get('companyMemberRole'))

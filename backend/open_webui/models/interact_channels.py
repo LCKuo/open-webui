@@ -181,6 +181,11 @@ class InteractLineIdentityLink(Base):
     company_user_id = Column(Text, nullable=True)
     company_email = Column(Text, nullable=True)
     company_member_id = Column(Text, nullable=True)
+    identity_source = Column(Text, nullable=False, default='company_portal')
+    product_key = Column(Text, nullable=True)
+    product_instance_id = Column(Text, nullable=True)
+    product_user_id = Column(Text, nullable=True)
+    product_team_codes_json = Column(Text, nullable=False, default='[]')
     member_email = Column(Text, nullable=True)
     member_role = Column(Text, nullable=True)
     member_status = Column(Text, nullable=True)
@@ -207,6 +212,11 @@ class InteractLineIdentityBinding(Base):
     company_user_id = Column(Text, nullable=False)
     company_email = Column(Text, nullable=False)
     company_member_id = Column(Text, nullable=True)
+    identity_source = Column(Text, nullable=False, default='company_portal')
+    product_key = Column(Text, nullable=True)
+    product_instance_id = Column(Text, nullable=True)
+    product_user_id = Column(Text, nullable=True)
+    product_team_codes_json = Column(Text, nullable=False, default='[]')
     member_email = Column(Text, nullable=False)
     member_role = Column(Text, nullable=False)
     member_status = Column(Text, nullable=False, default='active')
@@ -219,6 +229,12 @@ class InteractLineIdentityBinding(Base):
         UniqueConstraint('channel_id', 'external_user_hash', name='uq_interact_line_identity_channel_user'),
         Index('ix_interact_line_identity_company_member', 'company_user_id', 'company_member_id'),
         Index('ix_interact_line_identity_email', 'company_user_id', 'member_email'),
+        Index(
+            'ix_interact_line_identity_product_user',
+            'product_key',
+            'product_instance_id',
+            'product_user_id',
+        ),
     )
 
 
@@ -362,6 +378,12 @@ class InteractLineIdentityBindingModel(BaseModel):
     company_user_id: str
     company_email: str
     company_member_id: str | None = None
+    identity_source: str = 'company_portal'
+    product_key: str | None = None
+    product_instance_id: str | None = None
+    product_user_id: str | None = None
+    product_team_codes: list[str] = Field(default_factory=list)
+    access_subject_id: str | None = None
     member_email: str
     member_role: str
     member_status: str
@@ -459,6 +481,20 @@ class InteractChannelsTable:
                 'sync_token': 'TEXT',
                 'sync_expires_at': 'BIGINT',
             },
+            InteractLineIdentityLink.__table__: {
+                'identity_source': "TEXT NOT NULL DEFAULT 'company_portal'",
+                'product_key': 'TEXT',
+                'product_instance_id': 'TEXT',
+                'product_user_id': 'TEXT',
+                'product_team_codes_json': "TEXT NOT NULL DEFAULT '[]'",
+            },
+            InteractLineIdentityBinding.__table__: {
+                'identity_source': "TEXT NOT NULL DEFAULT 'company_portal'",
+                'product_key': 'TEXT',
+                'product_instance_id': 'TEXT',
+                'product_user_id': 'TEXT',
+                'product_team_codes_json': "TEXT NOT NULL DEFAULT '[]'",
+            },
         }
         for table, additions in additions_by_table.items():
             columns = {
@@ -553,12 +589,26 @@ class InteractChannelsTable:
             group_ids = json.loads(row.group_ids_json or '[]')
         except json.JSONDecodeError:
             group_ids = []
+        try:
+            product_team_codes = json.loads(row.product_team_codes_json or '[]')
+        except json.JSONDecodeError:
+            product_team_codes = []
+        identity_source = str(row.identity_source or 'company_portal')
+        access_subject_id = row.company_member_id
+        if identity_source == 'product' and row.product_key and row.product_instance_id and row.product_user_id:
+            access_subject_id = f'product:{row.product_key}:{row.product_instance_id}:{row.product_user_id}'
         return InteractLineIdentityBindingModel(
             id=row.id,
             channel_id=row.channel_id,
             company_user_id=row.company_user_id,
             company_email=row.company_email,
             company_member_id=row.company_member_id,
+            identity_source=identity_source,
+            product_key=row.product_key,
+            product_instance_id=row.product_instance_id,
+            product_user_id=row.product_user_id,
+            product_team_codes=[str(item) for item in product_team_codes if str(item).strip()],
+            access_subject_id=access_subject_id,
             member_email=row.member_email,
             member_role=row.member_role,
             member_status=row.member_status,
@@ -870,6 +920,11 @@ class InteractChannelsTable:
         member_role: str,
         member_status: str,
         group_ids: list[str],
+        identity_source: str = 'company_portal',
+        product_key: str | None = None,
+        product_instance_id: str | None = None,
+        product_user_id: str | None = None,
+        product_team_codes: list[str] | None = None,
     ) -> bool:
         await self.ensure_tables()
         now = int(time.time())
@@ -892,6 +947,13 @@ class InteractChannelsTable:
                 row.company_user_id = company_user_id
                 row.company_email = company_email.strip().lower()
                 row.company_member_id = company_member_id
+                row.identity_source = identity_source
+                row.product_key = product_key
+                row.product_instance_id = product_instance_id
+                row.product_user_id = product_user_id
+                row.product_team_codes_json = json.dumps(
+                    sorted(set(product_team_codes or [])), ensure_ascii=False
+                )
                 row.member_email = member_email.strip().lower()
                 row.member_role = member_role
                 row.member_status = member_status
@@ -963,6 +1025,11 @@ class InteractChannelsTable:
                 binding.company_user_id = link.company_user_id
                 binding.company_email = link.company_email
                 binding.company_member_id = link.company_member_id
+                binding.identity_source = link.identity_source or 'company_portal'
+                binding.product_key = link.product_key
+                binding.product_instance_id = link.product_instance_id
+                binding.product_user_id = link.product_user_id
+                binding.product_team_codes_json = link.product_team_codes_json or '[]'
                 binding.member_email = link.member_email
                 binding.member_role = link.member_role
                 binding.member_status = link.member_status
@@ -1038,6 +1105,11 @@ class InteractChannelsTable:
         member_role: str,
         member_status: str,
         group_ids: list[str],
+        identity_source: str | None = None,
+        product_key: str | None = None,
+        product_instance_id: str | None = None,
+        product_user_id: str | None = None,
+        product_team_codes: list[str] | None = None,
     ) -> InteractLineIdentityBindingModel | None:
         await self.ensure_tables()
         now = int(time.time())
@@ -1046,6 +1118,14 @@ class InteractChannelsTable:
             if not row:
                 return None
             row.company_member_id = company_member_id
+            if identity_source is not None:
+                row.identity_source = identity_source
+                row.product_key = product_key
+                row.product_instance_id = product_instance_id
+                row.product_user_id = product_user_id
+                row.product_team_codes_json = json.dumps(
+                    sorted(set(product_team_codes or [])), ensure_ascii=False
+                )
             row.member_email = member_email.strip().lower()
             row.member_role = member_role
             row.member_status = member_status

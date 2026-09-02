@@ -111,6 +111,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Starting private search tunnel ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\manage_searxng_tunnel.ps1" -Action Start -DataDir "%DATA_DIR%" -ConfigureWebUI
+if errorlevel 1 (
+    echo.
+    echo Development servers were not started because private search is unavailable.
+    echo Run install_self_hosted_search.bat once, then try again.
+    pause
+    exit /b 1
+)
+
 echo Starting backend window ...
 start "Interact Ai Backend :8080" /D "%BACKEND_DIR%" cmd /k ""%PYTHON_EXE%" -m uvicorn open_webui.main:app --port %PORT% --host %HOST% --forwarded-allow-ips=127.0.0.1 --reload"
 

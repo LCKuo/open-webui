@@ -134,6 +134,14 @@ PROSPECTING_DISCOVERY_CONTRACT_V1 = 'interact.crm.prospecting.discovery.v1'
 PROSPECTING_DISCOVERY_CONTRACT = 'interact.crm.prospecting.discovery.v2'
 _PROSPECTING_EVIDENCE_TYPES = {'website', 'directory', 'news', 'job_posting', 'trade_show'}
 _PROSPECTING_EMAIL_TYPES = {'personal', 'role', 'unknown'}
+_PROSPECTING_BUSINESS_ACTIVITY_CATEGORIES = {
+    'industry',
+    'equipment',
+    'process',
+    'product',
+    'service',
+    'application',
+}
 _PROSPECTING_EMAIL_PATTERN = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
 _PROSPECTING_PROFILE_FIELDS = {
     'industries',
@@ -228,6 +236,63 @@ def _normalize_prospecting_contact(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _normalize_prospecting_business_activity(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    category = str(value.get('category') or '').strip()
+    label = _contract_text(value.get('label'), maximum=160, nullable=False)
+    evidence_url = _contract_url(value.get('evidenceUrl'))
+    evidence_excerpt = _contract_text(
+        value.get('evidenceExcerpt'), maximum=1000, nullable=False
+    )
+    if (
+        category not in _PROSPECTING_BUSINESS_ACTIVITY_CATEGORIES
+        or len(label or '') < 2
+        or not evidence_url
+        or len(evidence_excerpt or '') < 5
+    ):
+        return None
+    return {
+        'category': category,
+        'label': label,
+        'evidenceUrl': evidence_url,
+        'evidenceExcerpt': evidence_excerpt,
+        'confidence': _contract_score(value.get('confidence', 50)),
+    }
+
+
+def _normalize_prospecting_entry_point(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    name = _contract_text(value.get('name'), maximum=160, nullable=False)
+    rationale = _contract_text(value.get('rationale'), maximum=1000, nullable=False)
+    supporting_facts = [
+        text
+        for item in (value.get('supportingFacts') if isinstance(value.get('supportingFacts'), list) else [])[:5]
+        if len(text := (_contract_text(item, maximum=500, nullable=False) or '')) >= 2
+    ]
+    assumptions = [
+        text
+        for item in (value.get('assumptions') if isinstance(value.get('assumptions'), list) else [])[:5]
+        if len(text := (_contract_text(item, maximum=500, nullable=False) or '')) >= 2
+    ]
+    evidence_urls: list[str] = []
+    for item in (value.get('evidenceUrls') if isinstance(value.get('evidenceUrls'), list) else [])[:5]:
+        url = _contract_url(item)
+        if url and url not in evidence_urls:
+            evidence_urls.append(url)
+    if len(name or '') < 2 or len(rationale or '') < 10 or not supporting_facts or not evidence_urls:
+        return None
+    return {
+        'name': name,
+        'rationale': rationale,
+        'supportingFacts': supporting_facts,
+        'assumptions': assumptions,
+        'evidenceUrls': evidence_urls,
+        'confidence': _contract_score(value.get('confidence', 50)),
+    }
+
+
 def _normalize_prospecting_candidate(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -247,6 +312,24 @@ def _normalize_prospecting_candidate(value: Any) -> dict[str, Any] | None:
         normalized
         for item in (value.get('contacts') if isinstance(value.get('contacts'), list) else [])[:10]
         if (normalized := _normalize_prospecting_contact(item)) is not None
+    ]
+    business_activities = [
+        normalized
+        for item in (
+            value.get('businessActivities')
+            if isinstance(value.get('businessActivities'), list)
+            else []
+        )[:15]
+        if (normalized := _normalize_prospecting_business_activity(item)) is not None
+    ]
+    suggested_entry_points = [
+        normalized
+        for item in (
+            value.get('suggestedEntryPoints')
+            if isinstance(value.get('suggestedEntryPoints'), list)
+            else []
+        )[:3]
+        if (normalized := _normalize_prospecting_entry_point(item)) is not None
     ]
     scores = {
         key: _contract_score(value.get(key))
@@ -287,6 +370,8 @@ def _normalize_prospecting_candidate(value: Any) -> dict[str, Any] | None:
         'website': _contract_url(value.get('website')),
         'contactEmail': contact_email,
         'contacts': contacts,
+        'businessActivities': business_activities,
+        'suggestedEntryPoints': suggested_entry_points,
         'contactEnrichmentStatus': 'verified' if contacts else 'not_found',
         'phone': _contract_text(value.get('phone'), maximum=500),
         **scores,

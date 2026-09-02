@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from open_webui.internal.db import Base, async_engine, get_async_db_context
+from open_webui.utils.interact_access import append_channel_for_selected_model
 from sqlalchemy import JSON, BigInteger, Boolean, Column, Index, Integer, Text, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
@@ -1640,6 +1641,44 @@ class InteractSemanticStore:
             if not row or (company_user_id and row.company_user_id != company_user_id):
                 return None
             return row_dict(row)
+
+    async def grant_channel_for_model(
+        self,
+        company_user_id: str,
+        model_id: str,
+        channel_id: str,
+    ) -> int:
+        """Add a replacement channel only to datasets already assigned to its model."""
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            rows = (
+                (
+                    await db.execute(
+                        select(InteractSemanticDataset).where(
+                            InteractSemanticDataset.company_user_id == company_user_id,
+                            InteractSemanticDataset.access_mode == 'selected_channels',
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            affected = 0
+            for row in rows:
+                channel_ids = append_channel_for_selected_model(
+                    access_mode=row.access_mode,
+                    allowed_model_ids=row.allowed_model_ids,
+                    allowed_channel_ids=row.allowed_channel_ids,
+                    model_id=model_id,
+                    channel_id=channel_id,
+                )
+                if channel_ids is None:
+                    continue
+                row.allowed_channel_ids = channel_ids
+                row.updated_at = int(time.time())
+                affected += 1
+            await db.commit()
+            return affected
 
     async def save_dataset(self, company_user_id: str, data: dict[str, Any], actor: str):
         await self.ensure_tables()

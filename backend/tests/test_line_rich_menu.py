@@ -15,6 +15,7 @@ from open_webui.routers.interact_channels import (
     _issue_line_account_link,
     _line_account_link_requested,
     _line_advance_workflow_session,
+    _line_binding_matches_channel_product,
     _line_event_requires_identity,
     _line_guided_input,
     _line_next_guided_field,
@@ -243,7 +244,7 @@ def test_channel_sync_schema_supports_standalone_and_future_product_adapters():
     assert payload.productBindings[0].actions[1].kind == 'message'
 
 
-def test_am_role_menu_exposes_only_am_actions_and_liff_workspace():
+def test_am_role_menu_opens_task_specific_liff_forms_without_questionnaire_messages():
     artifacts = build_line_role_menus(
         audience='member',
         alias_ids={'home': 'am-home', 'workflows': 'am-workflows'},
@@ -255,13 +256,20 @@ def test_am_role_menu_exposes_only_am_actions_and_liff_workspace():
     actions = [area['action'] for area in home.menu['areas']]
     payload = json.dumps(actions, ensure_ascii=False)
 
-    assert 'https://liff.line.me/2000000000-amtest' in payload
+    assert 'https://liff.line.me/2000000000-amtest?task=am-create' in payload
+    assert 'https://liff.line.me/2000000000-amtest?task=am-update' in payload
     assert '記錄客戶跟進' in payload
     assert '修正跟進紀錄' in payload
+    assert '請依序詢問' not in payload
     assert '執行新的潛客探索' not in payload
+    assert '客戶健康摘要' in payload
+    assert '不要反問' in payload
+    assert home.menu['chatBarText'] == 'AM 客戶經營'
+    assert len(home.menu['areas']) == 8
+    assert home.menu['areas'][2]['bounds']['width'] >= RICH_MENU_WIDTH // 3
 
 
-def test_bd_role_menu_exposes_only_bd_actions_and_liff_workspace():
+def test_bd_role_menu_runs_default_discovery_and_reserves_liff_for_explicit_override():
     artifacts = build_line_role_menus(
         audience='member',
         alias_ids={'home': 'bd-home', 'workflows': 'bd-workflows'},
@@ -273,10 +281,16 @@ def test_bd_role_menu_exposes_only_bd_actions_and_liff_workspace():
     actions = [area['action'] for area in home.menu['areas']]
     payload = json.dumps(actions, ensure_ascii=False)
 
-    assert 'https://liff.line.me/2000000000-bdtest' in payload
+    assert 'https://liff.line.me/2000000000-bdtest?task=bd-discovery' in payload
     assert '執行新的潛客探索' in payload
+    assert '不要反問' in payload
+    assert '請先列出可用目標客群' not in payload
     assert '改善搜尋輪廓' in payload
     assert '記錄客戶跟進' not in payload
+    assert '自由提問' not in payload
+    assert home.menu['chatBarText'] == 'BD 新客開發'
+    assert len(home.menu['areas']) == 8
+    assert home.menu['areas'][2]['bounds']['width'] >= RICH_MENU_WIDTH // 3
 
 
 @pytest.mark.asyncio
@@ -465,6 +479,79 @@ def test_rich_menu_liff_extension_reuses_existing_slot_contract():
     assert any(action.get('type') == 'uri' and action.get('uri') == 'https://liff.line.me/test' for action in actions)
     assert parse_line_postback_data('{"a":"menu.ask.v1"}') == {'a': 'menu.ask.v1'}
     assert parse_line_postback_data('not-json') is None
+
+
+def test_crm_product_channel_rejects_legacy_portal_and_other_instance_bindings():
+    channel = SimpleNamespace(
+        channel_mode='single_product',
+        product_bindings=[{
+            'enabled': True,
+            'productKey': 'crm',
+            'instanceId': 'crm-instance-a',
+            'identityLinkUrl': 'https://crm.example.com/line-link',
+        }],
+    )
+
+    assert not _line_binding_matches_channel_product(
+        channel,
+        SimpleNamespace(identity_source='company_portal'),
+    )
+    assert not _line_binding_matches_channel_product(
+        channel,
+        SimpleNamespace(
+            identity_source='product',
+            product_key='crm',
+            product_instance_id='crm-instance-b',
+            product_user_id='7',
+        ),
+    )
+    assert _line_binding_matches_channel_product(
+        channel,
+        SimpleNamespace(
+            identity_source='product',
+            product_key='crm',
+            product_instance_id='crm-instance-a',
+            product_user_id='7',
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_existing_crm_product_binding_derives_employee_link_from_registered_product(monkeypatch):
+    sent_messages = []
+
+    async def line_api(*args, **kwargs):
+        return {'linkToken': 'line-link-token'}
+
+    async def no_op(*args, **kwargs):
+        return None
+
+    async def send_messages(channel, reply_token, messages):
+        sent_messages.extend(messages)
+
+    channel = SimpleNamespace(
+        id='channel-id',
+        channel_mode='single_product',
+        product_bindings=[{
+            'enabled': True,
+            'productKey': 'crm',
+            'instanceId': 'crm-instance-a',
+            'label': '製造業 CRM',
+            'actions': [{'kind': 'link', 'href': 'https://crm.example.com/dashboard'}],
+        }],
+    )
+    monkeypatch.setattr('open_webui.routers.interact_channels._line_api_request', line_api)
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.InteractChannels.create_line_identity_link',
+        no_op,
+    )
+    monkeypatch.setattr('open_webui.routers.interact_channels._send_line_messages', send_messages)
+
+    await _issue_line_account_link(channel, 'line-user', 'reply-token')
+
+    uri = sent_messages[0]['contents']['footer']['contents'][0]['action']['uri']
+    assert uri.startswith('https://crm.example.com/line-link?')
+    assert 'channelId=channel-id' in uri
 
 
 def test_role_menus_use_shared_tabs_and_large_stable_categories():

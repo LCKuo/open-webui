@@ -1124,6 +1124,21 @@ CRM 探索條件：
       "confidence": 0,
       "verificationStatus": "verified"
     }],
+    "businessActivities": [{
+      "category": "industry 或 equipment 或 process 或 product 或 service 或 application",
+      "label": "從公開頁面辨識出的標準化營業項目",
+      "evidenceUrl": "該營業項目實際出現的公開網址",
+      "evidenceExcerpt": "支持分類的來源摘錄",
+      "confidence": 0
+    }],
+    "suggestedEntryPoints": [{
+      "name": "只能使用 search_brief.commercialEntryPoints 中的名稱",
+      "rationale": "公開事實如何支持這項開發方向",
+      "supportingFacts": ["公開來源已證實的事實"],
+      "assumptions": ["仍需人工確認的規格或採購需求"],
+      "evidenceUrls": ["https://本輪搜尋結果中的實際網址"],
+      "confidence": 0
+    }],
     "phone": "公開企業電話或 null",
     "structuralNeedScore": 0,
     "capabilityFitScore": 0,
@@ -1147,7 +1162,9 @@ CRM 探索條件：
   "notes": []
 }
 
-每家公司至少要有一筆含公開 URL 的證據。evidence.url 必須逐字複製本次搜尋結果中的 URL，不得自行組合或猜測。website 只有在搜尋資料能確認為公司官方網站時填寫，否則填 null。Email 與電話只有在本次讀取的公開頁文字中出現時才能填寫。辨識不出正式公司名稱、只有社群帳號、只有產品名、或沒有來源 URL 時不要列入。排除條件命中時仍可列出，但 excluded 必須為 true 並說明原因。分數必須保守，沒有採購或擴產時機證據時 timingScore 不得高於 35。`
+每家公司至少要有一筆含公開 URL 的證據。evidence.url 必須逐字複製本次搜尋結果中的 URL，不得自行組合或猜測。website 只有在搜尋資料能確認為公司官方網站時填寫，否則填 null。Email 與電話只有在本次讀取的公開頁文字中出現時才能填寫。辨識不出正式公司名稱、只有社群帳號、只有產品名、或沒有來源 URL 時不要列入。排除條件命中時仍可列出，但 excluded 必須為 true 並說明原因。分數必須保守，沒有採購或擴產時機證據時 timingScore 不得高於 35。
+
+businessActivities 必須描述候選公司公開資料顯示的實際營業項目，每項附來源，不得混入供應方產品。suggestedEntryPoints 最多 3 項且只能使用 search_brief.commercialEntryPoints 中的名稱；supportingFacts 與 assumptions 必須分開，沒有足夠證據時回傳空陣列。`
 		};
 		agent.data.label = 'AI 結構化候選';
 		parser.data.label = '驗證候選 JSON';

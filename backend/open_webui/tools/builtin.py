@@ -70,6 +70,7 @@ from open_webui.tools.interact_semantic import (  # noqa: F401 re-exported
     interact_semantic_query,
 )
 from open_webui.tools.interact_crm_actions import (  # noqa: F401 re-exported
+    interact_crm_bd_candidates_list,
     interact_crm_bd_discovery_start,
     interact_crm_bd_profile_suggestion_create,
     interact_crm_follow_up_create,

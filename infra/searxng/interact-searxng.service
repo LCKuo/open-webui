@@ -1,0 +1,19 @@
+[Unit]
+Description=Interact private SearXNG search service
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/interact-searxng.env
+ExecStartPre=-/usr/bin/docker rm -f interact-searxng
+ExecStart=/usr/bin/docker run --name interact-searxng --rm --memory=512m --memory-swap=768m --cpus=0.75 --log-opt max-size=10m --log-opt max-file=3 --publish 127.0.0.1:8888:8080 --env SEARXNG_SECRET --env FORCE_OWNERSHIP=true --volume /opt/interact-searxng/config:/etc/searxng --volume interact-searxng-cache:/var/cache/searxng ghcr.io/searxng/searxng@sha256:c7cc75852051bf6254afda6ed1b920dd1677d8efe4ab141bf558f02e582f4371
+ExecStop=/usr/bin/docker stop -t 20 interact-searxng
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

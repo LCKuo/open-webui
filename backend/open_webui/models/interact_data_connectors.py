@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from open_webui.internal.db import Base, async_engine, get_async_db_context
+from open_webui.utils.interact_access import append_channel_for_selected_model
 from open_webui.utils.oauth import decrypt_data, encrypt_data
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import BigInteger, Boolean, Column, Index, Integer, Text, delete, select
@@ -297,6 +298,44 @@ class InteractDataConnectorsTable:
                 )
             )
             return [self._model(row) for row in result.scalars().all()]
+
+    async def grant_channel_for_model(
+        self,
+        company_user_id: str,
+        model_id: str,
+        channel_id: str,
+    ) -> int:
+        """Keep selected-channel grants aligned when a product channel is replaced."""
+        await self.ensure_tables()
+        async with get_async_db_context() as db:
+            rows = (
+                (
+                    await db.execute(
+                        select(InteractDataConnector).where(
+                            InteractDataConnector.company_user_id == company_user_id,
+                            InteractDataConnector.access_mode == 'selected_channels',
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            affected = 0
+            for row in rows:
+                channel_ids = append_channel_for_selected_model(
+                    access_mode=row.access_mode,
+                    allowed_model_ids=row.allowed_model_ids,
+                    allowed_channel_ids=row.allowed_channel_ids,
+                    model_id=model_id,
+                    channel_id=channel_id,
+                )
+                if channel_ids is None:
+                    continue
+                row.allowed_channel_ids = _json_dump(channel_ids)
+                row.updated_at = int(time.time())
+                affected += 1
+            await db.commit()
+            return affected
 
     async def update_local_credentials(self, connector_id: str, data: dict[str, Any]) -> InteractDataConnectorModel | None:
         await self.ensure_tables()

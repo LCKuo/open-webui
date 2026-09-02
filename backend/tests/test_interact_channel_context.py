@@ -11,10 +11,12 @@ from open_webui.routers.interact_channels import (
     CRM_AM_ACTION_INSTRUCTION,
     CRM_BD_ACTION_INSTRUCTION,
     ChannelChatRequest,
+    _bd_direct_command,
     _channel_output_text,
     _channel_request_messages,
     _claim_and_respond,
     _complete_claimed_result,
+    _direct_crm_channel_command,
     _estimated_reservation_tokens,
     _generate_context_summary,
     _line_delivery_messages,
@@ -44,6 +46,8 @@ def test_am_instruction_names_the_only_allowed_crm_write_apis():
     assert 'interact_crm_follow_up_create' in CRM_AM_ACTION_INSTRUCTION
     assert 'interact_crm_follow_up_update' in CRM_AM_ACTION_INSTRUCTION
     assert 'Never use interact_crm_bd_discovery_start' in CRM_AM_ACTION_INSTRUCTION
+    assert 'Never ask for facts already stored in CRM' in CRM_AM_ACTION_INSTRUCTION
+    assert 'never send a generic workbench link' in CRM_AM_ACTION_INSTRUCTION
     assert 'never write CRM tables directly' in CRM_AM_ACTION_INSTRUCTION
 
 
@@ -52,6 +56,10 @@ def test_bd_instruction_allows_public_business_contacts_but_blocks_am_writes():
     assert 'verifiable corporate phone numbers and email addresses' in CRM_BD_ACTION_INSTRUCTION
     assert 'interact_crm_bd_discovery_start' in CRM_BD_ACTION_INSTRUCTION
     assert 'interact_crm_bd_profile_suggestion_create' in CRM_BD_ACTION_INSTRUCTION
+    assert 'interact_crm_bd_candidates_list' in CRM_BD_ACTION_INSTRUCTION
+    assert 'never claim that the list is unavailable before calling it' in CRM_BD_ACTION_INSTRUCTION
+    assert 'call interact_crm_bd_discovery_start immediately with no arguments' in CRM_BD_ACTION_INSTRUCTION
+    assert 'Never list segments or ask for region, count, rounds, or exclusions' in CRM_BD_ACTION_INSTRUCTION
     assert 'Never use interact_crm_follow_up_create' in CRM_BD_ACTION_INSTRUCTION
     assert 'never write CRM tables directly' in CRM_BD_ACTION_INSTRUCTION
 
@@ -693,7 +701,7 @@ async def test_unbound_line_user_cannot_execute_workflow_postback(monkeypatch):
     assert response.status_code == 200
     assert queued == []
     assert replies == [
-        '無法確認您的企業身分，這次動作沒有執行。\n請先點選「綁定帳號」；若已綁定，請稍後重試或到主站台檢查帳號狀態。'
+        '無法確認您的員工或企業身分，這次動作沒有執行。\n請先點選「綁定帳號」；若已綁定，請重新綁定或聯繫管理員確認權限。'
     ]
     assert json.loads(response.body)['results'][0]['identityRequired'] is True
 
@@ -1076,6 +1084,87 @@ async def test_line_workflow_menu_uses_carousel_without_quick_replies(monkeypatc
             'text': '工作流選單已更新，請重新點選 LINE 選單中的工作流分類。',
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_crm_follow_up_question_does_not_append_generic_workbench_button():
+    channel = SimpleNamespace(
+        product_role='bd',
+        liff_id='2011216749-l9nWQXj0',
+    )
+
+    messages = await _line_delivery_messages(
+        channel,
+        {'content': '請先提供公司名稱或官方網站，我會再進行分析。', 'outputs': []},
+    )
+
+    assert len(messages) == 1
+    assert messages[0]['type'] == 'text'
+
+
+@pytest.mark.asyncio
+async def test_regular_crm_answer_does_not_repeat_liff_button():
+    channel = SimpleNamespace(product_role='am', liff_id='2011216749-x8j4BVip')
+
+    messages = await _line_delivery_messages(
+        channel,
+        {'content': '今天最值得聯絡的是 A 公司。', 'outputs': []},
+    )
+
+    assert len(messages) == 1
+    assert messages[0]['type'] == 'text'
+
+
+def test_bd_direct_command_recognizes_execution_and_candidate_intents():
+    assert _bd_direct_command('我要執行新的潛客探索。請先列出客群。') == 'discovery'
+    assert _bd_direct_command('請列出目前待人工確認的潛在客戶') == 'candidates'
+    assert _bd_direct_command('說明一下潛客探索的規則') is None
+
+
+@pytest.mark.asyncio
+async def test_bd_direct_discovery_executes_without_llm_or_user_parameters(monkeypatch):
+    captured = {}
+
+    async def execute(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({
+            'ok': True,
+            'runId': 88,
+            'targetSegmentId': 6,
+            'targetSegmentName': '高純管路與管件',
+            'region': '台灣',
+            'requestedCount': 10,
+            'maxRounds': 2,
+        }, ensure_ascii=False)
+
+    monkeypatch.setattr(
+        'open_webui.routers.interact_channels.interact_crm_bd_discovery_start',
+        execute,
+    )
+    result = await _direct_crm_channel_command(
+        _request(b'', []),
+        SimpleNamespace(id='bd-channel', product_role='bd', model_id='bd-agent'),
+        '執行潛客探索',
+        {
+            'companyUserId': 'company-id',
+            'companyMemberId': 'member-id',
+            'memberEmail': 'bd@example.com',
+            'memberRole': 'member',
+            'identitySource': 'product',
+            'productKey': 'crm',
+            'productInstanceId': 'crm-instance',
+            'productUserId': '42',
+            'productTeamCodes': ['bd'],
+        },
+        'bd-agent',
+    )
+
+    assert result['ok'] is True
+    assert '任務 #88 已建立' in result['content']
+    assert '高純管路與管件' in result['content']
+    assert captured.get('target_segment_id') is None
+    assert captured.get('requested_count') is None
+    assert captured.get('region') is None
 
 
 @pytest.mark.asyncio

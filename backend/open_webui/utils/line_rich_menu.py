@@ -625,24 +625,8 @@ def _role_menu_items(
         )
         return items
 
-    role_home: list[dict[str, Any]] = []
-    if liff_uri:
-        role_home.append(
-            {
-                'label': (
-                    'AM 客戶工作台'
-                    if product_role == 'am'
-                    else 'BD 獲客工作台'
-                    if product_role == 'bd'
-                    else 'AI 工作台'
-                ),
-                'icon': 'link',
-                'accent': '#06C755',
-                'action': _uri_action('開啟 AI 工作台', liff_uri),
-            }
-        )
     if product_role == 'am':
-        return role_home + [
+        return [
             {
                 'label': '今日聯絡客戶',
                 'icon': 'history',
@@ -656,20 +640,20 @@ def _role_menu_items(
                 'label': '記錄客戶跟進',
                 'icon': 'form',
                 'accent': '#059669',
-                'action': _message_action(
-                    '記錄客戶跟進',
-                    '我要記錄一筆客戶跟進。請依序詢問公司、聯絡人或商機、方式、實際內容、'
-                    '結果、時間與下一步；確認後使用 CRM 跟進 API 寫入。',
+                'action': (
+                    _uri_action('記錄客戶跟進', f'{liff_uri}?task=am-create')
+                    if liff_uri
+                    else _message_action('記錄客戶跟進', '請記錄我接下來提供的客戶跟進內容。')
                 ),
             },
             {
                 'label': '修正跟進紀錄',
                 'icon': 'refresh',
                 'accent': '#7C3AED',
-                'action': _message_action(
-                    '修正跟進紀錄',
-                    '我要修正既有跟進紀錄。請先讀取最新版與 record_version，逐項確認替換內容，'
-                    '再使用 CRM 跟進修改 API。',
+                'action': (
+                    _uri_action('修正跟進紀錄', f'{liff_uri}?task=am-update')
+                    if liff_uri
+                    else _message_action('修正跟進紀錄', '請讀取最近跟進紀錄並讓我指定要修正的項目。')
                 ),
             },
             {
@@ -682,10 +666,14 @@ def _role_menu_items(
                 ),
             },
             {
-                'label': '公司資料',
+                'label': '客戶健康摘要',
                 'icon': 'database',
                 'accent': '#475569',
-                'action': _postback_action('查詢公司資料', 'menu.data.v1', keyboard=True),
+                'action': _message_action(
+                    '客戶健康摘要',
+                    '請依 CRM 的交易、詢價、回購週期與跟進紀錄，自動整理目前最需要注意的客戶；'
+                    '列出原因、資料日期與下一步，不要反問。',
+                ),
             },
             {
                 'label': '使用說明',
@@ -695,15 +683,15 @@ def _role_menu_items(
             },
         ]
     if product_role == 'bd':
-        return role_home + [
+        items = [
             {
                 'label': '執行潛客探索',
                 'icon': 'play',
                 'accent': '#2563EB',
                 'action': _message_action(
                     '執行潛客探索',
-                    '我要執行新的潛客探索。請先列出可用目標客群，詢問地區、淨新增數量與排除條件；'
-                    '我確認後使用 CRM 探索 API 建立背景任務。',
+                    '立即執行新的潛客探索。使用 CRM 啟用客群、歷史覆蓋、預設地區、目標數量與排除規則'
+                    '自動建立背景任務；不要列出客群、不要反問，也不要等待再次確認。',
                 ),
             },
             {
@@ -712,8 +700,8 @@ def _role_menu_items(
                 'accent': '#0891B2',
                 'action': _message_action(
                     '分析產品切入點',
-                    '我要分析一家潛在客戶的產品切入點。請先詢問公司名稱或網站，'
-                    '再依公開證據提出最多 3 個方向並區分事實與假設。',
+                    '從 CRM 待確認名單自動選擇目前分數最高且尚未完整分析的公司，依公開證據提出最多 '
+                    '3 個產品切入方向並區分事實與假設；直接完成，不要反問公司名稱或網站。',
                 ),
             },
             {
@@ -722,8 +710,8 @@ def _role_menu_items(
                 'accent': '#7C3AED',
                 'action': _message_action(
                     '改善搜尋輪廓',
-                    '我要依人工核准的候選公司改善搜尋輪廓。請用公開證據產生建議；'
-                    '確認後用輪廓建議 API 建立待審項目，不要直接套用。',
+                    '依 CRM 中已由人工核准且尚未用於本輪學習的候選公司與公開證據，自動產生搜尋輪廓建議，'
+                    '並用輪廓建議 API 建立待審項目；不要反問，不要直接套用。',
                 ),
             },
             {
@@ -736,18 +724,23 @@ def _role_menu_items(
                 ),
             },
             {
-                'label': '自由提問',
-                'icon': 'chat',
-                'accent': '#475569',
-                'action': _postback_action('自由提問', 'menu.ask.v1', keyboard=True),
-            },
-            {
                 'label': '使用說明',
                 'icon': 'help',
                 'accent': '#EA580C',
                 'action': _postback_action('使用說明', 'menu.help.v1'),
             },
         ]
+        if liff_uri:
+            items.insert(
+                1,
+                {
+                    'label': '自訂本輪探索',
+                    'icon': 'form',
+                    'accent': '#06C755',
+                    'action': _uri_action('自訂本輪探索', f'{liff_uri}?task=bd-discovery'),
+                },
+            )
+        return items
 
     return [
         {
@@ -933,14 +926,15 @@ def _role_menu_image(
         )
 
     rows = 1 if len(items) <= 4 else 2
+    columns = 3 if 5 <= len(items) <= 6 else 4
     grid_top = tab_height
     row_height = (RICH_MENU_HEIGHT - grid_top) // rows
-    cell_width = RICH_MENU_WIDTH // 4
+    cell_width = RICH_MENU_WIDTH // columns
     label_font = _font(78, 'Bold')
     for index, item in enumerate(items):
-        row, column = divmod(index, 4)
+        row, column = divmod(index, columns)
         x0, y0 = column * cell_width, grid_top + row * row_height
-        x1 = RICH_MENU_WIDTH if column == 3 else x0 + cell_width
+        x1 = RICH_MENU_WIDTH if column == columns - 1 else x0 + cell_width
         y1 = RICH_MENU_HEIGHT if row == rows - 1 else y0 + row_height
         draw.rectangle((x0, y0, x1, y1), fill='#FFFFFF', outline='#E2E8F0', width=3)
         center_x = (x0 + x1) // 2
@@ -972,6 +966,15 @@ def build_line_role_menus(
         raise ValueError('Unsupported LINE Rich Menu audience.')
     portal_base_url = str(portal_base_url or '').strip().rstrip('/') or None
     tabs = _ROLE_TABS[audience]
+    role_home_label = {
+        'am': 'AM 客戶經營',
+        'bd': 'BD 新客開發',
+    }.get(product_role)
+    if role_home_label:
+        tabs = [
+            (tab_name, role_home_label if tab_name == 'home' else label)
+            for tab_name, label in tabs
+        ]
     artifacts: list[LineRoleMenuArtifact] = []
     for tab, _tab_label in tabs:
         alias_id = alias_ids.get(tab)
@@ -1035,12 +1038,13 @@ def build_line_role_menus(
                     }
                 )
             rows = 1 if len(items) <= 4 else 2
+            columns = 3 if 5 <= len(items) <= 6 else 4
             row_height = (RICH_MENU_HEIGHT - 260) // rows
-            cell_width = RICH_MENU_WIDTH // 4
+            cell_width = RICH_MENU_WIDTH // columns
             for index, item in enumerate(items):
-                row, column = divmod(index, 4)
+                row, column = divmod(index, columns)
                 x0, y0 = column * cell_width, 260 + row * row_height
-                x1 = RICH_MENU_WIDTH if column == 3 else x0 + cell_width
+                x1 = RICH_MENU_WIDTH if column == columns - 1 else x0 + cell_width
                 y1 = RICH_MENU_HEIGHT if row == rows - 1 else y0 + row_height
                 areas.append(
                     {
@@ -1048,11 +1052,15 @@ def build_line_role_menus(
                         'action': item['action'],
                     }
                 )
+        chat_bar_text = {
+            'am': 'AM 客戶經營',
+            'bd': 'BD 新客開發',
+        }.get(product_role, '開啟 AI 工作台')
         menu = {
             'size': {'width': RICH_MENU_WIDTH, 'height': RICH_MENU_HEIGHT},
             'selected': True,
             'name': f'Interact AI {audience} {tab} - {_clean_label(channel_name, "LINE")}'[:300],
-            'chatBarText': '綁定企業帳號' if audience == 'guest' else '開啟 AI 工作台',
+            'chatBarText': '綁定企業帳號' if audience == 'guest' else chat_bar_text,
             'areas': areas,
         }
         digest = hashlib.sha256()

@@ -34,10 +34,15 @@ from open_webui.models.interact_channels import (
     InteractLineIdentityBindingModel,
 )
 from open_webui.models.interact_data_connectors import InteractDataConnectors
+from open_webui.models.interact_semantic import InteractSemantic
 from open_webui.models.interact_sso import InteractSsoTickets
 from open_webui.models.models import Models
 from open_webui.models.users import Users
 from open_webui.storage.provider import Storage
+from open_webui.tools.interact_crm_actions import (
+    interact_crm_bd_candidates_list,
+    interact_crm_bd_discovery_start,
+)
 from open_webui.tools.interact_database import scan_data_connector_schema
 from open_webui.utils.assistant_content import output_text, response_text
 from open_webui.utils.auth import get_password_hash, get_verified_user
@@ -119,6 +124,7 @@ _line_rich_menu_tasks: set[asyncio.Task] = set()
 _line_rich_menu_tasks_by_channel: dict[str, asyncio.Task] = {}
 _line_rich_menu_resync: dict[str, bool] = {}
 _line_rich_menu_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+_line_rich_menu_sync_semaphore = asyncio.Semaphore(1)
 
 
 def _channel_worker_setting(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -173,6 +179,10 @@ async def _complete_line_workflow_resume_job(
         company_member_id=str(identity.get('companyMemberId') or '').strip() or None,
         member_email=member_email,
         channel_id=channel.id,
+        identity_source=str(identity.get('identitySource') or 'company_portal'),
+        product_key=str(identity.get('productKey') or '').strip() or None,
+        product_instance_id=str(identity.get('productInstanceId') or '').strip() or None,
+        product_user_id=str(identity.get('productUserId') or '').strip() or None,
     )
     verified = authorization.get('identity')
     if not isinstance(verified, dict):
@@ -184,7 +194,9 @@ async def _complete_line_workflow_resume_job(
         user_id=user.id if verified.get('memberRole') == 'owner' else None,
         role=user.role if verified.get('memberRole') == 'owner' else 'user',
         company_user_id=str(verified.get('companyUserId') or ''),
-        company_member_id=str(verified.get('companyMemberId') or '').strip() or None,
+        company_member_id=(
+            str(verified.get('accessSubjectId') or verified.get('companyMemberId') or '').strip() or None
+        ),
         company_member_role=str(verified.get('memberRole') or '').strip().lower(),
         group_ids={str(item) for item in verified.get('groupIds') or [] if str(item)},
         channel_id=channel.id,
@@ -482,8 +494,13 @@ CRM_AM_ACTION_INSTRUCTION = (
     'APIs are interact_crm_follow_up_create and interact_crm_follow_up_update. When the user explicitly '
     'asks to record a confirmed customer interaction, use interact_crm_follow_up_create. To edit an '
     'existing follow-up, first read crm_app.ai_follow_ups and its record_version, confirm every replacement '
-    'fact, then use interact_crm_follow_up_update. Never claim a write succeeded unless the API returns '
-    'ok=true. Never use interact_crm_bd_discovery_start or '
+    'fact, then use interact_crm_follow_up_update. Resolve company, contact, opportunity, current time, '
+    'and existing follow-up facts from authorized CRM data and conversation context before asking the user. '
+    'Never ask for facts already stored in CRM, never return a checklist of questions, and never send a '
+    'generic workbench link as a substitute for completing an action. Ask at most one short blocking '
+    'question only when multiple records match or a safety-critical fact cannot be inferred. Never claim a '
+    'write succeeded unless the API returns ok=true. Never use interact_crm_bd_candidates_list. '
+    'Never use interact_crm_bd_discovery_start or '
     'interact_crm_bd_profile_suggestion_create, and never write CRM tables directly.'
 )
 
@@ -491,12 +508,21 @@ CRM_BD_ACTION_INSTRUCTION = (
     'You are the BD Agent. Database and semantic tools are strictly read-only. You may search public '
     'company websites, directories, exhibitions, registries, and public business contact pages, including '
     'verifiable corporate phone numbers and email addresses; never guess private personal contact data. '
-    'Your only CRM write APIs are interact_crm_bd_discovery_start and '
-    'interact_crm_bd_profile_suggestion_create. To create actual new public-web candidate work, use '
-    'interact_crm_bd_discovery_start after the user confirms an active target segment and run scope. To '
+    'Use interact_crm_bd_candidates_list whenever the user asks for pending or reviewed prospect '
+    'candidates; never claim that the list is unavailable before calling it. Your only CRM write APIs '
+    'are interact_crm_bd_discovery_start and '
+    'interact_crm_bd_profile_suggestion_create. When the user asks to start or execute prospect discovery, '
+    'call interact_crm_bd_discovery_start immediately with no arguments unless the user explicitly provided '
+    'an override. CRM automatically selects the next eligible active segment from run history, uses safe '
+    'scope defaults, and applies target exclusions, CRM/candidate deduplication, do-not-contact rules, and '
+    'seen-source history. Never list segments or ask for region, count, rounds, or exclusions before the '
+    'automatic call. To '
     'improve a future search profile, use interact_crm_bd_profile_suggestion_create only with '
     'human-approved candidate IDs and evidence URLs. It creates a pending suggestion and never applies '
-    'it; tell the user a manager must review it. Never use interact_crm_follow_up_create or '
+    'it; tell the user a manager must review it. Resolve target companies and public URLs from the pending '
+    'candidate list before asking the user. Never return a checklist of questions and never send a generic '
+    'workbench link as a substitute for completing an action. Ask at most one short blocking question only '
+    'when no authorized system record can resolve the target. Never use interact_crm_follow_up_create or '
     'interact_crm_follow_up_update, and never write CRM tables directly.'
 )
 
@@ -733,6 +759,11 @@ class ChannelChatRequest(BaseModel):
     companyMemberEmail: str | None = Field(default=None, max_length=320)
     companyMemberRole: str | None = Field(default=None, max_length=40)
     companyGroupIds: list[str] = Field(default_factory=list, max_length=200)
+    identitySource: Literal['company_portal', 'product'] = 'company_portal'
+    productKey: str | None = Field(default=None, max_length=60)
+    productInstanceId: str | None = Field(default=None, max_length=160)
+    productUserId: str | None = Field(default=None, max_length=120)
+    productTeamCodes: list[str] = Field(default_factory=list, max_length=20)
 
 
 class ProvisionAccountRequest(BaseModel):
@@ -798,6 +829,23 @@ class LineIdentityPrepareRequest(BaseModel):
     memberRole: Literal['owner', 'admin', 'member']
     memberStatus: Literal['active'] = 'active'
     groupIds: list[str] = Field(default_factory=list, max_length=200)
+    identitySource: Literal['company_portal', 'product'] = 'company_portal'
+    productKey: str | None = Field(default=None, max_length=60)
+    productInstanceId: str | None = Field(default=None, max_length=160)
+    productUserId: str | None = Field(default=None, max_length=120)
+    productTeamCodes: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode='after')
+    def validate_identity_source(self):
+        if self.identitySource == 'product' and not (
+            self.productKey and self.productInstanceId and self.productUserId
+        ):
+            raise ValueError('Product identities require product key, instance, and user id.')
+        if self.identitySource == 'company_portal' and any(
+            (self.productKey, self.productInstanceId, self.productUserId, self.productTeamCodes)
+        ):
+            raise ValueError('Company portal identities cannot include product identity fields.')
+        return self
 
 
 class LineIdentityUnlinkRequest(BaseModel):
@@ -855,6 +903,7 @@ class ChannelProductBindingRequest(BaseModel):
     instanceId: str = Field(..., min_length=1, max_length=160)
     label: str = Field(..., min_length=1, max_length=50)
     description: str = Field(default='', max_length=200)
+    identityLinkUrl: str | None = Field(default=None, max_length=700)
     enabled: bool = True
     allowedRoles: list[Literal['owner', 'admin', 'member']] = Field(
         default_factory=lambda: ['owner', 'admin', 'member'],
@@ -920,6 +969,8 @@ class SystemLineNotificationRequest(BaseModel):
     companyEmail: str = Field(..., min_length=3, max_length=320)
     companyUserId: str = Field(..., min_length=1, max_length=200)
     productRole: Literal['am'] = 'am'
+    productKey: str = Field(..., min_length=1, max_length=60)
+    productInstanceId: str = Field(..., min_length=1, max_length=160)
     message: str = Field(..., min_length=1, max_length=5000)
     idempotencyKey: str = Field(..., min_length=8, max_length=200)
     allowedRoles: list[Literal['owner', 'admin', 'member']] = Field(
@@ -1882,6 +1933,13 @@ async def _run_channel_message(
                 companyMemberEmail=str((company_identity or {}).get('memberEmail') or '') or None,
                 companyMemberRole=str((company_identity or {}).get('memberRole') or '') or None,
                 companyGroupIds=[str(item) for item in (company_identity or {}).get('groupIds') or []],
+                identitySource=str((company_identity or {}).get('identitySource') or 'company_portal'),
+                productKey=str((company_identity or {}).get('productKey') or '') or None,
+                productInstanceId=str((company_identity or {}).get('productInstanceId') or '') or None,
+                productUserId=str((company_identity or {}).get('productUserId') or '') or None,
+                productTeamCodes=[
+                    str(item) for item in (company_identity or {}).get('productTeamCodes') or []
+                ],
             ),
             x_interact_service_token=_service_token(),
         )
@@ -1982,6 +2040,160 @@ async def _complete_claimed_response(
     return str(result.get('content') or '')
 
 
+def _bd_direct_command(message: str) -> str | None:
+    normalized = re.sub(r'\s+', '', str(message or '')).lower()
+    discovery_phrases = (
+        '執行潛客探索',
+        '開始潛客探索',
+        '執行新的潛客探索',
+        '開始新的潛客探索',
+        '探索新潛客',
+        '拓展新候選',
+        '啟動自動獲客',
+    )
+    if any(phrase in normalized for phrase in discovery_phrases):
+        return 'discovery'
+    candidate_phrases = (
+        '待確認名單',
+        '待人工確認的潛在客戶',
+        '待審核潛客',
+        '待確認潛客',
+    )
+    if any(phrase in normalized for phrase in candidate_phrases):
+        return 'candidates'
+    return None
+
+
+def _crm_channel_tool_context(
+    channel: InteractChannelModel,
+    company_identity: dict[str, Any],
+    selected_model_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    metadata = {
+        'source': 'channel',
+        'channelId': channel.id,
+        'modelId': selected_model_id,
+        'companyUserId': company_identity.get('companyUserId'),
+        'companyMemberId': company_identity.get('companyMemberId'),
+        'companyMemberEmail': company_identity.get('memberEmail'),
+        'companyMemberRole': company_identity.get('memberRole'),
+        'identitySource': company_identity.get('identitySource'),
+        'productKey': company_identity.get('productKey'),
+        'productInstanceId': company_identity.get('productInstanceId'),
+        'productUserId': company_identity.get('productUserId'),
+        'productTeamCodes': company_identity.get('productTeamCodes') or [],
+    }
+    return {'companyUserId': company_identity.get('companyUserId')}, metadata
+
+
+def _crm_action_result(raw: str) -> dict[str, Any]:
+    try:
+        result = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {'ok': False, 'error': 'CRM 回傳格式不正確。'}
+    return result if isinstance(result, dict) else {'ok': False, 'error': 'CRM 回傳格式不正確。'}
+
+
+def _format_bd_candidate_list(result: dict[str, Any]) -> str:
+    candidates = result.get('candidates') if isinstance(result.get('candidates'), list) else []
+    if not candidates:
+        return '目前沒有待人工確認的潛在客戶。系統沒有產生或虛構名單。'
+    lines = [f'待人工確認潛客：{len(candidates)} 家（依分數排序）']
+    for index, candidate in enumerate(candidates[:10], start=1):
+        if not isinstance(candidate, dict):
+            continue
+        contact = candidate.get('contact') if isinstance(candidate.get('contact'), dict) else {}
+        evidence = candidate.get('evidence') if isinstance(candidate.get('evidence'), list) else []
+        first_evidence = next((item for item in evidence if isinstance(item, dict) and item.get('url')), {})
+        contact_value = contact.get('email') or contact.get('phone')
+        contact_text = f'已查證：{contact_value}' if contact_value else '尚未查證到公開聯絡方式'
+        source = first_evidence.get('url') or candidate.get('website') or candidate.get('sourceReference') or '尚無可點擊來源'
+        uncertainty = candidate.get('uncertainty') or '尚未標示'
+        segment = candidate.get('targetSegmentName') or '未分類'
+        lines.extend([
+            '',
+            f'{index}. {candidate.get("companyName") or "未命名公司"}｜{candidate.get("score") or 0} 分',
+            f'客群：{segment}',
+            f'聯絡：{contact_text}',
+            f'主要不確定性：{uncertainty}',
+            f'公開來源：{source}',
+        ])
+    return '\n'.join(lines)
+
+
+async def _direct_crm_channel_command(
+    request: Request,
+    channel: InteractChannelModel,
+    message: str,
+    company_identity: dict[str, Any] | None,
+    selected_model_id: str | None,
+) -> dict[str, Any] | None:
+    if str(getattr(channel, 'product_role', '') or '').lower() != 'bd':
+        return None
+    command = _bd_direct_command(message)
+    if not command:
+        return None
+    model_id = str(selected_model_id or channel.model_id or '').strip()
+    identity = company_identity if isinstance(company_identity, dict) else {}
+    if not model_id or not identity.get('companyUserId') or not identity.get('productUserId'):
+        return {
+            'ok': False,
+            'content': '無法確認 CRM 員工與固定 Agent 身分，這次沒有建立或讀取任何資料。',
+            'outputs': [],
+            'usage': {},
+            'reason': 'CRM-IDENTITY-NOT-READY',
+        }
+    user, metadata = _crm_channel_tool_context(channel, identity, model_id)
+    if command == 'discovery':
+        raw = await interact_crm_bd_discovery_start(
+            __request__=request,
+            __user__=user,
+            __metadata__=metadata,
+        )
+        result = _crm_action_result(raw)
+        if not result.get('ok'):
+            return {
+                'ok': False,
+                'content': str(result.get('error') or 'CRM 無法建立潛客探索任務。'),
+                'outputs': [],
+                'usage': {},
+                'reason': 'CRM-BD-DISCOVERY-REJECTED',
+            }
+        content = (
+            f'潛客探索任務 #{result.get("runId")} 已建立。\n\n'
+            f'自動選擇客群：{result.get("targetSegmentName") or result.get("targetSegmentId")}\n'
+            f'探索範圍：{result.get("region") or "台灣"}\n'
+            f'目標：淨新增 {result.get("requestedCount") or 10} 家，最多 {result.get("maxRounds") or 2} 輪\n\n'
+            '系統已套用 CRM 既有公司、候選池、禁止聯絡名單、已看過來源與客群排除規則。'
+            '完成後只會進入待確認名單，不會自動寄信。'
+        )
+        return {'ok': True, 'content': content, 'outputs': [], 'usage': {}, 'directCrmAction': True}
+
+    raw = await interact_crm_bd_candidates_list(
+        status='pending',
+        limit=10,
+        __request__=request,
+        __user__=user,
+        __metadata__=metadata,
+    )
+    result = _crm_action_result(raw)
+    if not result.get('ok'):
+        return {
+            'ok': False,
+            'content': str(result.get('error') or 'CRM 無法讀取待確認名單。'),
+            'outputs': [],
+            'usage': {},
+            'reason': 'CRM-BD-CANDIDATES-REJECTED',
+        }
+    return {
+        'ok': True,
+        'content': _format_bd_candidate_list(result),
+        'outputs': [],
+        'usage': {},
+        'directCrmAction': True,
+    }
+
+
 async def _complete_claimed_result(
     request: Request,
     channel: InteractChannelModel,
@@ -1998,6 +2210,21 @@ async def _complete_claimed_result(
     company_identity: dict[str, Any] | None = None,
     selected_model_id: str | None = None,
 ) -> dict[str, Any]:
+    direct_result = await _direct_crm_channel_command(
+        request,
+        channel,
+        message,
+        company_identity,
+        selected_model_id,
+    )
+    if direct_result is not None:
+        await InteractChannels.set_response(
+            claim.event_id,
+            str(direct_result.get('content') or ''),
+            0,
+            direct_result.get('reason'),
+        )
+        return direct_result
     reserved_tokens = _estimated_reservation_tokens(message) if channel.reply_mode == 'ai' else 0
     result = await _run_channel_message(
         request,
@@ -2098,33 +2325,44 @@ async def _line_api_request(
     data: bytes | None = None,
     content_type: str | None = None,
     accepted_statuses: set[int] | None = None,
+    max_attempts: int = 1,
 ) -> dict[str, Any]:
     if not channel.channel_access_token:
         raise RuntimeError('LINE channel access token is missing.')
     headers = {'Authorization': f'Bearer {channel.channel_access_token}'}
     if content_type:
         headers['Content-Type'] = content_type
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.request(
-            method,
-            url,
-            json=json_payload,
-            data=data,
-            headers=headers,
-        ) as response:
-            body = await response.text()
-            if (response.status < 200 or response.status >= 300) and response.status not in (
-                accepted_statuses or set()
-            ):
-                raise RuntimeError(f'LINE Rich Menu API failed ({response.status}): {body[:500]}')
-            if not body:
-                return {}
-            try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
-                return {'body': body[:500]}
-            return parsed if isinstance(parsed, dict) else {}
+    attempts = max(1, min(3, int(max_attempts)))
+    for attempt in range(attempts):
+        try:
+            timeout = aiohttp.ClientTimeout(total=45)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.request(
+                    method,
+                    url,
+                    json=json_payload,
+                    data=data,
+                    headers=headers,
+                ) as response:
+                    body = await response.text()
+                    if (response.status < 200 or response.status >= 300) and response.status not in (
+                        accepted_statuses or set()
+                    ):
+                        raise RuntimeError(f'LINE Rich Menu API failed ({response.status}): {body[:500]}')
+                    if not body:
+                        return {}
+                    try:
+                        parsed = json.loads(body)
+                    except json.JSONDecodeError:
+                        return {'body': body[:500]}
+                    return parsed if isinstance(parsed, dict) else {}
+        except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as error:
+            if attempt + 1 < attempts:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            operation = f'{method.upper()} {urlparse(url).path}'
+            raise RuntimeError(f'LINE Rich Menu API request timed out during {operation}.') from error
+    raise RuntimeError('LINE Rich Menu API request failed unexpectedly.')
 
 
 async def _download_line_message_content(
@@ -2256,6 +2494,83 @@ def _line_identity_audience(binding: InteractLineIdentityBindingModel | None) ->
     return 'admin' if binding.member_role in {'owner', 'admin'} else 'member'
 
 
+def _line_product_identity_contract(channel: InteractChannelModel) -> dict[str, str] | None:
+    if getattr(channel, 'channel_mode', 'general') != 'single_product':
+        return None
+    for product in getattr(channel, 'product_bindings', None) or []:
+        if not isinstance(product, dict) or not product.get('enabled'):
+            continue
+        product_key = str(product.get('productKey') or '').strip()
+        instance_id = str(product.get('instanceId') or '').strip()
+        if product_key and instance_id:
+            identity_link_url = str(product.get('identityLinkUrl') or '').strip()
+            if not identity_link_url and product_key == 'crm':
+                for action in product.get('actions') or []:
+                    if not isinstance(action, dict):
+                        continue
+                    parsed_href = urlparse(str(action.get('href') or '').strip())
+                    if parsed_href.scheme in {'https', 'http'} and parsed_href.netloc:
+                        identity_link_url = f'{parsed_href.scheme}://{parsed_href.netloc}/line-link'
+                        break
+            return {
+                'productKey': product_key,
+                'instanceId': instance_id,
+                'identityLinkUrl': identity_link_url,
+                'label': str(product.get('label') or '').strip(),
+            }
+    return None
+
+
+def _line_binding_matches_channel_product(
+    channel: InteractChannelModel,
+    binding: InteractLineIdentityBindingModel,
+) -> bool:
+    contract = _line_product_identity_contract(channel)
+    if not contract:
+        return (
+            getattr(channel, 'channel_mode', 'general') != 'single_product'
+            or getattr(binding, 'identity_source', 'company_portal') == 'company_portal'
+        )
+    return (
+        binding.identity_source == 'product'
+        and binding.product_key == contract['productKey']
+        and binding.product_instance_id == contract['instanceId']
+        and bool(binding.product_user_id)
+    )
+
+
+def _line_binding_authorization(
+    binding: InteractLineIdentityBindingModel,
+    channel_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        'company_user_id': binding.company_user_id,
+        'company_member_id': binding.company_member_id,
+        'member_email': binding.member_email,
+        'channel_id': channel_id or getattr(binding, 'channel_id', ''),
+        'identity_source': getattr(binding, 'identity_source', 'company_portal'),
+        'product_key': getattr(binding, 'product_key', None),
+        'product_instance_id': getattr(binding, 'product_instance_id', None),
+        'product_user_id': getattr(binding, 'product_user_id', None),
+    }
+
+
+def _line_company_identity(binding: InteractLineIdentityBindingModel) -> dict[str, Any]:
+    return {
+        'companyUserId': binding.company_user_id,
+        'companyMemberId': binding.company_member_id,
+        'accessSubjectId': getattr(binding, 'access_subject_id', binding.company_member_id),
+        'memberEmail': binding.member_email,
+        'memberRole': binding.member_role,
+        'groupIds': binding.group_ids,
+        'identitySource': getattr(binding, 'identity_source', 'company_portal'),
+        'productKey': getattr(binding, 'product_key', None),
+        'productInstanceId': getattr(binding, 'product_instance_id', None),
+        'productUserId': getattr(binding, 'product_user_id', None),
+        'productTeamCodes': getattr(binding, 'product_team_codes', []),
+    }
+
+
 async def _line_assign_role_menu(
     channel: InteractChannelModel,
     external_user_id: str,
@@ -2290,7 +2605,7 @@ async def _line_refresh_identity(
         external_user_id=external_user_id,
         reveal_external_user_id=True,
     )
-    if not binding:
+    if not binding or not _line_binding_matches_channel_product(channel, binding):
         return None
     if not force and binding.role_verified_at >= int(time.time()) - 300:
         return binding
@@ -2299,10 +2614,7 @@ async def _line_refresh_identity(
     previous_audience = _line_identity_audience(binding)
     try:
         result = await InteractBillingClient().authorize_line_identity(
-            company_user_id=binding.company_user_id,
-            company_member_id=binding.company_member_id,
-            member_email=binding.member_email,
-            channel_id=channel.id,
+            **_line_binding_authorization(binding, channel.id)
         )
         identity = result.get('identity') if isinstance(result, dict) else None
         if not isinstance(identity, dict):
@@ -2314,6 +2626,11 @@ async def _line_refresh_identity(
             member_role=str(identity.get('memberRole') or 'member'),
             member_status=str(identity.get('memberStatus') or 'disabled'),
             group_ids=[str(item) for item in identity.get('groupIds') or []],
+            identity_source=str(identity.get('identitySource') or binding.identity_source),
+            product_key=identity.get('productKey'),
+            product_instance_id=identity.get('productInstanceId'),
+            product_user_id=identity.get('productUserId'),
+            product_team_codes=[str(item) for item in identity.get('productTeamCodes') or []],
         )
     except HTTPException as error:
         if error.status_code == status.HTTP_403_FORBIDDEN:
@@ -2367,7 +2684,17 @@ async def _issue_line_account_link(
     reply_token: str | None,
 ) -> None:
     portal_base_url = _line_portal_base_url()
-    if not portal_base_url:
+    product_contract = _line_product_identity_contract(channel)
+    identity_link_url = product_contract.get('identityLinkUrl') if product_contract else None
+    product_label = product_contract.get('label') if product_contract else None
+    parsed_candidate = urlparse(identity_link_url or '')
+    if identity_link_url and (
+        parsed_candidate.scheme not in {'https', 'http'} or not parsed_candidate.netloc
+    ):
+        identity_link_url = None
+    if getattr(channel, 'channel_mode', 'general') == 'single_product' and not identity_link_url:
+        raise RuntimeError('This product Channel has not configured an employee account-link URL.')
+    if not identity_link_url and not portal_base_url:
         raise RuntimeError('Main website URL is not configured for LINE account linking.')
     token_result = await _line_api_request(
         channel,
@@ -2391,14 +2718,24 @@ async def _issue_line_account_link(
             'channelId': channel.id,
         }
     )
-    url = f'{portal_base_url}/company-portal/line-link?{query}'
+    url = (
+        f'{identity_link_url}{"&" if "?" in identity_link_url else "?"}{query}'
+        if identity_link_url
+        else f'{portal_base_url}/company-portal/line-link?{query}'
+    )
+    binding_title = '綁定 CRM 員工帳號' if identity_link_url else '綁定企業帳號'
+    binding_description = (
+        f'登入 {product_label or "企業系統"} 員工帳號後，LINE 會依您的職責顯示可用功能；AI 用量仍由企業統一計費。'
+        if identity_link_url
+        else '登入主站台並確認後，LINE 會依您的企業角色顯示可用功能。'
+    )
     await _send_line_messages(
         channel,
         reply_token,
         [
             {
                 'type': 'flex',
-                'altText': '綁定企業帳號以使用公司工作流',
+                'altText': f'{binding_title}以使用公司功能',
                 'contents': {
                     'type': 'bubble',
                     'size': 'kilo',
@@ -2407,10 +2744,10 @@ async def _issue_line_account_link(
                         'layout': 'vertical',
                         'spacing': 'md',
                         'contents': [
-                            {'type': 'text', 'text': '綁定企業帳號', 'weight': 'bold', 'size': 'xl'},
+                            {'type': 'text', 'text': binding_title, 'weight': 'bold', 'size': 'xl'},
                             {
                                 'type': 'text',
-                                'text': '登入主站台並確認後，LINE 會依您的企業角色顯示可用功能。',
+                                'text': binding_description,
                                 'wrap': True,
                                 'size': 'sm',
                                 'color': '#475569',
@@ -2490,6 +2827,11 @@ async def _clear_line_rich_menu(
 
 
 async def sync_line_rich_menu(channel_id: str, *, force: bool = False) -> dict[str, Any]:
+    async with _line_rich_menu_sync_semaphore:
+        return await _sync_line_rich_menu(channel_id, force=force)
+
+
+async def _sync_line_rich_menu(channel_id: str, *, force: bool = False) -> dict[str, Any]:
     lock = _line_rich_menu_locks.setdefault(channel_id, asyncio.Lock())
     async with lock:
         channel = await InteractChannels.get_by_id(channel_id)
@@ -2684,6 +3026,7 @@ async def sync_line_rich_menu(channel_id: str, *, force: bool = False) -> dict[s
                     f'https://api-data.line.me/v2/bot/richmenu/{quote(rich_menu_id, safe="")}/content',
                     data=artifact.image,
                     content_type='image/png',
+                    max_attempts=3,
                 )
                 created_ids[key] = rich_menu_id
                 selected_ids[key] = rich_menu_id
@@ -4221,6 +4564,10 @@ async def channel_chat(  # noqa: C901
             company_member_id=payload.companyMemberId,
             member_email=payload.companyMemberEmail,
             channel_id=channel_id,
+            identity_source=payload.identitySource,
+            product_key=payload.productKey,
+            product_instance_id=payload.productInstanceId,
+            product_user_id=payload.productUserId,
         )
         verified_identity = authorization_result.get('identity')
         if not isinstance(verified_identity, dict):
@@ -4229,7 +4576,9 @@ async def channel_chat(  # noqa: C901
             user_id=user.id if verified_identity.get('memberRole') == 'owner' else None,
             role=user.role if verified_identity.get('memberRole') == 'owner' else 'user',
             company_user_id=str(verified_identity.get('companyUserId') or ''),
-            company_member_id=verified_identity.get('companyMemberId'),
+            company_member_id=(
+                verified_identity.get('accessSubjectId') or verified_identity.get('companyMemberId')
+            ),
             company_member_role=str(verified_identity.get('memberRole') or ''),
             group_ids={str(item) for item in verified_identity.get('groupIds') or []},
             channel_id=channel_id,
@@ -4375,6 +4724,12 @@ async def channel_chat(  # noqa: C901
                     'companyMemberEmail': verified_identity.get('memberEmail'),
                     'companyMemberRole': verified_identity.get('memberRole'),
                     'groupIds': verified_identity.get('groupIds') or [],
+                    'identitySubject': verified_identity.get('identitySource') or 'company_portal',
+                    'accessSubjectId': verified_identity.get('accessSubjectId'),
+                    'productKey': verified_identity.get('productKey'),
+                    'productInstanceId': verified_identity.get('productInstanceId'),
+                    'productUserId': verified_identity.get('productUserId'),
+                    'productTeamCodes': verified_identity.get('productTeamCodes') or [],
                 }
                 if verified_identity
                 else {}
@@ -4648,6 +5003,27 @@ async def sync_channel(
             status_code=409,
             detail='The platform channel identifier is already bound.',
         )
+
+    if channel.company_user_id and channel.model_id and channel.product_role in {'am', 'bd'}:
+        connector_count, dataset_count = await asyncio.gather(
+            InteractDataConnectors.grant_channel_for_model(
+                channel.company_user_id,
+                channel.model_id,
+                channel.id,
+            ),
+            InteractSemantic.grant_channel_for_model(
+                channel.company_user_id,
+                channel.model_id,
+                channel.id,
+            ),
+        )
+        if connector_count or dataset_count:
+            log.info(
+                'Synchronized product channel %s with %s connector and %s dataset grants',
+                channel.id,
+                connector_count,
+                dataset_count,
+            )
 
     existing_rich_menu = await InteractChannels.get_rich_menu(channel.id)
     rich_menu_liff_uri = (
@@ -5100,6 +5476,11 @@ async def prepare_line_identity_link_nonce(
         member_role=payload.memberRole,
         member_status=payload.memberStatus,
         group_ids=payload.groupIds,
+        identity_source=payload.identitySource,
+        product_key=payload.productKey,
+        product_instance_id=payload.productInstanceId,
+        product_user_id=payload.productUserId,
+        product_team_codes=payload.productTeamCodes,
     )
     if not prepared:
         raise HTTPException(status_code=410, detail='This LINE account link has expired or was already used.')
@@ -5135,6 +5516,11 @@ async def list_line_identities(
                 'id': binding.id,
                 'channelId': binding.channel_id,
                 'companyMemberId': binding.company_member_id,
+                'identitySource': binding.identity_source,
+                'productKey': binding.product_key,
+                'productInstanceId': binding.product_instance_id,
+                'productUserId': binding.product_user_id,
+                'productTeamCodes': binding.product_team_codes,
                 'memberEmail': binding.member_email,
                 'memberRole': binding.member_role,
                 'memberStatus': binding.member_status,
@@ -5166,6 +5552,15 @@ async def send_system_line_notification(
         raise HTTPException(status_code=403, detail='This notification is not allowed for the selected Channel role.')
     if not channel.enabled:
         raise HTTPException(status_code=409, detail='The selected LINE Channel is disabled.')
+    product_matches = any(
+        isinstance(binding, dict)
+        and binding.get('enabled')
+        and binding.get('productKey') == payload.productKey
+        and binding.get('instanceId') == payload.productInstanceId
+        for binding in channel.product_bindings or []
+    )
+    if not product_matches:
+        raise HTTPException(status_code=403, detail='This notification does not match the Channel product instance.')
     bindings = await InteractChannels.list_line_identity_bindings(
         channel_id=channel_id,
         company_user_id=payload.companyUserId,
@@ -5175,6 +5570,13 @@ async def send_system_line_notification(
         binding for binding in bindings
         if binding.member_status == 'active'
         and binding.member_role in payload.allowedRoles
+        and binding.identity_source == 'product'
+        and binding.product_key == payload.productKey
+        and binding.product_instance_id == payload.productInstanceId
+        and (
+            binding.member_role in {'owner', 'admin'}
+            or payload.productRole in binding.product_team_codes
+        )
         and binding.external_user_id
     ]
     sent = 0
@@ -5512,14 +5914,22 @@ async def platform_webhook(  # noqa: C901
                         if source.get('type') != 'user' or not source.get('userId'):
                             response = '請在與官方帳號的一對一聊天室中進行帳號綁定。'
                             await _send_line_reply(channel, event.get('replyToken'), response)
-                        elif identity_binding and identity_binding.member_status == 'active':
+                        elif (
+                            identity_binding
+                            and identity_binding.member_status == 'active'
+                            and not _line_product_identity_contract(channel)
+                        ):
                             response = (
                                 f'目前已綁定 {identity_binding.member_email}。\n'
                                 '若要更換帳號，請先到主站台「AI 通訊渠道」解除綁定。'
                             )
                             await _send_line_reply(channel, event.get('replyToken'), response)
                         else:
-                            response = '已發送安全綁定連結。'
+                            response = (
+                                '已發送 CRM 員工安全綁定連結。'
+                                if _line_product_identity_contract(channel)
+                                else '已發送安全綁定連結。'
+                            )
                             await _issue_line_account_link(
                                 channel,
                                 str(source['userId']),
@@ -5535,10 +5945,16 @@ async def platform_webhook(  # noqa: C901
                             external_user_id,
                             force=True,
                         )
+                        identity_label = (
+                            'CRM 員工帳號'
+                            if _line_product_identity_contract(channel)
+                            else '企業帳號'
+                        )
                         response = (
-                            f'已綁定帳號：{refreshed.member_email}\n企業角色：{refreshed.member_role}\n權限狀態：可使用'
+                            f'已綁定{identity_label}：{refreshed.member_email}\n'
+                            f'角色：{refreshed.member_role}\n權限狀態：可使用'
                             if refreshed and refreshed.member_status == 'active'
-                            else '目前尚未完成企業帳號綁定，請點選「綁定帳號」。'
+                            else f'目前尚未完成{identity_label}綁定，請點選「綁定帳號」。'
                         )
                         await InteractChannels.set_response(claim.event_id, response, 0, None)
                         await _send_line_reply(channel, event.get('replyToken'), response)
@@ -5549,8 +5965,8 @@ async def platform_webhook(  # noqa: C901
                         not identity_binding or identity_binding.member_status != 'active'
                     ):
                         response = (
-                            '無法確認您的企業身分，這次動作沒有執行。\n'
-                            '請先點選「綁定帳號」；若已綁定，請稍後重試或到主站台檢查帳號狀態。'
+                            '無法確認您的員工或企業身分，這次動作沒有執行。\n'
+                            '請先點選「綁定帳號」；若已綁定，請重新綁定或聯繫管理員確認權限。'
                         )
                         await InteractChannels.set_response(
                             claim.event_id,
@@ -5585,13 +6001,7 @@ async def platform_webhook(  # noqa: C901
                                 'platformEventId': platform_event_id,
                                 'recipientId': line_recipient_id,
                                 'workflowResume': workflow_resume,
-                                'companyIdentity': {
-                                    'companyUserId': identity_binding.company_user_id,
-                                    'companyMemberId': identity_binding.company_member_id,
-                                    'memberEmail': identity_binding.member_email,
-                                    'memberRole': identity_binding.member_role,
-                                    'groupIds': identity_binding.group_ids,
-                                },
+                                'companyIdentity': _line_company_identity(identity_binding),
                             },
                         )
                         wake_channel_job_workers()
@@ -5921,13 +6331,7 @@ async def platform_webhook(  # noqa: C901
                                 'modelId': selected_model_id,
                                 **(
                                     {
-                                        'companyIdentity': {
-                                            'companyUserId': identity_binding.company_user_id,
-                                            'companyMemberId': identity_binding.company_member_id,
-                                            'memberEmail': identity_binding.member_email,
-                                            'memberRole': identity_binding.member_role,
-                                            'groupIds': identity_binding.group_ids,
-                                        }
+                                        'companyIdentity': _line_company_identity(identity_binding)
                                     }
                                     if identity_binding and identity_binding.member_status == 'active'
                                     else {}
@@ -6249,15 +6653,68 @@ async def _verified_liff_identity(channel: InteractChannelModel, id_token: str):
         ) as response:
             result = await response.json(content_type=None)
             if response.status != 200 or not isinstance(result, dict) or not result.get('sub'):
-                raise HTTPException(status_code=401, detail='LINE LIFF identity could not be verified.')
-    binding = await InteractChannels.get_line_identity_binding(channel.id, str(result['sub']))
+                log.warning(
+                    'LIFF ID token rejected channel=%s status=%s line_error=%s',
+                    channel.id,
+                    response.status,
+                    str(result.get('error') or result.get('error_description') or 'unknown')[:120]
+                    if isinstance(result, dict)
+                    else 'invalid-response',
+                )
+                raise HTTPException(status_code=401, detail='LIFF_ID_TOKEN_INVALID')
+    external_user_id = str(result['sub'])
+    identity_ref = hashlib.sha256(external_user_id.encode()).hexdigest()[:12]
+    binding = await InteractChannels.get_line_identity_binding(
+        channel_id=channel.id,
+        external_user_id=external_user_id,
+    )
+    if not binding:
+        known_bindings = await InteractChannels.list_line_identity_bindings(channel_id=channel.id)
+        log.warning(
+            'LIFF identity not bound channel=%s identity_ref=%s binding_count=%s',
+            channel.id,
+            identity_ref,
+            len(known_bindings),
+        )
+        raise HTTPException(status_code=403, detail='LIFF_IDENTITY_NOT_BOUND')
+    if binding.member_status != 'active':
+        log.warning(
+            'LIFF identity inactive channel=%s identity_ref=%s status=%s',
+            channel.id,
+            identity_ref,
+            binding.member_status,
+        )
+        raise HTTPException(status_code=403, detail='LIFF_IDENTITY_INACTIVE')
+    if binding.company_user_id != channel.company_user_id:
+        log.warning(
+            'LIFF identity company mismatch channel=%s identity_ref=%s',
+            channel.id,
+            identity_ref,
+        )
+        raise HTTPException(status_code=403, detail='LIFF_COMPANY_MISMATCH')
+    return external_user_id, binding
+
+
+def _assert_crm_liff_subject(
+    claims: dict[str, Any],
+    channel: InteractChannelModel,
+    binding: InteractLineIdentityBindingModel,
+) -> None:
     if (
-        not binding
-        or binding.member_status != 'active'
-        or binding.company_user_id != channel.company_user_id
+        binding.identity_source != 'product'
+        or binding.product_key != 'crm'
+        or binding.product_instance_id != str(claims.get('crm_instance_id') or '')
+        or binding.product_user_id != str(claims.get('crm_user_id') or '')
     ):
-        raise HTTPException(status_code=403, detail='This LINE account is not bound to an active company member.')
-    return str(result['sub']), binding
+        raise HTTPException(status_code=403, detail='LIFF CRM employee identity does not match this LINE binding.')
+    if (
+        channel.product_role not in {'am', 'bd'}
+        or (
+            binding.member_role not in {'owner', 'admin'}
+            and channel.product_role not in binding.product_team_codes
+        )
+    ):
+        raise HTTPException(status_code=403, detail='CRM employee is not allowed to use this Channel role.')
 
 
 @router.get('/crm/channels')
@@ -6299,6 +6756,7 @@ async def liff_agent_session(
     if not channel or channel.company_user_id != str(claims['company_user_id']):
         raise HTTPException(status_code=404, detail='LINE channel was not found for this company.')
     external_user_id, binding = await _verified_liff_identity(channel, payload.idToken)
+    _assert_crm_liff_subject(claims, channel, binding)
     agents = _enabled_agent_bindings(channel, binding.member_role)
     selected = await _selected_channel_model(channel, external_user_id, binding.member_role)
     return {
@@ -6321,6 +6779,7 @@ async def select_liff_agent(
     if not channel or channel.company_user_id != str(claims['company_user_id']):
         raise HTTPException(status_code=404, detail='LINE channel was not found for this company.')
     _, binding = await _verified_liff_identity(channel, payload.idToken)
+    _assert_crm_liff_subject(claims, channel, binding)
     allowed = {
         item['modelId'] for item in _enabled_agent_bindings(channel, binding.member_role)
     }

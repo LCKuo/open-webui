@@ -131,7 +131,7 @@ def test_managed_prospecting_workflow_is_deterministic_and_publishable():
     )['data']['config']
     assert search_config['blocked_domains_input_key'] == 'excluded_domains'
     assert search_config['blocked_urls_input_key'] == 'seen_source_urls'
-    assert graph['schema_version'] == 7
+    assert graph['schema_version'] == 9
     assert meta['managed']['read_only'] is True
     assert meta['acl']['scope'] == 'private'
     assert _validate_workflow_configuration(graph, 'private', meta, for_publish=True)['ok'] is True
@@ -494,6 +494,16 @@ def test_public_contact_extraction_requires_traceable_company_context():
     assert [item['email'] for item in joined_emails] == [
         'chuenan.chuenan@msa.hinet.net',
         'chuenan.intsales@gmail.com',
+    ]
+
+    fax_joined_email = _public_contacts_from_text(
+        '傳真 : (06)253-7206tq.tq5556@msa.hinet.net',
+        source_url='https://example.com/contact',
+        official_domain='example.com',
+        company_name='範例設備股份有限公司',
+    )
+    assert [item['email'] for item in fax_joined_email] == [
+        'tq.tq5556@msa.hinet.net',
     ]
 
     unrelated = _public_contacts_from_text(

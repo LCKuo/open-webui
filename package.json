@@ -9,6 +9,8 @@
 		"build:watch": "npm run pyodide:fetch && vite build --watch",
 		"preview": "vite preview",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:interact": "npm run test:interact:frontend && npm run test:interact:backend && npm run build:interact",
+		"build:interact": "npm run pyodide:fetch && node --max-old-space-size=8192 node_modules/vite/bin/vite.js build",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"lint": "npm run lint:frontend ; npm run lint:types ; npm run lint:backend",
 		"lint:frontend": "eslint . --fix",
@@ -19,6 +21,8 @@
 		"i18n:parse": "i18next --config i18next-parser.config.ts && prettier --write \"src/lib/i18n/**/*.{js,json}\"",
 		"cy:open": "cypress open",
 		"test:frontend": "vitest --passWithNoTests",
+		"test:interact:frontend": "vitest run src/lib/components/workflows/workflowNodeCatalog.test.ts",
+		"test:interact:backend": "node scripts/run-interact-backend-tests.js",
 		"pyodide:fetch": "node scripts/prepare-pyodide.js"
 	},
 	"devDependencies": {

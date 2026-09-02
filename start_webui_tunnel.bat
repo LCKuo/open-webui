@@ -126,6 +126,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Starting private search tunnel ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\manage_searxng_tunnel.ps1" -Action Start -DataDir "%DATA_DIR%" -ConfigureWebUI
+if errorlevel 1 (
+    echo.
+    echo WebUI was not started because private search is unavailable.
+    echo Run install_self_hosted_search.bat once, then try again.
+    pause
+    exit /b 1
+)
+
 echo Starting backend-only WebUI on %WEBUI_URL% ...
 echo Do not start the frontend dev server for tunnel/public access.
 echo WebSocket transport is disabled for tunnel stability; Socket.IO will use polling.
@@ -134,6 +144,8 @@ echo.
 pushd "%BACKEND_DIR%" >nul
 "%PYTHON_EXE%" -m uvicorn open_webui.main:app --port %PORT% --host %HOST% --forwarded-allow-ips=%FORWARDED_ALLOW_IPS%
 popd >nul
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\manage_searxng_tunnel.ps1" -Action Stop >nul 2>nul
 
 echo.
 echo WebUI stopped.

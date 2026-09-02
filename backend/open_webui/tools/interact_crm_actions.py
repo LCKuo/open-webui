@@ -81,6 +81,15 @@ async def _execute(
             'email': _text(_metadata_value(metadata, 'companyMemberEmail', 'memberEmail')) or None,
             'memberId': _text(_metadata_value(metadata, 'companyMemberId', 'memberId')) or None,
             'externalUserRef': external_ref,
+            'identitySource': _text(_metadata_value(metadata, 'identitySubject', 'identitySource')) or None,
+            'productKey': _text(_metadata_value(metadata, 'productKey')) or None,
+            'productInstanceId': _text(_metadata_value(metadata, 'productInstanceId')) or None,
+            'productUserId': _text(_metadata_value(metadata, 'productUserId')) or None,
+            'productTeamCodes': [
+                str(item)
+                for item in (_metadata_value(metadata, 'productTeamCodes') or [])
+                if str(item).strip()
+            ],
         },
         'payload': payload,
     }
@@ -185,29 +194,64 @@ async def interact_crm_follow_up_update(
 
 
 async def interact_crm_bd_discovery_start(
-    target_segment_id: int,
-    requested_count: int = 10,
-    max_rounds: int = 2,
-    region: str = '台灣',
+    target_segment_id: int | None = None,
+    requested_count: int | None = None,
+    max_rounds: int | None = None,
+    region: str | None = None,
     search_notes: str | None = None,
     __request__: Request = None,
     __user__: dict = None,
     __metadata__: dict = None,
 ) -> str:
     """
-    Queue a real CRM public-web prospect discovery run. Use after the user chooses an active
-    target segment and confirms count, region, and optional focus. The CRM worker searches
-    public sources, verifies evidence, deduplicates candidates, and leaves them for human review.
+    Queue a real CRM public-web prospect discovery run immediately. When the user does not
+    provide overrides, omit every argument: CRM selects the next eligible active target segment
+    from run history and uses its safe defaults. The worker searches public sources, verifies
+    evidence, deduplicates candidates, applies exclusions, and leaves results for human review.
+    Never ask the user to choose a segment, region, count, rounds, or exclusions that CRM can
+    derive. Ask only when the user explicitly requests a one-off override.
 
-    :param target_segment_id: Active CRM target segment ID.
-    :param requested_count: Net-new candidate goal, 5 to 30.
-    :param max_rounds: Search rounds, 1 to 5.
-    :param region: Geographic search area.
+    :param target_segment_id: Optional active CRM target segment ID override.
+    :param requested_count: Optional net-new candidate goal override, 5 to 30.
+    :param max_rounds: Optional search-round override, 1 to 5.
+    :param region: Optional geographic search-area override.
     :param search_notes: Optional non-sensitive focus for this run.
     """
-    return await _execute('bd.discovery.start', {
-        'targetSegmentId': target_segment_id, 'requestedCount': requested_count,
-        'maxRounds': max_rounds, 'region': region, 'searchNotes': search_notes,
+    payload: dict[str, Any] = {}
+    if target_segment_id is not None:
+        payload['targetSegmentId'] = target_segment_id
+    if requested_count is not None:
+        payload['requestedCount'] = requested_count
+    if max_rounds is not None:
+        payload['maxRounds'] = max_rounds
+    if region:
+        payload['region'] = region
+    if search_notes:
+        payload['searchNotes'] = search_notes
+    return await _execute(
+        'bd.discovery.start', payload, 'bd', __request__, __user__, __metadata__
+    )
+
+
+async def interact_crm_bd_candidates_list(
+    status: str = 'pending',
+    limit: int = 20,
+    __request__: Request = None,
+    __user__: dict = None,
+    __metadata__: dict = None,
+) -> str:
+    """
+    List CRM prospect candidates that the verified BD employee may review. Call this whenever
+    the user asks for pending, approved, contacted, converted, or all prospect candidates.
+    Results include score, public evidence URLs, contact verification status, public contact
+    details when permitted, and uncertainty notes. Never claim that candidate-list access is
+    unavailable before calling this tool.
+
+    :param status: One of pending, qualified, contacted, converted, or all.
+    :param limit: Maximum rows to return, 1 to 50.
+    """
+    return await _execute('bd.candidates.list', {
+        'status': status, 'limit': limit,
     }, 'bd', __request__, __user__, __metadata__)
 
 

@@ -163,7 +163,7 @@ def _normalize_discovery_source_url(value: str) -> str:
 
 PAGE_ITEM_COUNT = 30
 MANAGED_PROSPECTING_WORKFLOW_KEY = 'interact.crm.prospecting.discovery'
-MANAGED_PROSPECTING_WORKFLOW_VERSION = 7
+MANAGED_PROSPECTING_WORKFLOW_VERSION = 9
 MANAGED_PROSPECTING_MODEL_USE_CASE = 'prospecting_discovery'
 _managed_workflow_locks: dict[str, asyncio.Lock] = {}
 _deferred_workflow_tasks: set[asyncio.Task[Any]] = set()
@@ -271,6 +271,21 @@ CRM 探索條件：
       "confidence": 0,
       "verificationStatus": "verified"
     }],
+    "businessActivities": [{
+      "category": "industry 或 equipment 或 process 或 product 或 service 或 application",
+      "label": "從公開頁面辨識出的標準化營業項目",
+      "evidenceUrl": "該營業項目實際出現的公開網址",
+      "evidenceExcerpt": "支持分類的來源摘錄",
+      "confidence": 0
+    }],
+    "suggestedEntryPoints": [{
+      "name": "只能使用 search_brief.commercialEntryPoints 中的名稱",
+      "rationale": "為何這個公開營業項目可能對應承炘切入方向",
+      "supportingFacts": ["來源已證實的設備、製程或產品事實"],
+      "assumptions": ["仍需業務確認的介質、規格、用量或採購需求"],
+      "evidenceUrls": ["https://本輪搜尋結果中的實際網址"],
+      "confidence": 0
+    }],
     "phone": "公開企業電話或 null",
     "structuralNeedScore": 0,
     "capabilityFitScore": 0,
@@ -309,6 +324,11 @@ Email 與電話只有在本次讀取的公開頁文字中出現時才能填寫�
 辨識不出正式公司名稱、只有社群帳號、只有產品名、或沒有來源 URL 時不要列入。
 排除條件命中時仍可列出，但 excluded 必須為 true 並說明原因。
 分數必須保守，沒有採購或擴產時機證據時 timingScore 不得高於 35。
+
+businessActivities 必須先回答「這家公司公開資料顯示在做什麼」，每一項都要附實際來源，不得把承炘產品當成候選公司的營業項目。
+suggestedEntryPoints 最多 3 項，name 只能逐字使用 search_brief.commercialEntryPoints 中的名稱；沒有足夠證據時回傳空陣列。
+supportingFacts 只能寫公開來源已證實的事實；介質、溫度、壓力、尺寸、材質、用量、採購意願與現有供應商若未公開，必須放在 assumptions，不得寫成事實。
+中文同名詞必須依實際用途消歧，不得只因名稱部分相同就推導需求。例如住宅或空調通風用的「全熱交換器」不等於工業流體製程的熱交換器；若公開來源只顯示通風、風管或空調工程，不得推導工業法蘭、腐蝕性介質或高溫高壓需求。
 
 profileSuggestions 只用於改善未來搜尋輪廓，最多 5 項；candidate_contact_enrichment 模式必須回傳空陣列。
 field 只能是 industries、productKeywords、needSignals、exclusionSignals 其中一個。
@@ -435,6 +455,9 @@ PROSPECT_EMAIL_PATTERN = re.compile(
 PROSPECT_JOINED_EMAIL_BOUNDARY_PATTERN = re.compile(
     r'(?i)(\.(?:com|net|org|edu|gov|mil|biz|info|io|ai|co)(?:\.[a-z]{2})?)'
     r'(?=[a-z0-9][a-z0-9_.+-]{0,63}@)'
+)
+PROSPECT_PHONE_PREFIXED_EMAIL_LOCAL_PATTERN = re.compile(
+    r'(?i)^(?:\+?\d[\d() ]{0,8})?\d{2,4}-\d{4,8}(?=[a-z])'
 )
 PROSPECT_ROLE_LOCALS = {
     'business',
@@ -582,9 +605,14 @@ def _public_contacts_from_text(
     seen: set[str] = set()
     for match in PROSPECT_EMAIL_PATTERN.finditer(searchable_text):
         email = match.group(1).strip('.,;:，；：').lower()
+        local, _, domain = email.partition('@')
+        # HTML-to-text conversion can remove the separator after a phone or
+        # fax value, producing values such as 253-7206sales@example.com.
+        # Remove only an unmistakably phone-shaped prefix from the local part.
+        local = PROSPECT_PHONE_PREFIXED_EMAIL_LOCAL_PATTERN.sub('', local)
+        email = f'{local}@{domain}' if local and domain else email
         if email in seen:
             continue
-        local, _, domain = email.partition('@')
         if (
             not domain
             or local in PROSPECT_REJECT_LOCALS
@@ -3304,7 +3332,9 @@ def _verified_channel_access_context(
         user_id=user.id if member_role == 'owner' else None,
         role=user.role if member_role == 'owner' else 'user',
         company_user_id=company_user_id,
-        company_member_id=str(channel_context.get('companyMemberId') or '').strip() or None,
+        company_member_id=str(
+            channel_context.get('accessSubjectId') or channel_context.get('companyMemberId') or ''
+        ).strip() or None,
         company_member_role=member_role,
         group_ids={str(item) for item in channel_context.get('groupIds') or [] if str(item)},
         channel_id=channel_id,

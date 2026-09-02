@@ -136,6 +136,49 @@ async def test_enqueue_is_idempotent_per_platform_event(queue_table):
 
 
 @pytest.mark.asyncio
+async def test_crm_employee_account_link_persists_product_identity(queue_table, monkeypatch):
+    monkeypatch.setattr(channel_models, '_encrypt_secret', lambda value: value)
+    monkeypatch.setattr(channel_models, '_decrypt_secret', lambda value: value)
+    await queue_table.create_line_identity_link(
+        state='state-value',
+        channel_id='channel-1',
+        external_user_id='line-user',
+        link_token='line-link-token',
+    )
+    prepared = await queue_table.prepare_line_identity_nonce(
+        state='state-value',
+        channel_id='channel-1',
+        link_token='line-link-token',
+        nonce='line-nonce',
+        company_user_id='company-1',
+        company_email='billing@example.com',
+        company_member_id=None,
+        member_email='employee@example.com',
+        member_role='member',
+        member_status='active',
+        group_ids=[],
+        identity_source='product',
+        product_key='crm',
+        product_instance_id='crm-instance-a',
+        product_user_id='7',
+        product_team_codes=['am'],
+    )
+    binding = await queue_table.consume_line_identity_link(
+        nonce='line-nonce',
+        channel_id='channel-1',
+        external_user_id='line-user',
+    )
+
+    assert prepared is True
+    assert binding.identity_source == 'product'
+    assert binding.product_key == 'crm'
+    assert binding.product_instance_id == 'crm-instance-a'
+    assert binding.product_user_id == '7'
+    assert binding.product_team_codes == ['am']
+    assert binding.access_subject_id == 'product:crm:crm-instance-a:7'
+
+
+@pytest.mark.asyncio
 async def test_user_rate_limit_does_not_block_other_users(queue_table):
     channel = await queue_table.get_by_id('channel-1')
     channel.user_rate_limit_per_minute = 1
