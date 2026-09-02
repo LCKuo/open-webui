@@ -93,7 +93,7 @@ from open_webui.utils.interact_crm_auth import (
     workflow_allowed_by_crm_token,
 )
 from open_webui.utils.misc import get_message_list
-from open_webui.utils.models import get_all_models, get_filtered_models
+from open_webui.utils.models import check_model_access, get_all_models, get_filtered_models
 from open_webui.utils.workflow_launch import (
     add_guidance_node_to_legacy_graph,
     apply_launch_defaults,
@@ -109,6 +109,7 @@ from open_webui.utils.workflow_runtime import (
     WorkflowPause,
     WorkflowRuntimeError,
     _extract_path,
+    _node_config,
     _render_template,
     execute_workflow_graph,
     node_semantic_type,
@@ -166,7 +167,7 @@ def _normalize_discovery_source_url(value: str) -> str:
 
 PAGE_ITEM_COUNT = 30
 MANAGED_PROSPECTING_WORKFLOW_KEY = 'interact.crm.prospecting.discovery'
-MANAGED_PROSPECTING_WORKFLOW_VERSION = 9
+MANAGED_PROSPECTING_WORKFLOW_VERSION = 10
 MANAGED_PROSPECTING_MODEL_USE_CASE = 'prospecting_discovery'
 _managed_workflow_locks: dict[str, asyncio.Lock] = {}
 _deferred_workflow_tasks: set[asyncio.Task[Any]] = set()
@@ -247,6 +248,9 @@ CRM 探索條件：
   找不到時保留該公司並將聯絡欄位填 null，不得猜測 Email。
 - 其他模式才可依目標客群探索新的候選公司。
 - excludedIdentitySummary 是 CRM 已有的公司身分摘要。不得再次推薦名稱、統編或官網網域相同的公司。
+- targetSegment.industries 決定產業池；companyRoles 決定要找設備製造商、系統整合商、加工廠或終端製程廠等公司角色。
+- targetSegment.productKeywords 與 evidenceKeywords 都描述「候選公司」的公開產品、設備、製程或應用。先用這些詞找公司，再從實際頁面驗證 businessActivities；不得只因搜尋摘要出現關鍵字就判定符合。
+- targetSegment.needSignals 用於判斷近期時機，exclusionSignals 用於排除；缺少需求時機證據不代表公司不存在，但 timingScore 必須保守。
 - commercialEntryPoints 由 CRM「產品與切入點中心」即時計算，應用其中的產品、材料、設備與訊號擴展搜尋方向。
   這些關聯只代表可能的業務切入點，不代表候選公司已確認有採購需求；仍須以公開頁面逐筆提供命中證據。
 - 優先探索本輪指定且尚未覆蓋的地區、應用、名錄或需求訊號，不要退回泛用熱門公司清單。
@@ -334,7 +338,9 @@ supportingFacts 只能寫公開來源已證實的事實；介質、溫度、壓�
 中文同名詞必須依實際用途消歧，不得只因名稱部分相同就推導需求。例如住宅或空調通風用的「全熱交換器」不等於工業流體製程的熱交換器；若公開來源只顯示通風、風管或空調工程，不得推導工業法蘭、腐蝕性介質或高溫高壓需求。
 
 profileSuggestions 只用於改善未來搜尋輪廓，最多 5 項；candidate_contact_enrichment 模式必須回傳空陣列。
-field 只能是 industries、productKeywords、needSignals、exclusionSignals 其中一個。
+field 只能是 industries、companyRoles、productKeywords、evidenceKeywords、needSignals、exclusionSignals 其中一個。
+companyRoles 是目標公司在供應鏈中的角色，例如設備製造商、系統整合商、加工廠或終端製程廠；evidenceKeywords 是候選官網可直接觀察的設備、製程、產品或應用詞。
+不得把委託方自己的材料、產品或供應能力寫成候選公司的 companyRoles、productKeywords 或 evidenceKeywords，除非公開來源明確證實候選公司本身有該項活動。
 只有同一個一般化條件獲得至少兩家候選的公開證據支持時才能建議。不得放入公司名稱、Email、電話、地址、統編、客戶名稱、圖面、尺寸、公差或其他機密資訊。
 只可建議新增條件，不得要求刪除或改寫既有條件。evidenceUrls 必須逐字複製本輪搜尋結果中的 URL。"""
     node_specs = [
@@ -2135,6 +2141,9 @@ async def _execute_workflow(
     resume: dict[str, Any] | None = None,
     access_context_override: WorkflowAccessContext | None = None,
 ) -> dict[str, Any]:
+    if not request.app.state.MODELS:
+        await get_all_models(request, user=user)
+
     version_id = form_data.workflow_version_id
     use_draft = form_data.trigger_type in {'manual_test', 'test.editor'} and not version_id
     if not use_draft:
@@ -2183,6 +2192,10 @@ async def _execute_workflow(
             raise WorkflowRuntimeError(
                 'This workflow requires a model. Select one in chat or configure the model node.'
             )
+        runtime_model = request.app.state.MODELS.get(resolved_model_id)
+        if runtime_model is None:
+            raise WorkflowRuntimeError('Model not found.')
+        await check_model_access(user, runtime_model)
         content = await _workflow_multimodal_content(prompt, parts, user)
         messages = []
         if system_prompt:

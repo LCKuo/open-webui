@@ -145,7 +145,9 @@ _PROSPECTING_BUSINESS_ACTIVITY_CATEGORIES = {
 _PROSPECTING_EMAIL_PATTERN = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
 _PROSPECTING_PROFILE_FIELDS = {
     'industries',
+    'companyRoles',
     'productKeywords',
+    'evidenceKeywords',
     'needSignals',
     'exclusionSignals',
 }

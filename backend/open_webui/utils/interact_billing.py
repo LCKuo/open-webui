@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Optional
 from uuid import uuid4
@@ -39,6 +40,16 @@ def _service_token() -> str:
 
 def is_billing_enabled() -> bool:
     return bool(_base_url() and _service_token())
+
+
+def require_metered_inference_entrypoint(request: Any) -> None:
+    """Prevent authenticated clients from calling provider proxy routes directly."""
+    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    if is_billing_enabled() and path.startswith(("/openai/", "/ollama/")):
+        raise HTTPException(
+            status_code=404,
+            detail="Use the metered /api/v1 inference endpoint.",
+        )
 
 
 def estimate_text_tokens(value: Any) -> int:
@@ -206,6 +217,97 @@ def content_text(content: Any) -> str:
     return str(content)
 
 
+def response_usage_and_answer(response: Any) -> tuple[dict[str, Any], str]:
+    """Read provider usage from stateless JSON responses without consuming streams."""
+    payload: Any = response
+    if not isinstance(payload, dict):
+        body = getattr(response, "body", None)
+        if isinstance(body, (bytes, bytearray)):
+            try:
+                payload = json.loads(body.decode("utf-8", "replace"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+
+    if not isinstance(payload, dict):
+        return {}, ""
+
+    usage = payload.get("usage")
+    normalized_usage = usage if isinstance(usage, dict) else {}
+    answer = ""
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        if isinstance(message, dict):
+            answer = content_text(message.get("content"))
+        elif choices[0].get("text") is not None:
+            answer = content_text(choices[0].get("text"))
+    elif isinstance(payload.get("content"), list):
+        answer = content_text(payload.get("content"))
+
+    return normalized_usage, answer
+
+
+def stream_chunk_billing_data(chunk: Any) -> tuple[dict[str, Any], str, str]:
+    """Extract the latest usage, text delta, and final text from an SSE chunk."""
+    if isinstance(chunk, bytes):
+        text = chunk.decode("utf-8", "replace")
+    elif isinstance(chunk, str):
+        text = chunk
+    else:
+        return {}, "", ""
+
+    latest_usage: dict[str, Any] = {}
+    delta_parts: list[str] = []
+    final_text = ""
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        raw_data = line[5:].strip()
+        if not raw_data or raw_data == "[DONE]":
+            continue
+        try:
+            data = json.loads(raw_data)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        usage = data.get("usage")
+        if not isinstance(usage, dict):
+            response_data = data.get("response")
+            usage = response_data.get("usage") if isinstance(response_data, dict) else None
+        if not isinstance(usage, dict):
+            message_data = data.get("message")
+            usage = message_data.get("usage") if isinstance(message_data, dict) else None
+        if isinstance(usage, dict) and usage:
+            latest_usage = usage
+
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            delta = choices[0].get("delta")
+            if isinstance(delta, dict):
+                content = content_text(delta.get("content"))
+                if content:
+                    delta_parts.append(content)
+
+        event_type = data.get("type")
+        if isinstance(event_type, str) and event_type.endswith(".delta"):
+            delta = data.get("delta")
+            if isinstance(delta, str):
+                delta_parts.append(delta)
+            elif isinstance(delta, dict):
+                delta_text = content_text(delta.get("text"))
+                if delta_text:
+                    delta_parts.append(delta_text)
+
+        if data.get("done") is True:
+            content = content_text(data.get("content"))
+            if content:
+                final_text = content
+
+    return latest_usage, "".join(delta_parts), final_text
+
+
 def current_user_question(form_data: dict[str, Any], metadata: dict[str, Any]) -> str:
     channel_metadata = metadata.get("interact_channel") or {}
     if channel_metadata.get("operation") == "context-summary":
@@ -238,6 +340,17 @@ def billing_workflow_metadata(metadata: dict[str, Any]) -> dict[str, str]:
         if isinstance(value, str) and value.strip():
             result[target_key] = value.strip()[:200]
     return result
+
+
+def pop_trusted_interact_channel(request: Any, form_data: dict[str, Any]) -> dict[str, Any] | None:
+    """Accept channel billing identity only from validated server-side runtimes."""
+    channel_metadata = form_data.pop("interact_channel", None)
+    request_state = getattr(request, "state", None)
+    trusted = bool(
+        getattr(request_state, "interact_channel_runtime", False) is True
+        or getattr(request_state, "internal", False) is True
+    )
+    return channel_metadata if trusted and isinstance(channel_metadata, dict) else None
 
 
 @dataclass
@@ -656,18 +769,26 @@ class InteractBillingClient:
             if channel_metadata.get("operation") == "context-summary"
             else answer_text
         )
+        billing_operation = str(metadata.get("billing_operation") or "").strip().lower()
+        tool_key = "ai-embedding" if billing_operation == "embedding" else "ai-chat"
+        service_name = (
+            "Interact Web Ai Embeddings"
+            if billing_operation == "embedding"
+            else None
+        )
         input_tokens, output_tokens, compute_tokens, billable_tokens = usage_token_counts(
             usage,
             max(
                 authorization.estimated_input_tokens,
                 estimate_prompt_tokens(form_data.get("messages") or []),
             ),
-            estimate_text_tokens(answer_text),
+            0 if billing_operation == "embedding" else estimate_text_tokens(answer_text),
         )
-        data = await self._request(
-            "POST",
-            "/api/integrations/open-webui/usage/commit",
-            {
+        if billing_operation == "embedding":
+            output_tokens = 0
+            compute_tokens = 0
+            billable_tokens = input_tokens
+        payload = {
                 "request_id": authorization.request_id,
                 "reservation_id": authorization.reservation_id,
                 "company_user_id": authorization.company_user_id,
@@ -683,6 +804,8 @@ class InteractBillingClient:
                 "chat_id": metadata.get("chat_id"),
                 "message_id": metadata.get("message_id"),
                 "model": form_data.get("model"),
+                "tool_key": tool_key,
+                **({"service_name": service_name} if service_name else {}),
                 "usage_channel": authorization.usage_channel,
                 "status": status_value,
                 "request_summary": (
@@ -721,16 +844,27 @@ class InteractBillingClient:
                     "reservedTokens": authorization.reserved_tokens,
                     "chargedAt": int(time.time()),
                     "content": {
-                        "type": "text-chat",
+                        "type": "embedding" if billing_operation == "embedding" else "text-chat",
                         "question": question_text,
                         "answer": logged_answer_text,
                     },
                     **({"source": "channel", "channel": channel_metadata} if channel_metadata else {}),
                     **({"workflow": workflow_metadata} if workflow_metadata else {}),
                 },
-            },
-        )
-        return data
+            }
+        try:
+            return await self._request(
+                "POST",
+                "/api/integrations/open-webui/usage/commit",
+                payload,
+            )
+        except Exception as exc:
+            await queue_billing_settlement(
+                "/api/integrations/open-webui/usage/commit",
+                payload,
+                exc,
+            )
+            raise
 
     async def commit_image(
         self,
@@ -741,11 +875,9 @@ class InteractBillingClient:
         usage: dict[str, int],
         image_count: int,
         operation: str = "image-generation",
+        status: str = "completed",
     ) -> dict[str, Any]:
-        data = await self._request(
-            "POST",
-            "/api/integrations/open-webui/usage/commit",
-            {
+        payload = {
                 "request_id": authorization.request_id,
                 "reservation_id": authorization.reservation_id,
                 "company_user_id": authorization.company_user_id,
@@ -761,7 +893,7 @@ class InteractBillingClient:
                 "model": model,
                 "tool_key": "ai-image",
                 "service_name": "Open WebUI Image Generation",
-                "status": "completed",
+                "status": status,
                 "request_summary": prompt[:500],
                 "usage": {
                     "input_tokens": usage["input_tokens"],
@@ -787,9 +919,20 @@ class InteractBillingClient:
                         "prompt": prompt,
                     },
                 },
-            },
-        )
-        return data
+            }
+        try:
+            return await self._request(
+                "POST",
+                "/api/integrations/open-webui/usage/commit",
+                payload,
+            )
+        except Exception as exc:
+            await queue_billing_settlement(
+                "/api/integrations/open-webui/usage/commit",
+                payload,
+                exc,
+            )
+            raise
 
     async def cancel(self, authorization: Optional[BillingAuthorization], reason: str = "cancelled") -> None:
         if not authorization:
@@ -806,3 +949,71 @@ class InteractBillingClient:
             )
         except Exception as e:
             log.warning("Failed to cancel billing reservation: %s", e)
+
+
+async def queue_billing_settlement(path: str, payload: dict[str, Any], error: Exception) -> None:
+    """Persist provider-incurred usage when Website cannot accept it immediately."""
+    try:
+        from open_webui.models.interact_billing import InteractBillingSettlements
+
+        await InteractBillingSettlements.enqueue(path, payload, str(error))
+    except Exception:
+        log.exception(
+            "Unable to persist billing settlement for request %s",
+            payload.get("request_id"),
+        )
+
+
+async def replay_billing_settlements_once(limit: int = 20) -> int:
+    from open_webui.models.interact_billing import InteractBillingSettlements
+
+    client = InteractBillingClient()
+    if not client.enabled:
+        return 0
+
+    completed = 0
+    for settlement in await InteractBillingSettlements.due(limit):
+        try:
+            await client._request("POST", settlement["path"], settlement["payload"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await InteractBillingSettlements.mark_failed(
+                settlement["id"],
+                int(settlement.get("attempts") or 0),
+                str(exc),
+            )
+            log.warning(
+                "Deferred billing settlement %s is still pending: %s",
+                settlement.get("request_id"),
+                exc,
+            )
+        else:
+            await InteractBillingSettlements.mark_completed(settlement["id"])
+            completed += 1
+    return completed
+
+
+async def billing_settlement_worker_loop() -> None:
+    while True:
+        try:
+            await replay_billing_settlements_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Billing settlement retry worker failed")
+        await asyncio.sleep(30)
+
+
+def start_billing_settlement_worker() -> asyncio.Task | None:
+    if not is_billing_enabled():
+        return None
+    return asyncio.create_task(billing_settlement_worker_loop())
+
+
+async def stop_billing_settlement_worker(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task

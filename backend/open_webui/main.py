@@ -237,7 +237,15 @@ from open_webui.utils.chat_variables import (
     normalize_chat_variables,
 )
 from open_webui.utils.embeddings import generate_embeddings
-from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
+from open_webui.utils.interact_billing import (
+    InteractBillingClient,
+    is_billing_enabled,
+    pop_trusted_interact_channel,
+    response_usage_and_answer,
+    start_billing_settlement_worker,
+    stop_billing_settlement_worker,
+    stream_chunk_billing_data,
+)
 from open_webui.utils.json_response import apply_orjson_http_json
 from open_webui.utils.logger import start_logger
 from open_webui.utils.middleware import (
@@ -455,6 +463,7 @@ async def lifespan(app: FastAPI):
             log.warning(f'Failed to initialize terminal servers at startup: {e}')
 
     await interact_channels.start_channel_job_workers(app)
+    app.state.interact_billing_settlement_task = start_billing_settlement_worker()
 
     # Mark application as ready to accept traffic from a startup perspective.
     if license_task:
@@ -472,6 +481,9 @@ async def lifespan(app: FastAPI):
 
     await publish_event(app, EVENTS.SYSTEM_SHUTDOWN_STARTED, source='system')
     await interact_channels.stop_channel_job_workers()
+    await stop_billing_settlement_worker(
+        getattr(app.state, 'interact_billing_settlement_task', None)
+    )
 
     if hasattr(app.state, 'semantic_schema_scheduler_task'):
         app.state.semantic_schema_scheduler_task.cancel()
@@ -1101,8 +1113,50 @@ async def embeddings(request: Request, form_data: dict, user=Depends(get_verifie
     # Make sure models are loaded in app state
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
-    # Use generic dispatcher in utils.embeddings
-    return await generate_embeddings(request, form_data, user)
+    billing_client = InteractBillingClient() if is_billing_enabled() else None
+    billing_authorization = None
+    provider_response_received = False
+    input_value = form_data.get('input')
+    input_count = len(input_value) if isinstance(input_value, list) else 1
+    billing_form_data = {
+        'model': form_data.get('model'),
+        'messages': [{'role': 'user', 'content': input_value}],
+        'max_completion_tokens': 1,
+    }
+    billing_metadata = {
+        'auth_type': getattr(request.state, 'auth_type', 'jwt'),
+        'api_key_id': getattr(request.state, 'api_key_id', None),
+        'billing_operation': 'embedding',
+        'user_message': {
+            'role': 'user',
+            'content': f'[Embedding input: {input_count} item(s)]',
+        },
+    }
+    if billing_client:
+        billing_authorization = await billing_client.authorize(
+            user,
+            billing_form_data,
+            billing_metadata,
+        )
+
+    try:
+        response = await generate_embeddings(request, form_data, user)
+        provider_response_received = True
+        if billing_client and billing_authorization:
+            usage, _ = response_usage_and_answer(response)
+            await billing_client.commit(
+                user,
+                billing_authorization,
+                billing_form_data,
+                billing_metadata,
+                usage or None,
+                '[Embedding generated]',
+            )
+        return response
+    except Exception:
+        if billing_client and billing_authorization and not provider_response_received:
+            await billing_client.cancel(billing_authorization, 'embedding-error-before-response')
+        raise
 
 
 async def _set_direct_model(request: Request, model_item: dict, user) -> None:
@@ -1301,6 +1355,8 @@ async def chat_completion(
 
         requested_function_calling = form_data.get('params', {}).get('function_calling')
 
+        interact_channel = pop_trusted_interact_channel(request, form_data)
+
         metadata = {
             'user_id': user.id,
             'auth_type': getattr(request.state, 'auth_type', 'jwt'),
@@ -1319,7 +1375,7 @@ async def chat_completion(
             'files': form_data.get('files', None),
             'features': form_data.get('features', {}),
             'variables': form_data.get('variables', {}),
-            'interact_channel': form_data.pop('interact_channel', None),
+            'interact_channel': interact_channel,
             'workflow': workflow_request if isinstance(workflow_request, dict) else None,
             'model_id': model_id,
             'chat_variables': chat_variables,
@@ -1758,12 +1814,76 @@ async def chat_completion(
             processed_response = await process_chat_response(response, ctx)
 
             if billing_client and billing_authorization:
+                if isinstance(processed_response, StreamingResponse):
+                    original_iterator = processed_response.body_iterator
+
+                    async def settle_streaming_billing():
+                        stream_usage = {}
+                        stream_answer = ''
+                        settlement_status = 'completed'
+                        try:
+                            async for chunk in original_iterator:
+                                chunk_usage, answer_delta, final_answer = stream_chunk_billing_data(chunk)
+                                if chunk_usage:
+                                    # Streaming middleware emits cumulative usage when a
+                                    # request performs more than one model continuation.
+                                    stream_usage = chunk_usage
+                                if final_answer:
+                                    stream_answer = final_answer
+                                elif answer_delta:
+                                    stream_answer += answer_delta
+                                yield chunk
+                        except asyncio.CancelledError:
+                            settlement_status = 'cancelled'
+                            raise
+                        except Exception:
+                            settlement_status = 'failed'
+                            raise
+                        finally:
+                            assistant_message = ctx.get('assistant_message') or {}
+                            primary_usage = assistant_message.get('usage') or stream_usage
+                            usage = merge_usage(
+                                getattr(request.state, 'interact_billing_aux_usage', None),
+                                primary_usage,
+                            )
+                            answer_content = assistant_message.get('content') or stream_answer
+                            try:
+                                await asyncio.shield(
+                                    billing_client.commit(
+                                        user,
+                                        billing_authorization,
+                                        form_data,
+                                        metadata,
+                                        usage,
+                                        answer_content,
+                                        status_value=settlement_status,
+                                    )
+                                )
+                            except Exception:
+                                # Preserve the authorized reservation for later
+                                # reconciliation if Website is temporarily unavailable.
+                                log.exception('Unable to settle streaming chat usage')
+
+                    processed_response.body_iterator = settle_streaming_billing()
+                    return processed_response
+
                 assistant_message = ctx.get('assistant_message') or {}
+                raw_usage, raw_answer = response_usage_and_answer(response)
+                processed_usage, processed_answer = response_usage_and_answer(processed_response)
+                primary_usage = (
+                    assistant_message.get('usage')
+                    or processed_usage
+                    or raw_usage
+                )
                 usage = merge_usage(
                     getattr(request.state, 'interact_billing_aux_usage', None),
-                    assistant_message.get('usage'),
+                    primary_usage,
                 )
-                answer_content = assistant_message.get('content')
+                answer_content = (
+                    assistant_message.get('content')
+                    or processed_answer
+                    or raw_answer
+                )
                 if not answer_content and metadata.get('chat_id') and metadata.get('message_id'):
                     stored_assistant = await Chats.get_message_by_id_and_message_id(
                         metadata['chat_id'],
@@ -2198,8 +2318,107 @@ async def generate_messages(
     model = models.get(model_id)
     if model:
         url, _, api_config = await openai.get_openai_connection(model['urlIdx'])
-        if is_anthropic_messages_passthrough(url, api_config):
-            return await passthrough_anthropic_messages(request, form_data, user)
+        if is_anthropic_messages_passthrough(url, api_config) and not (
+            model_info and model_info.base_model_id
+        ):
+            runtime_model = request.app.state.MODELS.get(requested_model)
+            if not runtime_model:
+                raise HTTPException(status_code=404, detail='Model not found')
+            if not BYPASS_MODEL_ACCESS_CONTROL and (
+                user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL
+            ):
+                await check_model_access(user, runtime_model, model_info=model_info)
+
+            billing_form_data = convert_anthropic_to_openai_payload(
+                form_data,
+                api_config.get('passthrough_params') or [],
+            )
+            billing_metadata = {
+                'auth_type': getattr(request.state, 'auth_type', 'jwt'),
+                'api_key_id': getattr(request.state, 'api_key_id', None),
+                'model_id': requested_model,
+            }
+            billing_client = InteractBillingClient() if is_billing_enabled() else None
+            billing_authorization = None
+            provider_response_received = False
+            if billing_client:
+                billing_authorization = await billing_client.authorize(
+                    user,
+                    billing_form_data,
+                    billing_metadata,
+                )
+
+            try:
+                response = await passthrough_anthropic_messages(request, form_data, user)
+                provider_response_received = True
+                if isinstance(response, JSONResponse) and response.status_code >= 400:
+                    if billing_client and billing_authorization:
+                        await billing_client.cancel(
+                            billing_authorization,
+                            'anthropic-provider-error',
+                        )
+                    return response
+
+                if isinstance(response, StreamingResponse):
+                    if not billing_client or not billing_authorization:
+                        return response
+                    original_iterator = response.body_iterator
+
+                    async def settle_anthropic_stream():
+                        stream_usage: dict[str, Any] = {}
+                        stream_answer = ''
+                        settlement_status = 'completed'
+                        try:
+                            async for chunk in original_iterator:
+                                chunk_usage, answer_delta, _ = stream_chunk_billing_data(chunk)
+                                if chunk_usage:
+                                    stream_usage = merge_usage(stream_usage, chunk_usage)
+                                if answer_delta:
+                                    stream_answer += answer_delta
+                                yield chunk
+                        except asyncio.CancelledError:
+                            settlement_status = 'cancelled'
+                            raise
+                        except Exception:
+                            settlement_status = 'failed'
+                            raise
+                        finally:
+                            try:
+                                await asyncio.shield(
+                                    billing_client.commit(
+                                        user,
+                                        billing_authorization,
+                                        billing_form_data,
+                                        billing_metadata,
+                                        stream_usage or None,
+                                        stream_answer,
+                                        status_value=settlement_status,
+                                    )
+                                )
+                            except Exception:
+                                log.exception('Unable to settle Anthropic streaming usage')
+
+                    response.body_iterator = settle_anthropic_stream()
+                    return response
+
+                if billing_client and billing_authorization:
+                    usage, answer = response_usage_and_answer(response)
+                    await billing_client.commit(
+                        user,
+                        billing_authorization,
+                        billing_form_data,
+                        billing_metadata,
+                        usage or None,
+                        answer,
+                    )
+                return response
+            except Exception:
+                if billing_client and billing_authorization and not provider_response_received:
+                    await billing_client.cancel(
+                        billing_authorization,
+                        'anthropic-request-error-before-response',
+                    )
+                raise
         passthrough_params = api_config.get('passthrough_params') or []
 
     # Convert Anthropic payload to OpenAI format

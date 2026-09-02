@@ -22,6 +22,7 @@ from open_webui.routers.pipelines import process_pipeline_inlet_filter
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
+from open_webui.utils.models import check_model_access, get_all_models
 from open_webui.utils.response import record_auxiliary_usage
 from open_webui.utils.task import (
     autocomplete_generation_template,
@@ -66,6 +67,14 @@ async def _generate_task_completion(request: Request, payload: dict, user):
     if getattr(request.state, 'interact_billing_parent_active', False) or not is_billing_enabled():
         response = await generate_chat_completion(request, form_data=payload, user=user)
         return record_auxiliary_usage(request, response, payload)
+
+    if not request.app.state.MODELS:
+        await get_all_models(request, user=user)
+    model = request.app.state.MODELS.get(str(payload.get('model') or ''))
+    if model is None:
+        raise HTTPException(status_code=404, detail='Model not found')
+    if user.role == 'user':
+        await check_model_access(user, model)
 
     metadata = {
         **(payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}),

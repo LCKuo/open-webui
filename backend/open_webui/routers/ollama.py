@@ -40,6 +40,7 @@ from open_webui.models.users import UserModel
 from open_webui.utils.access_control import check_model_access
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import get_custom_headers, include_user_info_headers
+from open_webui.utils.interact_billing import require_metered_inference_entrypoint
 from open_webui.utils.model_ids import strip_provider_model_prefix
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import calculate_sha256
@@ -880,6 +881,7 @@ async def embed(
     user=Depends(get_verified_user),
 ):
     """Generate embeddings via the Ollama /api/embed endpoint."""
+    require_metered_inference_entrypoint(request)
     if not await Config.get('ollama.enable'):
         raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
 
@@ -931,6 +933,7 @@ async def embeddings(
     user=Depends(get_verified_user),
 ):
     """Generate embeddings via the legacy Ollama /api/embeddings endpoint."""
+    require_metered_inference_entrypoint(request)
     if not await Config.get('ollama.enable'):
         raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
 
@@ -990,6 +993,7 @@ async def generate_completion(
     user=Depends(get_verified_user),
 ):
     """Run text completion via Ollama /api/generate."""
+    require_metered_inference_entrypoint(request)
     if not await Config.get('ollama.enable'):
         raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
 
@@ -1092,6 +1096,7 @@ async def generate_chat_completion(
     user=Depends(get_verified_user),  # noqa: B008
 ):
     """Forward a chat completion request to an Ollama backend."""
+    require_metered_inference_entrypoint(request)
     if not await Config.get('ollama.enable'):
         raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
 
@@ -1209,6 +1214,7 @@ async def generate_openai_completion(
     user=Depends(get_verified_user),  # noqa: B008
 ):
     """Forward a text completion request via the OpenAI-compatible proxy."""
+    require_metered_inference_entrypoint(request)
     # NOTE: We intentionally do NOT use Depends(get_async_session) here.
     # Database operations (get_model_by_id, AccessGrants.has_access) manage their own short-lived sessions.
     # This prevents holding a connection during the entire LLM call (30-60+ seconds),
@@ -1264,6 +1270,7 @@ async def generate_openai_embeddings(
     user=Depends(get_verified_user),  # noqa: B008
 ):
     """Forward an embeddings request via the OpenAI-compatible proxy."""
+    require_metered_inference_entrypoint(request)
     if not await Config.get('ollama.enable'):
         raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
 
@@ -1313,6 +1320,7 @@ async def generate_openai_chat_completion(
     user=Depends(get_verified_user),  # noqa: B008
 ):
     """Forward a chat completion request via the OpenAI-compatible proxy."""
+    require_metered_inference_entrypoint(request)
     # NOTE: We intentionally do NOT use Depends(get_async_session) here.
     # Database operations (get_model_by_id, AccessGrants.has_access) manage their own short-lived sessions.
     # This prevents holding a connection during the entire LLM call (30-60+ seconds),
@@ -1438,6 +1446,7 @@ async def generate_responses(
 
     See https://ollama.com/blog/responses-api
     """
+    require_metered_inference_entrypoint(request)
     if not await Config.get('ollama.enable'):
         raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
 

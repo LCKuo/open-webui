@@ -618,6 +618,8 @@ async def image_generations(
     billing_client = InteractBillingClient() if is_billing_enabled() and user else None
     billing_authorization = None
     billing_usage = None
+    provider_usage_incurred = False
+    billing_commit_attempted = False
 
     if billing_client:
         billing_authorization, billing_usage = await billing_client.authorize_image(
@@ -629,12 +631,14 @@ async def image_generations(
             original_count,
             {
                 'operation': 'image-generation',
-                'engine': request.app.state.config.IMAGE_GENERATION_ENGINE or 'automatic1111',
+                'engine': image_config.IMAGE_GENERATION_ENGINE or 'automatic1111',
             },
         )
 
     async def commit_image_usage(images):
+        nonlocal billing_commit_attempted
         if billing_client and billing_authorization and billing_usage:
+            billing_commit_attempted = True
             await billing_client.commit_image(
                 user,
                 billing_authorization,
@@ -689,6 +693,7 @@ async def image_generations(
             ) as r:
                 r.raise_for_status()
                 res = await r.json(content_type=None)
+            provider_usage_incurred = True
 
             images = []
 
@@ -739,6 +744,7 @@ async def image_generations(
             ) as r:
                 r.raise_for_status()
                 res = await r.json(content_type=None)
+            provider_usage_incurred = True
 
             images = []
 
@@ -795,6 +801,7 @@ async def image_generations(
                 image_config.COMFYUI_BASE_URL,
                 image_config.COMFYUI_API_KEY,
             )
+            provider_usage_incurred = True
             log.debug(f'res: {res}')
 
             images = []
@@ -850,6 +857,7 @@ async def image_generations(
                 ssl=AIOHTTP_CLIENT_SESSION_SSL,
             ) as r:
                 res = await r.json(content_type=None)
+            provider_usage_incurred = True
             log.debug(f'res: {res}')
 
             images = []
@@ -867,7 +875,22 @@ async def image_generations(
             return await commit_image_usage(images)
     except Exception as e:
         if billing_client and billing_authorization:
-            await billing_client.cancel(billing_authorization, 'image-generation-error')
+            if not billing_commit_attempted and provider_usage_incurred and billing_usage:
+                try:
+                    await billing_client.commit_image(
+                        user,
+                        billing_authorization,
+                        original_prompt,
+                        model,
+                        billing_usage,
+                        original_count or 1,
+                        'image-generation',
+                        'failed',
+                    )
+                except Exception:
+                    log.exception('Unable to settle failed image generation usage')
+            elif not billing_commit_attempted:
+                await billing_client.cancel(billing_authorization, 'image-generation-error-before-usage')
         error = e
         if isinstance(e, aiohttp.ClientResponseError):
             error = e.message
@@ -1003,6 +1026,8 @@ async def image_edits(
     billing_client = InteractBillingClient() if is_billing_enabled() and user else None
     billing_authorization = None
     billing_usage = None
+    provider_usage_incurred = False
+    billing_commit_attempted = False
 
     if billing_client:
         billing_authorization, billing_usage = await billing_client.authorize_image(
@@ -1014,12 +1039,14 @@ async def image_edits(
             original_count,
             {
                 'operation': 'image-edit',
-                'engine': request.app.state.config.IMAGE_EDIT_ENGINE,
+                'engine': image_config.IMAGE_EDIT_ENGINE,
             },
         )
 
     async def commit_image_usage(images):
+        nonlocal billing_commit_attempted
         if billing_client and billing_authorization and billing_usage:
+            billing_commit_attempted = True
             await billing_client.commit_image(
                 user,
                 billing_authorization,
@@ -1110,6 +1137,7 @@ async def image_edits(
             ) as r:
                 r.raise_for_status()
                 res = await r.json(content_type=None)
+            provider_usage_incurred = True
 
             images = []
             for image in res['data']:
@@ -1165,6 +1193,7 @@ async def image_edits(
             ) as r:
                 r.raise_for_status()
                 res = await r.json(content_type=None)
+            provider_usage_incurred = True
 
             images = []
             for image in res['candidates']:
@@ -1230,6 +1259,7 @@ async def image_edits(
                 image_config.IMAGES_EDIT_COMFYUI_BASE_URL,
                 image_config.IMAGES_EDIT_COMFYUI_API_KEY,
             )
+            provider_usage_incurred = True
             log.debug(f'res: {res}')
 
             image_urls = set()
@@ -1267,7 +1297,22 @@ async def image_edits(
             return await commit_image_usage(images)
     except Exception as e:
         if billing_client and billing_authorization:
-            await billing_client.cancel(billing_authorization, 'image-edit-error')
+            if not billing_commit_attempted and provider_usage_incurred and billing_usage:
+                try:
+                    await billing_client.commit_image(
+                        user,
+                        billing_authorization,
+                        original_prompt,
+                        model,
+                        billing_usage,
+                        original_count or 1,
+                        'image-edit',
+                        'failed',
+                    )
+                except Exception:
+                    log.exception('Unable to settle failed image edit usage')
+            elif not billing_commit_attempted:
+                await billing_client.cancel(billing_authorization, 'image-edit-error-before-usage')
         error = e
         if isinstance(e, aiohttp.ClientResponseError):
             error = e.message

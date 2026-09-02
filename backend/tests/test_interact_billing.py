@@ -1,3 +1,4 @@
+import open_webui.utils.interact_billing as interact_billing
 from open_webui.utils.interact_billing import (
     BillingAuthorization,
     InteractBillingClient,
@@ -6,6 +7,10 @@ from open_webui.utils.interact_billing import (
     estimate_prompt_tokens,
     estimate_reserved_tokens,
     image_usage_estimate,
+    pop_trusted_interact_channel,
+    require_metered_inference_entrypoint,
+    response_usage_and_answer,
+    stream_chunk_billing_data,
     usage_token_counts,
 )
 from open_webui.utils.response import merge_usage, record_auxiliary_usage
@@ -34,6 +39,45 @@ def test_internal_context_summary_hides_transcript_from_usage_log():
         {"messages": [{"role": "user", "content": "full private transcript"}]},
         {"interact_channel": {"operation": "context-summary"}},
     ) == "[Internal channel context summary]"
+
+
+def test_browser_cannot_spoof_channel_billing_identity():
+    request = SimpleNamespace(state=SimpleNamespace())
+    form_data = {
+        "interact_channel": {
+            "identitySource": "line-binding",
+            "companyUserId": "someone-elses-company",
+        }
+    }
+
+    assert pop_trusted_interact_channel(request, form_data) is None
+    assert "interact_channel" not in form_data
+
+
+def test_validated_channel_runtime_keeps_channel_billing_identity():
+    request = SimpleNamespace(state=SimpleNamespace(interact_channel_runtime=True))
+    channel = {"source": "channel", "companyUserId": "company-1"}
+
+    assert pop_trusted_interact_channel(request, {"interact_channel": channel}) == channel
+
+
+def test_provider_proxy_inference_is_blocked_when_billing_is_enabled(monkeypatch):
+    monkeypatch.setenv("INTERACT_BILLING_BASE_URL", "https://billing.example.com")
+    monkeypatch.setenv("INTERACT_BILLING_SERVICE_TOKEN", "service-token")
+    request = SimpleNamespace(url=SimpleNamespace(path="/openai/chat/completions"))
+
+    with pytest.raises(HTTPException) as error:
+        require_metered_inference_entrypoint(request)
+
+    assert error.value.status_code == 404
+
+
+def test_internal_metered_inference_path_remains_available(monkeypatch):
+    monkeypatch.setenv("INTERACT_BILLING_BASE_URL", "https://billing.example.com")
+    monkeypatch.setenv("INTERACT_BILLING_SERVICE_TOKEN", "service-token")
+    request = SimpleNamespace(url=SimpleNamespace(path="/api/v1/chat/completions"))
+
+    require_metered_inference_entrypoint(request)
 
 
 def test_reserved_tokens_use_weighted_output_credits():
@@ -67,6 +111,77 @@ def test_missing_usage_uses_estimated_input_and_output():
         fallback_input_tokens=800,
         fallback_output_tokens=120,
     ) == (800, 120, 0, 1_520)
+
+
+def test_stateless_completion_response_preserves_provider_usage_for_billing():
+    usage, answer = response_usage_and_answer(
+        {
+            "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+            "usage": {
+                "prompt_tokens": 73,
+                "completion_tokens": 16,
+                "total_tokens": 89,
+            },
+        }
+    )
+
+    assert usage == {
+        "prompt_tokens": 73,
+        "completion_tokens": 16,
+        "total_tokens": 89,
+    }
+    assert answer == "OK"
+
+
+def test_anthropic_response_preserves_provider_usage_and_answer():
+    usage, answer = response_usage_and_answer(
+        {
+            "content": [{"type": "text", "text": "Anthropic answer"}],
+            "usage": {"input_tokens": 12, "output_tokens": 4},
+        }
+    )
+
+    assert usage == {"input_tokens": 12, "output_tokens": 4}
+    assert answer == "Anthropic answer"
+
+
+def test_streaming_completion_chunk_preserves_provider_usage_for_billing():
+    usage, answer_delta, final_answer = stream_chunk_billing_data(
+        'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n'
+        'data: {"choices":[],"usage":{"prompt_tokens":73,"completion_tokens":16,"total_tokens":89}}\n\n'
+    )
+
+    assert usage == {
+        "prompt_tokens": 73,
+        "completion_tokens": 16,
+        "total_tokens": 89,
+    }
+    assert answer_delta == "OK"
+    assert final_answer == ""
+
+
+def test_anthropic_stream_chunks_preserve_usage_and_text():
+    start_usage, _, _ = stream_chunk_billing_data(
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0}}}\n\n'
+    )
+    end_usage, answer_delta, _ = stream_chunk_billing_data(
+        'data: {"type":"content_block.delta","delta":{"type":"text_delta","text":"hello"}}\n\n'
+        'data: {"type":"message_delta","usage":{"output_tokens":4}}\n\n'
+    )
+
+    assert start_usage == {"input_tokens": 12, "output_tokens": 0}
+    assert end_usage == {"output_tokens": 4}
+    assert answer_delta == "hello"
+
+
+def test_streaming_done_event_uses_canonical_final_answer():
+    usage, answer_delta, final_answer = stream_chunk_billing_data(
+        'data: {"done":true,"content":"final answer","usage":{"input_tokens":5,"output_tokens":2}}\n\n'
+    )
+
+    assert usage == {"input_tokens": 5, "output_tokens": 2}
+    assert answer_delta == ""
+    assert final_answer == "final answer"
 
 
 def test_anthropic_cache_tokens_are_added_to_input():
@@ -482,6 +597,73 @@ async def test_external_api_commit_keeps_authorized_usage_channel():
 
 
 @pytest.mark.asyncio
+async def test_embedding_commit_never_invents_output_or_compute_tokens():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-user", email="member@example.com")
+    authorization = BillingAuthorization(
+        request_id="embedding-1",
+        company_user_id="company-1",
+        reservation_id="reservation-1",
+        estimated_input_tokens=12,
+        max_output_tokens=1,
+        reserved_tokens=18,
+    )
+
+    await client.commit(
+        user,
+        authorization,
+        {"model": "embedding-model", "messages": [{"role": "user", "content": "hello"}]},
+        {"billing_operation": "embedding"},
+        None,
+        "[Embedding generated]",
+    )
+
+    commit_payload = client.requests[-1][2]
+    assert commit_payload["tool_key"] == "ai-embedding"
+    assert commit_payload["usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 0,
+        "compute_tokens": 0,
+        "billable_tokens": 12,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_image_delivery_keeps_provider_usage_and_failed_status():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-user", email="member@example.com")
+    authorization = BillingAuthorization(
+        request_id="image-1",
+        company_user_id="company-1",
+        reservation_id="reservation-1",
+        estimated_input_tokens=1,
+        max_output_tokens=1,
+        reserved_tokens=10_821,
+    )
+
+    await client.commit_image(
+        user,
+        authorization,
+        "industrial product image",
+        "image-model",
+        {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "compute_tokens": 10_814,
+            "billable_tokens": 10_821,
+        },
+        1,
+        "image-generation",
+        "failed",
+    )
+
+    commit_payload = client.requests[-1][2]
+    assert commit_payload["tool_key"] == "ai-image"
+    assert commit_payload["status"] == "failed"
+    assert commit_payload["usage"]["billable_tokens"] == 10_821
+
+
+@pytest.mark.asyncio
 async def test_commit_sends_only_auditable_workflow_labels():
     client = CaptureBillingClient()
     user = SimpleNamespace(id="webui-user", email="member@example.com")
@@ -522,4 +704,47 @@ async def test_commit_sends_only_auditable_workflow_labels():
         "versionId": "version-2",
         "runId": "run-3",
         "trigger": "webui_chat.manual",
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_commit_is_persisted_for_deferred_retry(monkeypatch):
+    queued = []
+
+    class FailingBillingClient(InteractBillingClient):
+        async def _request(self, method, path, payload=None):
+            raise RuntimeError("website temporarily unavailable")
+
+    async def capture_settlement(path, payload, error):
+        queued.append((path, payload, str(error)))
+
+    monkeypatch.setattr(interact_billing, "queue_billing_settlement", capture_settlement)
+    client = FailingBillingClient()
+    authorization = BillingAuthorization(
+        request_id="request-deferred",
+        company_user_id="company-1",
+        reservation_id="reservation-1",
+        estimated_input_tokens=5,
+        max_output_tokens=10,
+        reserved_tokens=65,
+    )
+
+    with pytest.raises(RuntimeError, match="temporarily unavailable"):
+        await client.commit(
+            SimpleNamespace(id="webui-user", email="member@example.com"),
+            authorization,
+            {"model": "model", "messages": [{"role": "user", "content": "hello"}]},
+            {"message_id": "message-1"},
+            {"prompt_tokens": 5, "completion_tokens": 2},
+            "answer",
+        )
+
+    assert len(queued) == 1
+    assert queued[0][0] == "/api/integrations/open-webui/usage/commit"
+    assert queued[0][1]["request_id"] == "request-deferred"
+    assert queued[0][1]["usage"] == {
+        "input_tokens": 5,
+        "output_tokens": 2,
+        "compute_tokens": 0,
+        "billable_tokens": 17,
     }

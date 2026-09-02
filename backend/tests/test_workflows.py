@@ -35,6 +35,7 @@ from open_webui.routers.workflows import (
     _validate_email_draft_content,
     _validate_workflow_configuration,
     _workflow_multimodal_content,
+    _workflow_model_attempts,
 )
 from open_webui.semantic_query.contracts import QueryPlan
 from open_webui.utils.workflow_runtime import PROSPECTING_DISCOVERY_CONTRACT, WorkflowRuntimeError
@@ -85,6 +86,18 @@ def _workflow(**overrides):
     return SimpleNamespace(**values)
 
 
+def test_workflow_model_attempts_reads_nested_node_config():
+    graph = {
+        "nodes": [
+            {"data": {"type": "agent", "config": {"max_attempts": 2}}},
+            {"data": {"type": "chat_model", "config": {"max_attempts": 9}}},
+            {"data": {"type": "web_search", "config": {"max_attempts": 3}}},
+        ]
+    }
+
+    assert _workflow_model_attempts(graph) == 5
+
+
 def _context(company_id='company-a'):
     return WorkflowAccessContext(user_id='member', role='user', company_user_id=company_id)
 
@@ -131,7 +144,7 @@ def test_managed_prospecting_workflow_is_deterministic_and_publishable():
     )['data']['config']
     assert search_config['blocked_domains_input_key'] == 'excluded_domains'
     assert search_config['blocked_urls_input_key'] == 'seen_source_urls'
-    assert graph['schema_version'] == 9
+    assert graph['schema_version'] == 10
     assert meta['managed']['read_only'] is True
     assert meta['acl']['scope'] == 'private'
     assert _validate_workflow_configuration(graph, 'private', meta, for_publish=True)['ok'] is True

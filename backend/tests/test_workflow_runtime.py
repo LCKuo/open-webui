@@ -429,7 +429,7 @@ async def test_prospecting_contract_retries_empty_output_and_normalizes_schema_d
                 "notes": [{"note": "僅使用公開來源。"}],
                 "profileSuggestions": [{
                     "action": "add",
-                    "field": "productKeywords",
+                    "field": "evidenceKeywords",
                     "term": "客製自動化設備",
                     "reason": "公開來源顯示候選公司持續提供客製自動化設備。",
                     "confidence": 88,
@@ -480,6 +480,7 @@ async def test_prospecting_contract_retries_empty_output_and_normalizes_schema_d
     assert result['outputs'][0]['value']['candidates'][0]['businessActivities'][0]['category'] == 'equipment'
     assert result['outputs'][0]['value']['candidates'][0]['suggestedEntryPoints'][0]['name'] == 'PEEK 耐磨件'
     assert result['outputs'][0]['value']['profileSuggestions'][0]['term'] == '客製自動化設備'
+    assert result['outputs'][0]['value']['profileSuggestions'][0]['field'] == 'evidenceKeywords'
 
 
 @pytest.mark.asyncio
