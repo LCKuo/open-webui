@@ -542,7 +542,7 @@ class InteractBillingClient:
         product_actor: dict[str, Any] | None = None
         if (
             isinstance(channel_metadata, dict)
-            and channel_metadata.get('identitySource') == 'line-binding'
+            and channel_metadata.get('identitySource') in {'line-binding', 'crm-session'}
             and channel_metadata.get('companyUserId')
             and channel_metadata.get('companyMemberEmail')
             and channel_metadata.get('companyMemberRole')

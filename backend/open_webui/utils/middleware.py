@@ -391,7 +391,7 @@ def _is_builtin_tool_runtime(request: Request, metadata: dict[str, Any]) -> bool
     return bool(
         getattr(request.state, 'interact_channel_runtime', False)
         and isinstance(channel_metadata, dict)
-        and channel_metadata.get('source') == 'channel'
+        and channel_metadata.get('source') in {'channel', 'crm_embedded'}
     )
 
 

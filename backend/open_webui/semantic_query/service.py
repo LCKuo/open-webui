@@ -108,6 +108,8 @@ def _metadata_value(metadata: dict[str, Any], *keys: str) -> Any:
 async def runtime_context(
     user: dict[str, Any] | None,
     metadata: dict[str, Any] | None,
+    *,
+    trusted_product_runtime: bool = False,
 ) -> QueryRuntimeContext:
     user = user or {}
     metadata = metadata or {}
@@ -126,7 +128,7 @@ async def runtime_context(
     )
     if not company_user_id:
         raise SemanticQueryError('DB-COMPANY-CONTEXT-MISSING', 'Company context is required.')
-    return QueryRuntimeContext(
+    context = QueryRuntimeContext(
         user_id=user_id,
         user_role=_text(user.get('role')),
         company_user_id=company_user_id,
@@ -148,6 +150,18 @@ async def runtime_context(
         external_user_id=_text(_metadata_value(metadata, 'external_user_id', 'externalUserId')),
         request_id=_text(_metadata_value(metadata, 'request_id', 'requestId')),
     )
+    product_subject = _text(_metadata_value(metadata, 'accessSubjectId', 'access_subject_id'))
+    if (
+        trusted_product_runtime
+        and context.channel_source == 'crm_embedded'
+        and product_subject
+        and product_subject.startswith('product:crm:')
+        and context.model_id
+        and _text(_metadata_value(metadata, 'companyUserId', 'company_user_id')) == context.company_user_id
+    ):
+        context.company_member_id = product_subject
+        context.trusted_crm_product = True
+    return context
 
 
 def _company_admin(context: QueryRuntimeContext) -> bool:
@@ -170,6 +184,8 @@ def _principal_allowed(
     allowed_group_ids: list[str],
     context: QueryRuntimeContext,
 ) -> bool:
+    if context.trusted_crm_product and access_mode == 'selected_channels':
+        return True
     if context.external_user_id:
         return access_mode == 'selected_channels'
     if access_mode == 'selected_channels':
@@ -195,7 +211,7 @@ def _connector_allowed(connector: InteractDataConnectorModel, context: QueryRunt
         raise SemanticQueryError('QUERY-EXECUTION-FAILED', 'Write-enabled connectors cannot run semantic queries.')
     if not connector.allowed_model_ids or not _scope_allowed(connector.allowed_model_ids, context.model_id):
         raise SemanticQueryError('DB-MODEL-NOT-ALLOWED')
-    if context.external_user_id:
+    if context.external_user_id and not context.trusted_crm_product:
         if not context.channel_id or context.channel_id not in connector.allowed_channel_ids:
             raise SemanticQueryError('DB-CHANNEL-NOT-ALLOWED')
     else:
@@ -220,7 +236,7 @@ def _dataset_allowed(dataset: dict[str, Any], context: QueryRuntimeContext) -> N
         raise SemanticQueryError('SEMANTIC-DATASET-NOT-PUBLISHED')
     access_mode = dataset.get('access_mode') or 'company_admins'
     allowed_channels = dataset.get('allowed_channel_ids') or []
-    if context.external_user_id:
+    if context.external_user_id and not context.trusted_crm_product:
         if not context.channel_id or context.channel_id not in allowed_channels:
             raise SemanticQueryError('SEMANTIC-DATASET-NOT-ALLOWED', 'The channel is not explicitly allowed.')
     elif not _principal_allowed(
@@ -232,6 +248,8 @@ def _dataset_allowed(dataset: dict[str, Any], context: QueryRuntimeContext) -> N
         raise SemanticQueryError('SEMANTIC-DATASET-NOT-ALLOWED')
     if context.channel_id and allowed_channels and context.channel_id not in allowed_channels:
         raise SemanticQueryError('SEMANTIC-DATASET-NOT-ALLOWED', 'The channel is not explicitly allowed.')
+    if context.trusted_crm_product and not dataset.get('allowed_model_ids'):
+        raise SemanticQueryError('SEMANTIC-DATASET-NOT-ALLOWED', 'CRM product access requires an explicitly assigned model.')
     for key, value in (
         ('allowed_model_ids', context.model_id),
         ('allowed_workflow_ids', context.workflow_id),

@@ -61,9 +61,10 @@ def test_browser_session_can_use_builtin_tools():
     assert _is_builtin_tool_runtime(request, {'session_id': 'browser-session'}) is True
 
 
-def test_verified_channel_runtime_can_use_builtin_tools_without_browser_session():
+@pytest.mark.parametrize('source', ['channel', 'crm_embedded'])
+def test_verified_channel_runtime_can_use_builtin_tools_without_browser_session(source):
     request = SimpleNamespace(state=SimpleNamespace(interact_channel_runtime=True))
-    metadata = {'interact_channel': {'source': 'channel'}}
+    metadata = {'interact_channel': {'source': source}}
 
     assert _is_builtin_tool_runtime(request, metadata) is True
 
@@ -87,9 +88,10 @@ def test_function_calling_mode_preserves_explicit_model_behavior(requested, conf
     assert resolve_function_calling_mode(requested, configured) == expected
 
 
-def test_channel_metadata_cannot_enable_builtin_tools_without_trusted_runtime():
+@pytest.mark.parametrize('source', ['channel', 'crm_embedded'])
+def test_channel_metadata_cannot_enable_builtin_tools_without_trusted_runtime(source):
     request = SimpleNamespace(state=SimpleNamespace())
-    metadata = {'interact_channel': {'source': 'channel'}}
+    metadata = {'interact_channel': {'source': source}}
 
     assert _is_builtin_tool_runtime(request, metadata) is False
 

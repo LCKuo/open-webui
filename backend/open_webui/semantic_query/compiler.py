@@ -433,6 +433,19 @@ class SemanticCompiler:
         )
         column = self._column(field, aliases)
         op = condition.operator
+        # Some tool providers serialize scalar booleans as text. Normalize only
+        # explicit boolean literals after resolving the authorized field type.
+        if field.get('semantic_type') == 'boolean':
+            def boolean_literal(value):
+                if isinstance(value, str) and value.strip().lower() in {'true', 'false'}:
+                    return value.strip().lower() == 'true'
+                return value
+
+            value = condition.value
+            condition = condition.model_copy(update={
+                'value': [boolean_literal(item) for item in value]
+                if isinstance(value, list) else boolean_literal(value),
+            })
         if op == 'is_null':
             return f'{column} IS NULL'
         if op == 'is_not_null':

@@ -67,6 +67,31 @@ def test_database_errors_have_stable_public_codes():
         assert str(error) not in result.values()
 
 
+@pytest.mark.parametrize('error', [
+    PermissionError('Table is not allowed: private.table'),
+    PermissionError('Column is not allowed: private_column'),
+    ValueError('Invalid table name.'),
+])
+def test_database_shape_errors_direct_model_to_authorized_schema(error):
+    result = _database_error_result(error)
+    assert 'interact_database_schema' in result['repairHint']
+    assert 'same connector_id' in result['repairHint']
+    assert 'never switch connectors' in result['repairHint']
+    assert str(error) not in json.dumps(result)
+
+
+@pytest.mark.parametrize('error', [
+    PermissionError('model private_model is not assigned'),
+    PermissionError('channel private_channel is not assigned'),
+    PermissionError('This user/model/channel is not allowed'),
+    RuntimeError('password authentication failed for private_user'),
+])
+def test_database_identity_errors_do_not_suggest_schema_retry(error):
+    result = _database_error_result(error)
+    assert 'repairHint' not in result
+    assert str(error) not in json.dumps(result)
+
+
 def test_channel_uses_database_error_code_without_exposing_internal_detail():
     output = [
         {

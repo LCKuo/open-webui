@@ -143,6 +143,15 @@ def _is_channel_request(ctx: QueryContext) -> bool:
     return (ctx.channel_source or '').lower() == 'channel' or bool(ctx.channel_id)
 
 
+def _is_crm_product_request(ctx: QueryContext) -> bool:
+    return (
+        (ctx.channel_source or '').lower() == 'crm_embedded'
+        and bool(ctx.company_user_id)
+        and bool(ctx.company_member_id)
+        and bool(ctx.model_id)
+    )
+
+
 def _sqlite_path_from_url(url: str) -> str | None:
     parsed = urlparse(url)
     if parsed.scheme not in {'sqlite', 'sqlite+aiosqlite', 'sqlite+pysqlite'}:
@@ -442,11 +451,21 @@ def _database_error_code(error: Exception) -> str:
 
 def _database_error_result(error: Exception) -> dict[str, Any]:
     code = _database_error_code(error)
-    return {
+    result = {
         'ok': False,
         'error_code': code,
         'message': DATABASE_ERROR_MESSAGES[code],
     }
+    if code in {'DB-TABLE-NOT-ALLOWED', 'DB-COLUMN-NOT-ALLOWED', 'DB-QUERY-INVALID'}:
+        result['repairHint'] = (
+            'Do not guess or repeat table/column names. Call interact_database_schema '
+            'with the same connector_id and omit table to discover the authorized structure. '
+            'Use only exact table and column names returned by that tool. '
+            'For business analytics, use interact_semantic_catalog and interact_semantic_query instead. '
+            'If the schema/catalog is empty or denies access, stop and report the limitation; '
+            'never switch connectors or raw queries to bypass authorization.'
+        )
+    return result
 
 
 def _connector_context_allowed(connector: InteractDataConnectorModel, ctx: QueryContext) -> bool:
@@ -483,9 +502,14 @@ def _connector_context_allowed(connector: InteractDataConnectorModel, ctx: Query
     if connector.access_mode == 'selected_channels':
         return bool(
             ctx.company_user_id == connector.company_user_id
-            and _is_channel_request(ctx)
-            and ctx.channel_id
-            and ctx.channel_id in connector.allowed_channel_ids
+            and (
+                (
+                    _is_channel_request(ctx)
+                    and ctx.channel_id
+                    and ctx.channel_id in connector.allowed_channel_ids
+                )
+                or _is_crm_product_request(ctx)
+            )
         )
     return False
 
@@ -528,11 +552,16 @@ def _connector_denial_reason(connector: InteractDataConnectorModel, ctx: QueryCo
         return 'user belongs to another company'
     if connector.access_mode == 'selected_channels' and not (
         ctx.company_user_id == connector.company_user_id
-        and _is_channel_request(ctx)
-        and ctx.channel_id
-        and ctx.channel_id in connector.allowed_channel_ids
+        and (
+            (
+                _is_channel_request(ctx)
+                and ctx.channel_id
+                and ctx.channel_id in connector.allowed_channel_ids
+            )
+            or _is_crm_product_request(ctx)
+        )
     ):
-        return f'channel {ctx.channel_id or "unknown"} is not assigned for this company'
+        return f'channel or CRM product session {ctx.channel_id or "unknown"} is not assigned for this company'
     if connector.access_mode not in {'company_admins', 'selected_members', 'all_company_members', 'selected_channels'}:
         return f'unsupported access mode {connector.access_mode}'
     return None
@@ -2155,7 +2184,8 @@ async def interact_database_query(
     """
     Query rows from an authorized Interact Vision data connector using a safe read-only builder.
     This tool does not accept raw SQL and does not have a sql parameter.
-    Use interact_database_schema first when unsure, then call this tool with table, operation,
+    Call interact_database_schema before the first table query in a conversation. Never guess
+    table/column names or copy example names as real schema. Then use table, operation,
     columns, filters, order_by, group_by, and limit.
     For business metrics, rankings, or analytics, call interact_semantic_catalog first and use
     interact_semantic_query when a dataset is returned. Never use this raw table tool to bypass

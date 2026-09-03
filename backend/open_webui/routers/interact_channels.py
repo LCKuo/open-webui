@@ -504,6 +504,22 @@ CRM_AM_ACTION_INSTRUCTION = (
     'interact_crm_bd_profile_suggestion_create, and never write CRM tables directly.'
 )
 
+CRM_EMBEDDED_AM_REVIEW_INSTRUCTION = (
+    'You are the AM Agent inside the CRM web application. Database and semantic tools are read-only. '
+    'On this surface, never call interact_crm_follow_up_create or interact_crm_follow_up_update and never '
+    'write CRM data. When the employee asks to add or change a follow-up, resolve company, contact, opportunity, '
+    'existing record, and dates from authorized CRM data. Explain the result normally, then append exactly one '
+    'machine block using <crm_review_action>{JSON}</crm_review_action>. For a new follow-up JSON must contain '
+    'type="follow_up.create", companyId, contactId or null, opportunityId or null, followUpType (one of call, '
+    'email, line, meeting, demo, proposal, support), subject, content, '
+    'outcome, nextAction, and an ISO-8601 followUpAt with timezone. For an edit use type="follow_up.update" and '
+    'also include followUpId. When a new sales opportunity is appropriate, the block may instead use '
+    'type="opportunity.create" with companyId, contactId or null, name, amount, expectedCloseDate, source, '
+    'painPoint, and nextStep. Use only IDs returned by authorized CRM queries. Do not emit a block for read-only '
+    'questions. The CRM validates this block and opens its original form with prefilled values; the employee must '
+    'review and submit that form before any database write occurs.'
+)
+
 CRM_BD_ACTION_INSTRUCTION = (
     'You are the BD Agent. Database and semantic tools are strictly read-only. You may search public '
     'company websites, directories, exhibitions, registries, and public business contact pages, including '
@@ -555,6 +571,8 @@ CHANNEL_RUNTIME_ERROR_MESSAGES = {
     'WORKFLOW-QUICK-ACTION-UNAVAILABLE': '這個快速工作流已停用、更新或不再允許此渠道使用，請從最新按鈕重新選擇。',
     'AI-MODEL-NOT-CONFIGURED': '此渠道尚未設定 AI 模型。',
     'AI-MODEL-NOT-FOUND': '此渠道設定的 AI 模型不存在或已停用。',
+    'AI-MODEL-RETIRED': '供應商已停止提供此 AI 模型，請由管理員更換 Agent 的底層模型。CRM 資料與授權不受影響。',
+    'AI-UPSTREAM-TIMEOUT': 'AI 模型服務回應逾時，請先查看工作紀錄，避免連續重送；若持續發生，請由管理員檢查模型服務。',
     'AI-ACCOUNT-NOT-FOUND': '此渠道綁定的 WebUI 帳號不存在。',
     'AI-ACCOUNT-PENDING': '此渠道綁定的 WebUI 帳號尚未完成啟用。',
     'COMPANY-IDENTITY-NOT-FOUND': '企業帳號授權資料不一致，請重新綁定 LINE 帳號或聯繫管理員。',
@@ -570,6 +588,10 @@ def _channel_runtime_failure(detail: str) -> tuple[str, str]:
     lowered = detail.lower()
     if 'workflow-quick-action-unavailable' in lowered:
         code = 'WORKFLOW-QUICK-ACTION-UNAVAILABLE'
+    elif 'end of life' in lowered or 'model has been retired' in lowered or 'model_decommissioned' in lowered:
+        code = 'AI-MODEL-RETIRED'
+    elif 'timeout' in lowered or 'timed out' in lowered:
+        code = 'AI-UPSTREAM-TIMEOUT'
     elif 'configured open webui model was not found' in lowered:
         code = 'AI-MODEL-NOT-FOUND'
     elif 'interact web ai user not found' in lowered:
@@ -738,7 +760,7 @@ def _safe_sso_return_url(value: str | None) -> str | None:
 
 class ChannelChatRequest(BaseModel):
     companyEmail: str = Field(..., min_length=3)
-    channelType: Literal['line', 'wechat', 'telegram']
+    channelType: Literal['line', 'wechat', 'telegram', 'crm']
     channelIdentifier: str = Field(..., min_length=1)
     externalUserId: str = Field(..., min_length=1)
     conversationId: str | None = Field(default=None, min_length=1, max_length=200)
@@ -764,6 +786,7 @@ class ChannelChatRequest(BaseModel):
     productInstanceId: str | None = Field(default=None, max_length=160)
     productUserId: str | None = Field(default=None, max_length=120)
     productTeamCodes: list[str] = Field(default_factory=list, max_length=20)
+    productRole: Literal['am', 'bd'] | None = None
 
 
 class ProvisionAccountRequest(BaseModel):
@@ -800,6 +823,9 @@ class CrmTokenRequest(BaseModel):
     crmInstanceId: str = Field(..., min_length=1, max_length=200)
     crmInstanceName: str = Field(..., min_length=1, max_length=120)
     crmUserId: str | None = Field(default=None, max_length=120)
+    crmUserEmail: str | None = Field(default=None, max_length=320)
+    crmUserRole: Literal['owner', 'manager', 'sales', 'viewer'] | None = None
+    productTeamCodes: list[Literal['am', 'bd']] = Field(default_factory=list, max_length=2)
     scopes: list[str] = Field(default_factory=list, min_length=1, max_length=20)
     allowedWorkflowIds: list[str] = Field(default_factory=list, max_length=100)
     ttlSeconds: int = Field(default=300, ge=120, le=600)
@@ -955,6 +981,13 @@ class LiffAgentSessionRequest(BaseModel):
 
 class LiffAgentSelectRequest(LiffAgentSessionRequest):
     modelId: str = Field(..., min_length=1, max_length=160)
+
+
+class CrmEmbeddedAgentSessionRequest(BaseModel):
+    companyEmail: str = Field(..., min_length=3, max_length=320)
+    companyUserId: str = Field(..., min_length=1, max_length=200)
+    productUserId: str = Field(..., min_length=1, max_length=120)
+    productRole: Literal['am', 'bd']
 
 
 class ChannelHubLiffSessionRequest(LiffAgentSessionRequest):
@@ -4566,12 +4599,20 @@ async def channel_chat(  # noqa: C901
     authorization: str | None = Header(default=None),
     x_interact_service_token: str | None = Header(default=None),
 ):
-    _require_service_token(authorization, x_interact_service_token)
+    crm_claims: dict[str, Any] | None = None
+    if payload.channelType == 'crm':
+        crm_claims = _crm_claims(authorization, 'agent:select')
+    else:
+        _require_service_token(authorization, x_interact_service_token)
     request.state.interact_channel_runtime = True
     if not payload.message.strip() and not payload.parts:
         raise HTTPException(status_code=400, detail='A message or media part is required.')
 
-    user = await Users.get_user_by_email(payload.companyEmail)
+    user = (
+        await _crm_company_user(crm_claims)
+        if crm_claims
+        else await Users.get_user_by_email(payload.companyEmail)
+    )
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Interact Web Ai user not found.')
     if user.role == 'pending':
@@ -4580,7 +4621,64 @@ async def channel_chat(  # noqa: C901
     channel_id = str((payload.metadata or {}).get('channelId') or '').strip()
     access_context: WorkflowAccessContext | None = None
     verified_identity: dict[str, Any] | None = None
-    if payload.companyUserId:
+    if crm_claims:
+        crm_user_id = str(crm_claims.get('crm_user_id') or '')
+        crm_instance_id = str(crm_claims.get('crm_instance_id') or '')
+        crm_user_role = str(crm_claims.get('crm_user_role') or '').strip().lower()
+        member_role = (
+            'owner' if crm_user_role == 'owner'
+            else 'admin' if crm_user_role == 'manager'
+            else 'member'
+        )
+        product_role = str(payload.productRole or '').strip().lower()
+        team_codes = {
+            str(item).strip().lower()
+            for item in crm_claims.get('product_team_codes') or []
+            if str(item).strip()
+        }
+        member_email = str(crm_claims.get('crm_user_email') or '').strip().lower()
+        if (
+            payload.companyEmail.strip().lower() != str(crm_claims.get('company_email') or '').lower()
+            or str(payload.companyUserId or '') != str(crm_claims.get('company_user_id') or '')
+            or payload.identitySource != 'product'
+            or payload.productKey != 'crm'
+            or payload.productInstanceId != crm_instance_id
+            or payload.productUserId != crm_user_id
+            or product_role not in {'am', 'bd'}
+            or crm_user_role not in {'owner', 'manager', 'sales', 'viewer'}
+            or not member_email
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail='CRM embedded identity does not match the signed product session.',
+            )
+        if member_role not in {'owner', 'admin'} and product_role not in team_codes:
+            raise HTTPException(status_code=403, detail='CRM employee is not allowed to use this Agent role.')
+        access_subject_id = f'product:crm:{crm_instance_id}:{crm_user_id}'
+        verified_identity = {
+            'companyUserId': str(crm_claims['company_user_id']),
+            'companyMemberId': access_subject_id,
+            'memberEmail': member_email,
+            'memberRole': member_role,
+            'groupIds': [],
+            'accessSubjectId': access_subject_id,
+            'identitySource': 'product',
+            'productKey': 'crm',
+            'productInstanceId': crm_instance_id,
+            'productUserId': crm_user_id,
+            'productTeamCodes': sorted(team_codes),
+        }
+        access_context = WorkflowAccessContext(
+            user_id=user.id if member_role in {'owner', 'admin'} else None,
+            role=user.role if member_role in {'owner', 'admin'} else 'user',
+            company_user_id=str(crm_claims['company_user_id']),
+            company_member_id=access_subject_id,
+            company_member_role=member_role,
+            group_ids=set(),
+            channel_id=None,
+            model_id=payload.modelId,
+        )
+    elif payload.companyUserId:
         if not channel_id or not payload.companyMemberEmail or not payload.companyMemberRole:
             raise HTTPException(status_code=400, detail='LINE member identity is incomplete.')
         channel = await InteractChannels.get_by_id(channel_id)
@@ -4636,6 +4734,19 @@ async def channel_chat(  # noqa: C901
         runtime_model = refresh_runtime_model_cache_entry(request, model_info)
         if runtime_model is None:
             await get_all_models(request, refresh=True, user=user)
+
+    if crm_claims:
+        inventory = await Models.get_active_workspace_model_inventory_by_user_ids([user.id])
+        allowed_model = next((item for item in inventory if item.get('id') == model_id), None)
+        if (
+            not allowed_model
+            or 'crm' not in set(allowed_model.get('productKeys') or [])
+            or payload.productRole not in set(allowed_model.get('productRoles') or [])
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail='This Agent is not enabled for the requested CRM role.',
+            )
 
     runtime_model = request.app.state.MODELS.get(model_id, {})
     model_knowledge = (
@@ -4716,8 +4827,16 @@ async def channel_chat(  # noqa: C901
         if isinstance(runtime_model, dict)
         else {}
     )
-    if runtime_builtin_tools.get('crm_am_actions') is True:
-        messages.insert(0, {'role': 'system', 'content': CRM_AM_ACTION_INSTRUCTION})
+    if crm_claims and payload.productRole == 'am':
+        messages.insert(0, {
+            'role': 'system',
+            'content': CRM_EMBEDDED_AM_REVIEW_INSTRUCTION,
+        })
+    elif runtime_builtin_tools.get('crm_am_actions') is True:
+        messages.insert(0, {
+            'role': 'system',
+            'content': CRM_AM_ACTION_INSTRUCTION,
+        })
     if runtime_builtin_tools.get('crm_bd_actions') is True:
         messages.insert(0, {'role': 'system', 'content': CRM_BD_ACTION_INSTRUCTION})
 
@@ -4725,6 +4844,7 @@ async def channel_chat(  # noqa: C901
         'model': model_id,
         'messages': messages,
         'stream': True,
+        'stream_options': {'include_usage': True},
         'chat_id': chat_id,
         'id': assistant_message_id,
         'parent_id': parent_id,
@@ -4740,7 +4860,7 @@ async def channel_chat(  # noqa: C901
         },
         'background_tasks': {},
         'interact_channel': {
-            'source': 'channel',
+            'source': 'crm_embedded' if crm_claims else 'channel',
             'channelType': payload.channelType,
             'channelId': (payload.metadata or {}).get('channelId'),
             'modelId': model_id,
@@ -4749,7 +4869,7 @@ async def channel_chat(  # noqa: C901
             'knowledgeScopeFingerprint': knowledge_scope_fingerprint,
             **(
                 {
-                    'identitySource': 'line-binding',
+                    'identitySource': 'crm-session' if crm_claims else 'line-binding',
                     'companyUserId': verified_identity.get('companyUserId'),
                     'companyMemberId': verified_identity.get('companyMemberId'),
                     'companyMemberEmail': verified_identity.get('memberEmail'),
@@ -6776,6 +6896,60 @@ async def list_crm_channels(authorization: str | None = Header(default=None)):
     }
 
 
+@router.post('/crm/embedded/agents/session')
+async def crm_embedded_agent_session(
+    payload: CrmEmbeddedAgentSessionRequest,
+    authorization: str | None = Header(default=None),
+):
+    claims = _crm_claims(authorization, 'agent:select')
+    user = await _crm_company_user(claims)
+    crm_user_role = str(claims.get('crm_user_role') or '').strip().lower()
+    team_codes = set(claims.get('product_team_codes') or [])
+    identity_mismatches = {
+        'company_email': payload.companyEmail.strip().lower()
+        != str(claims.get('company_email') or '').lower(),
+        'company_user_id': payload.companyUserId
+        != str(claims.get('company_user_id') or ''),
+        'crm_user_id': payload.productUserId
+        != str(claims.get('crm_user_id') or ''),
+        'crm_user_role': crm_user_role
+        not in {'owner', 'manager', 'sales', 'viewer'},
+        'crm_user_email': not str(claims.get('crm_user_email') or '').strip(),
+    }
+    if any(identity_mismatches.values()):
+        log.warning(
+            'CRM embedded session identity mismatch fields=%s',
+            sorted(field for field, mismatched in identity_mismatches.items() if mismatched),
+        )
+        raise HTTPException(status_code=403, detail='CRM embedded session identity mismatch.')
+    if crm_user_role not in {'owner', 'manager'} and payload.productRole not in team_codes:
+        raise HTTPException(status_code=403, detail='CRM employee is not allowed to use this Agent role.')
+    inventory = await Models.get_active_workspace_model_inventory_by_user_ids([user.id])
+    agents = [
+        {
+            'modelId': item['id'],
+            'label': item['name'],
+            'role': payload.productRole,
+            'description': item.get('description') or '',
+            'knowledgeCount': item.get('knowledgeCount') or 0,
+            'enabled': True,
+            'isDefault': False,
+        }
+        for item in inventory
+        if 'crm' in set(item.get('productKeys') or [])
+        and payload.productRole in set(item.get('productRoles') or [])
+    ]
+    agents.sort(key=lambda item: (item['label'], item['modelId']))
+    if agents:
+        agents[0]['isDefault'] = True
+    return {
+        'ok': True,
+        'productRole': payload.productRole,
+        'agents': agents,
+        'selectedModelId': agents[0]['modelId'] if agents else None,
+    }
+
+
 @router.post('/crm/liff/agents/session')
 async def liff_agent_session(
     payload: LiffAgentSessionRequest,
@@ -6911,6 +7085,9 @@ async def issue_crm_token(
         crm_instance_id=payload.crmInstanceId,
         crm_instance_name=payload.crmInstanceName,
         crm_user_id=payload.crmUserId,
+        crm_user_email=payload.crmUserEmail,
+        crm_user_role=payload.crmUserRole,
+        product_team_codes=payload.productTeamCodes,
         scopes=scopes,
         allowed_workflow_ids=[
             workflow_id.strip()

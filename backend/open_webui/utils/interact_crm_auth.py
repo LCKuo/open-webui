@@ -32,6 +32,9 @@ def issue_crm_access_token(
     crm_instance_id: str,
     crm_instance_name: str,
     crm_user_id: str | None,
+    crm_user_email: str | None,
+    crm_user_role: str | None,
+    product_team_codes: list[str],
     scopes: list[str],
     allowed_workflow_ids: list[str],
     ttl_seconds: int,
@@ -53,6 +56,9 @@ def issue_crm_access_token(
             'crm_instance_id': crm_instance_id,
             'crm_instance_name': crm_instance_name,
             'crm_user_id': crm_user_id,
+            'crm_user_email': crm_user_email.strip().lower() if crm_user_email else None,
+            'crm_user_role': crm_user_role,
+            'product_team_codes': sorted(set(product_team_codes) & {'am', 'bd'}),
             'scopes': normalized_scopes,
             'allowed_workflow_ids': sorted(set(allowed_workflow_ids)),
         },
@@ -111,6 +117,14 @@ def decode_crm_access_token(token: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail='CRM Agent token workflow grants are invalid.',
+        )
+    product_team_codes = claims.get('product_team_codes', [])
+    if not isinstance(product_team_codes, list) or any(
+        team_code not in {'am', 'bd'} for team_code in product_team_codes
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='CRM Agent token team grants are invalid.',
         )
     return claims
 

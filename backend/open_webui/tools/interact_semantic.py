@@ -5,6 +5,7 @@ from typing import Any
 
 from fastapi import Request
 
+from open_webui.semantic_query.contracts import QueryPlan
 from open_webui.semantic_query.errors import SemanticQueryError
 from open_webui.semantic_query.service import (
     accessible_dataset_manifests,
@@ -15,6 +16,24 @@ from open_webui.semantic_query.service import (
 
 def _result(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _trusted_product_runtime(request: Request | None) -> bool:
+    return bool(request and getattr(request.state, 'interact_channel_runtime', False) is True)
+
+
+def _error_result(error: SemanticQueryError) -> str:
+    payload: dict[str, Any] = {'ok': False, 'error': error.public()}
+    if error.code in {'QUERY-PLAN-INVALID', 'QUERY-TYPE-MISMATCH'}:
+        payload['queryPlanSchema'] = QueryPlan.model_json_schema()
+        payload['repairHint'] = (
+            'Use only QueryPlan schema properties; groupBy is not supported. '
+            'Select up to 8 dimension IDs from the catalog. Grouping is inferred from dimensions. '
+            'Boolean filters require JSON true/false, not strings or numbers. '
+            'Numeric filters require JSON numbers. datasetId must be the catalog datasetId, not a name or slug. '
+            'Correct the plan and retry this semantic tool; do not use raw database queries as a fallback.'
+        )
+    return _result(payload)
 
 
 async def interact_semantic_catalog(
@@ -38,12 +57,13 @@ async def interact_semantic_catalog(
     :return: JSON containing authorized semantic dataset manifests.
     """
     try:
-        context = await runtime_context(__user__, __metadata__)
+        context = await runtime_context(__user__, __metadata__, trusted_product_runtime=_trusted_product_runtime(__request__))
         datasets = await accessible_dataset_manifests(context, query)
         return _result(
             {
                 'ok': True,
                 'datasets': datasets,
+                'queryPlanSchema': QueryPlan.model_json_schema(),
                 'selectionPolicy': {
                     'rawDatabaseFallbackAllowed': False,
                     'whenEmpty': (
@@ -54,7 +74,7 @@ async def interact_semantic_catalog(
             }
         )
     except SemanticQueryError as error:
-        return _result({'ok': False, 'error': error.public()})
+        return _error_result(error)
     except Exception as error:
         semantic_error = SemanticQueryError('QUERY-EXECUTION-FAILED', str(error))
         return _result({'ok': False, 'error': semantic_error.public()})
@@ -76,15 +96,20 @@ async def interact_semantic_query(
       "filters":{"operator":"and","conditions":[{"fieldId":"region",
       "operator":"eq","value":"north"}]},
       "orderBy":[{"fieldId":"revenue","direction":"desc"}],"limit":5}
+    Use only properties in queryPlanSchema returned by the catalog. Do not send groupBy,
+    table, sql, or columns. dimensions already define grouping and allow at most 8 IDs.
+    For a boolean dimension such as active, filters.conditions[].value must be JSON true
+    or false, never "true", "false", 1, or 0. Numeric fields use JSON numbers.
+    For a simple list use datasetId, dimensions, filters, and limit; measures are optional.
 
     :param plan: Strict Query Plan v1 using published semantic IDs only.
     :return: JSON result rows or a stable error code with corrective guidance.
     """
     try:
-        context = await runtime_context(__user__, __metadata__)
+        context = await runtime_context(__user__, __metadata__, trusted_product_runtime=_trusted_product_runtime(__request__))
         return _result(await execute_query(plan, context))
     except SemanticQueryError as error:
-        return _result({'ok': False, 'error': error.public()})
+        return _error_result(error)
     except Exception as error:
         semantic_error = SemanticQueryError('QUERY-EXECUTION-FAILED', str(error))
         return _result({'ok': False, 'error': semantic_error.public()})

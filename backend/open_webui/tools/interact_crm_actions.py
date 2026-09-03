@@ -41,6 +41,13 @@ def _service_config() -> tuple[str, str]:
     return base_url, token
 
 
+def _embedded_action_requires_original_form(action: str) -> bool:
+    return action in {
+        'am.follow_up.create',
+        'am.follow_up.update',
+    }
+
+
 async def _execute(
     action: str,
     payload: dict[str, Any],
@@ -59,10 +66,23 @@ async def _execute(
         or _text(_metadata_value(metadata, 'companyUserId', 'company_user_id'))
     )
     source = _text(_metadata_value(metadata, 'source', 'channelSource', 'channel_source')).lower()
-    if source != 'channel' or not channel_id or not model_id or not company_user_id:
+    if (
+        source not in {'channel', 'crm_embedded'}
+        or (source == 'channel' and not channel_id)
+        or not model_id
+        or not company_user_id
+    ):
         return json.dumps({
             'ok': False,
-            'error': 'This CRM action is available only inside a verified enterprise Channel.',
+            'error': 'This CRM action requires a verified enterprise Channel or CRM product session.',
+        }, ensure_ascii=False)
+    if source == 'crm_embedded' and _embedded_action_requires_original_form(action):
+        return json.dumps({
+            'ok': False,
+            'error': (
+                'Embedded CRM assistants must prepare a review draft. '
+                'The employee must save it with the original CRM form.'
+            ),
         }, ensure_ascii=False)
     external_user_id = _text(_metadata_value(metadata, 'externalUserId', 'external_user_id'))
     external_ref = (
@@ -73,12 +93,13 @@ async def _execute(
     base_url, service_token = _service_config()
     body = {
         'companyUserId': company_user_id,
-        'channelId': channel_id,
+        'channelId': channel_id or None,
         'modelId': model_id,
         'action': action,
         'requestId': str(uuid4()),
         'requester': {
             'email': _text(_metadata_value(metadata, 'companyMemberEmail', 'memberEmail')) or None,
+            'memberRole': _text(_metadata_value(metadata, 'companyMemberRole', 'memberRole')) or None,
             'memberId': _text(_metadata_value(metadata, 'companyMemberId', 'memberId')) or None,
             'externalUserRef': external_ref,
             'identitySource': _text(_metadata_value(metadata, 'identitySubject', 'identitySource')) or None,

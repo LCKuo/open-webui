@@ -10,9 +10,11 @@ from open_webui.models.interact_channels import InteractEventClaim
 from open_webui.routers.interact_channels import (
     CRM_AM_ACTION_INSTRUCTION,
     CRM_BD_ACTION_INSTRUCTION,
+    CRM_EMBEDDED_AM_REVIEW_INSTRUCTION,
     ChannelChatRequest,
     _bd_direct_command,
     _channel_output_text,
+    _channel_runtime_failure,
     _channel_request_messages,
     _claim_and_respond,
     _complete_claimed_result,
@@ -38,8 +40,22 @@ from open_webui.routers.interact_channels import (
     delete_channel,
     platform_webhook,
 )
+from open_webui.tools.interact_crm_actions import _embedded_action_requires_original_form
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
+
+
+def test_channel_model_retirement_error_is_actionable():
+    code, message = _channel_runtime_failure("The model 'old' has reached its end of life and is no longer available.")
+    assert code == 'AI-MODEL-RETIRED'
+    assert '底層模型' in message
+    assert 'AI-RUNTIME-FAILED' not in message
+
+
+def test_channel_timeout_error_does_not_encourage_duplicate_runs():
+    code, message = _channel_runtime_failure('upstream request timed out')
+    assert code == 'AI-UPSTREAM-TIMEOUT'
+    assert '避免連續重送' in message
 
 
 def test_am_instruction_names_the_only_allowed_crm_write_apis():
@@ -49,6 +65,13 @@ def test_am_instruction_names_the_only_allowed_crm_write_apis():
     assert 'Never ask for facts already stored in CRM' in CRM_AM_ACTION_INSTRUCTION
     assert 'never send a generic workbench link' in CRM_AM_ACTION_INSTRUCTION
     assert 'never write CRM tables directly' in CRM_AM_ACTION_INSTRUCTION
+
+
+def test_embedded_am_requires_original_crm_form_for_writes():
+    assert '<crm_review_action>' in CRM_EMBEDDED_AM_REVIEW_INSTRUCTION
+    assert _embedded_action_requires_original_form('am.follow_up.create') is True
+    assert _embedded_action_requires_original_form('am.follow_up.update') is True
+    assert _embedded_action_requires_original_form('bd.discovery.start') is False
 
 
 def test_bd_instruction_allows_public_business_contacts_but_blocks_am_writes():

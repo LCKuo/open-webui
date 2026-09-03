@@ -227,6 +227,7 @@ class QueryRuntimeContext(StrictModel):
     model_id: str | None = None
     channel_id: str | None = None
     channel_source: str | None = None
+    trusted_crm_product: bool = False
     workflow_id: str | None = None
     external_user_id: str | None = None
     request_id: str | None = None

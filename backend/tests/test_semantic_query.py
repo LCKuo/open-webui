@@ -546,6 +546,47 @@ def test_row_policy_is_always_anded_outside_user_or_filters():
     assert compiled.parameters == ['A%', 'B%', 'member-a']
 
 
+@pytest.mark.parametrize('raw,expected', [('true', True), ('false', False), (' FALSE ', False), (True, True)])
+def test_compiler_normalizes_only_explicit_boolean_literals(raw, expected):
+    catalog = catalog_fixture()
+    catalog['objects'][1]['fields'][1]['semantic_type'] = 'boolean'
+    plan = QueryPlan.model_validate({
+        'datasetId': 'sales', 'dimensions': ['salesperson.name'],
+        'filters': {'conditions': [{'fieldId': 'salesperson.name', 'operator': 'eq', 'value': raw}]},
+    })
+    compiled = SemanticCompiler('postgresql', catalog, definition_fixture()).compile(plan)
+    assert compiled.parameters == [expected]
+    assert type(compiled.parameters[0]) is bool
+    assert 'IS NOT NULL' not in compiled.sql
+    assert plan.filters.conditions[0].value == raw
+
+
+@pytest.mark.parametrize('raw', ['yes', '1', 1, 'false OR true'])
+def test_compiler_still_rejects_ambiguous_boolean_values(raw):
+    catalog = catalog_fixture()
+    catalog['objects'][1]['fields'][1]['semantic_type'] = 'boolean'
+    plan = QueryPlan.model_validate({
+        'datasetId': 'sales', 'dimensions': ['salesperson.name'],
+        'filters': {'conditions': [{'fieldId': 'salesperson.name', 'operator': 'eq', 'value': raw}]},
+    })
+    with pytest.raises(SemanticQueryError, match='boolean value'):
+        SemanticCompiler('postgresql', catalog, definition_fixture()).compile(plan)
+
+
+def test_compiler_boolean_list_preserves_false_and_text_fields_stay_text():
+    plan = QueryPlan.model_validate({
+        'datasetId': 'sales', 'dimensions': ['salesperson.name'],
+        'filters': {'conditions': [{'fieldId': 'salesperson.name', 'operator': 'in', 'value': ['true', 'false']}]},
+    })
+    catalog = catalog_fixture()
+    text_result = SemanticCompiler('postgresql', catalog, definition_fixture()).compile(plan)
+    assert text_result.parameters == ['true', 'false']
+    catalog['objects'][1]['fields'][1]['semantic_type'] = 'boolean'
+    bool_result = SemanticCompiler('postgresql', catalog, definition_fixture()).compile(plan)
+    assert bool_result.parameters == [True, False]
+    assert all(type(value) is bool for value in bool_result.parameters)
+
+
 def test_compiler_rejects_wrong_filter_value_type():
     plan = plan_fixture()
     plan.filters.conditions = [
@@ -728,6 +769,32 @@ def test_legacy_connector_selected_channel_requires_company_and_channel():
     assert _connector_context_allowed(connector, context) is False
 
 
+def test_selected_channel_connector_accepts_verified_crm_product_session_for_assigned_model():
+    connector = connector_fixture()
+    connector.access_mode = 'selected_channels'
+    connector.allowed_channel_ids = ['line-channel-a']
+    context = QueryContext(
+        user_id='company-owner-webui-user',
+        user_role='user',
+        model_id='model-a',
+        channel_id=None,
+        channel_source='crm_embedded',
+        company_user_id='company-a',
+        company_member_id='product:crm:instance-a:employee-a',
+        company_member_role='member',
+        group_ids=[],
+    )
+    assert _connector_context_allowed(connector, context) is True
+    context.model_id = 'unassigned-model'
+    assert _connector_context_allowed(connector, context) is False
+    context.model_id = 'model-a'
+    context.company_member_id = None
+    assert _connector_context_allowed(connector, context) is False
+    context.company_member_id = 'product:crm:instance-a:employee-a'
+    context.company_user_id = 'company-b'
+    assert _connector_context_allowed(connector, context) is False
+
+
 @pytest.mark.asyncio
 async def test_external_channel_cannot_fall_back_to_webui_local_admin_connector():
     context = QueryContext(
@@ -807,6 +874,76 @@ def test_external_channel_requires_explicit_connector_and_dataset_channel_access
     with pytest.raises(SemanticQueryError) as captured:
         _dataset_allowed(dataset, external)
     assert captured.value.code == 'SEMANTIC-DATASET-NOT-ALLOWED'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('trusted', [False, True])
+async def test_crm_semantic_access_requires_server_trust_and_explicit_model(trusted):
+    from open_webui.semantic_query.service import runtime_context as build_runtime_context
+
+    context = await build_runtime_context(
+        {'companyUserId': 'company-a'},
+        {
+            'groupIds': [],
+            'model_id': 'model-a',
+            'trusted_crm_product': True,
+            'interact_channel': {
+                'source': 'crm_embedded',
+                'externalUserId': 'crm-user-1',
+                'accessSubjectId': 'product:crm:instance-a:1',
+                'companyUserId': 'company-a',
+            },
+        },
+        trusted_product_runtime=trusted,
+    )
+    assert context.trusted_crm_product is trusted
+    assert context.channel_id is None
+    connector = connector_fixture()
+    connector.access_mode = 'selected_channels'
+    dataset = {
+        'company_user_id': 'company-a',
+        'status': 'published',
+        'current_version_id': 'version-1',
+        'access_mode': 'selected_channels',
+        'allowed_model_ids': ['model-a'],
+        'allowed_channel_ids': ['channel-a'],
+    }
+    if not trusted:
+        with pytest.raises(SemanticQueryError):
+            _connector_allowed(connector, context)
+        with pytest.raises(SemanticQueryError):
+            _dataset_allowed(dataset, context)
+        return
+    _connector_allowed(connector, context)
+    _dataset_allowed(dataset, context)
+    for change in ({'company_user_id': 'company-b'}, {'model_id': 'model-b'}, {'channel_id': 'channel-b'}):
+        denied = context.model_copy(update=change)
+        with pytest.raises(SemanticQueryError):
+            _connector_allowed(connector, denied)
+        with pytest.raises(SemanticQueryError):
+            _dataset_allowed(dataset, denied)
+    dataset['allowed_model_ids'] = []
+    with pytest.raises(SemanticQueryError):
+        _dataset_allowed(dataset, context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('source,subject,company,model', [
+    ('channel', 'product:crm:instance-a:1', 'company-a', 'model-a'),
+    ('crm_embedded', 'member-a', 'company-a', 'model-a'),
+    ('crm_embedded', None, 'company-a', 'model-a'),
+    ('crm_embedded', 'product:crm:instance-a:1', 'company-b', 'model-a'),
+    ('crm_embedded', 'product:crm:instance-a:1', 'company-a', None),
+])
+async def test_incomplete_crm_semantic_identity_cannot_use_product_access(source, subject, company, model):
+    from open_webui.semantic_query.service import runtime_context as build_runtime_context
+
+    context = await build_runtime_context(
+        {'companyUserId': 'company-a'},
+        {'groupIds': [], 'source': source, 'accessSubjectId': subject, 'companyUserId': company, 'model_id': model},
+        trusted_product_runtime=True,
+    )
+    assert context.trusted_crm_product is False
 
 
 def test_dataset_channel_allowlist_adds_external_access_without_blocking_internal_principals():
