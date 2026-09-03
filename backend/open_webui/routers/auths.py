@@ -167,6 +167,7 @@ async def create_session_response(
     db,
     response: Response = None,
     set_cookie: bool = False,
+    cookie_httponly: bool = True,
     source: str = 'api',
 ) -> dict:
     """
@@ -179,6 +180,7 @@ async def create_session_response(
         db: Database session
         response: FastAPI response object (required if set_cookie is True)
         set_cookie: Whether to set the auth cookie on the response
+        cookie_httponly: Whether browser JavaScript may read the auth cookie
     """
     expires_delta = parse_duration(await Config.get('auth.jwt_expiry'))
     expires_at = None
@@ -197,7 +199,7 @@ async def create_session_response(
             key='token',
             value=token,
             expires=datetime_expires_at,
-            httponly=True,
+            httponly=cookie_httponly,
             samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
             secure=WEBUI_AUTH_COOKIE_SECURE,
             **({'max_age': max_age} if max_age is not None else {}),

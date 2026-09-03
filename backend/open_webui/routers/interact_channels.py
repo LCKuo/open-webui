@@ -7171,6 +7171,7 @@ async def consume_sso_ticket(request: Request, ticket: str = Query(..., min_leng
             db,
             response=response,
             set_cookie=True,
+            cookie_httponly=False,
             source='interact_sso',
         )
     return response

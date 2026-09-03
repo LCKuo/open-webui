@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 from open_webui.models.interact_semantic import (
     InteractSemantic,
     _business_day_start,
@@ -9,6 +10,8 @@ from open_webui.models.interact_semantic import (
     _synced_description,
 )
 from open_webui.routers import interact_semantic as semantic_router
+from open_webui.routers import auths as auth_router
+from open_webui.routers import interact_channels as channel_router
 from open_webui.routers.interact_channels import _safe_sso_return_url, _safe_sso_target
 from open_webui.routers.interact_semantic import (
     BulkCatalogAuthorizationRequest,
@@ -73,6 +76,45 @@ def test_sso_navigation_allowlists_targets_and_return_hosts():
     assert _safe_sso_target('/admin/settings') is None
     assert _safe_sso_return_url('https://interact-vision.com.tw/company-portal/data-connectors')
     assert _safe_sso_return_url('https://evil.example/company-portal') is None
+
+
+@pytest.mark.asyncio
+async def test_sso_consume_uses_browser_readable_cookie(monkeypatch):
+    async def consume(_ticket):
+        return {
+            'user_id': 'user-1',
+            'target_path': '/workspace/email-connectors',
+            'return_url': 'https://interact-vision.com.tw/company-portal/email-connectors',
+        }
+
+    async def get_user(_user_id):
+        return SimpleNamespace(id='user-1', role='user')
+
+    captured = {}
+
+    async def create_session_response(_request, _user, _db, **kwargs):
+        captured.update(kwargs)
+        return {'token': 'test-token'}
+
+    class DbContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(channel_router.InteractSsoTickets, 'consume', consume)
+    monkeypatch.setattr(channel_router.Users, 'get_user_by_id', get_user)
+    monkeypatch.setattr(auth_router, 'create_session_response', create_session_response)
+    monkeypatch.setattr('open_webui.internal.db.get_async_db_context', lambda: DbContext())
+
+    request = Request({'type': 'http', 'method': 'GET', 'path': '/', 'headers': []})
+    response = await channel_router.consume_sso_ticket(request, 'x' * 20)
+
+    assert response.status_code == 303
+    assert captured['set_cookie'] is True
+    assert captured['cookie_httponly'] is False
+    assert captured['source'] == 'interact_sso'
 
 
 @pytest.mark.asyncio
