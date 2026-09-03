@@ -67,6 +67,7 @@ def test_schema_descriptions_are_limited_to_connector_visible_tables():
 
 def test_sso_navigation_allowlists_targets_and_return_hosts():
     assert _safe_sso_target('/workspace/data-connectors/connector-1')
+    assert _safe_sso_target('/workspace/email-connectors?connectorId=connector-1')
     assert _safe_sso_target('/workflows/workflow-1/edit')
     assert _safe_sso_target('//evil.example') is None
     assert _safe_sso_target('/admin/settings') is None

@@ -738,6 +738,8 @@ def _safe_sso_target(value: str) -> str | None:
     path = value.split('?', 1)[0]
     if path == '/workspace/data-connectors' or path.startswith('/workspace/data-connectors/'):
         return value
+    if path == '/workspace/email-connectors' or path.startswith('/workspace/email-connectors/'):
+        return value
     if path == '/workflows' or path.startswith('/workflows/'):
         return value
     return None
