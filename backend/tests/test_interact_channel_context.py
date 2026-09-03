@@ -35,6 +35,7 @@ from open_webui.routers.interact_channels import (
     _should_summarize_context,
     _stable_channel_chat_id,
     _summary_history_state,
+    _tool_sequence_ended_without_answer,
     _usage_tokens,
     channel_chat,
     delete_channel,
@@ -85,6 +86,22 @@ def test_bd_instruction_allows_public_business_contacts_but_blocks_am_writes():
     assert 'Never list segments or ask for region, count, rounds, or exclusions' in CRM_BD_ACTION_INSTRUCTION
     assert 'Never use interact_crm_follow_up_create' in CRM_BD_ACTION_INSTRUCTION
     assert 'never write CRM tables directly' in CRM_BD_ACTION_INSTRUCTION
+    assert 'return the complete business answer in the same turn' in CRM_BD_ACTION_INSTRUCTION
+
+
+def test_tool_sequence_requires_a_nonempty_final_answer():
+    incomplete = [
+        {'type': 'message', 'content': [{'type': 'output_text', 'text': '我先查詢資料。'}]},
+        {'type': 'function_call', 'name': 'fetch_url'},
+        {'type': 'function_call_output', 'output': [{'type': 'input_text', 'text': 'result'}]},
+        {'type': 'message', 'content': [{'type': 'output_text', 'text': ''}]},
+    ]
+    complete = [
+        *incomplete[:-1],
+        {'type': 'message', 'content': [{'type': 'output_text', 'text': '完整結論'}]},
+    ]
+    assert _tool_sequence_ended_without_answer(incomplete) is True
+    assert _tool_sequence_ended_without_answer(complete) is False
 
 
 def _payload(message: str = 'latest question') -> ChannelChatRequest:

@@ -497,7 +497,8 @@ CRM_AM_ACTION_INSTRUCTION = (
     'fact, then use interact_crm_follow_up_update. Resolve company, contact, opportunity, current time, '
     'and existing follow-up facts from authorized CRM data and conversation context before asking the user. '
     'Never ask for facts already stored in CRM, never return a checklist of questions, and never send a '
-    'generic workbench link as a substitute for completing an action. Ask at most one short blocking '
+    'generic workbench link as a substitute for completing an action. Do not narrate progress, announce '
+    'a future lookup, or end after a tool call; return the complete business answer in the same turn. Ask at most one short blocking '
     'question only when multiple records match or a safety-critical fact cannot be inferred. Never claim a '
     'write succeeded unless the API returns ok=true. Never use interact_crm_bd_candidates_list. '
     'Never use interact_crm_bd_discovery_start or '
@@ -537,7 +538,8 @@ CRM_BD_ACTION_INSTRUCTION = (
     'human-approved candidate IDs and evidence URLs. It creates a pending suggestion and never applies '
     'it; tell the user a manager must review it. Resolve target companies and public URLs from the pending '
     'candidate list before asking the user. Never return a checklist of questions and never send a generic '
-    'workbench link as a substitute for completing an action. Ask at most one short blocking question only '
+    'workbench link as a substitute for completing an action. Do not narrate progress, announce a future '
+    'lookup, or end after a tool call; return the complete business answer in the same turn. Ask at most one short blocking question only '
     'when no authorized system record can resolve the target. Never use interact_crm_follow_up_create or '
     'interact_crm_follow_up_update, and never write CRM tables directly.'
 )
@@ -567,6 +569,35 @@ def _incomplete_semantic_tool_response(items: Any, content: str) -> bool:
     return any(pattern.lower() in lowered for pattern in transitional_patterns)
 
 
+def _tool_sequence_ended_without_answer(items: Any) -> bool:
+    if not isinstance(items, list):
+        return False
+    function_call_seen = False
+    last_tool_index = -1
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get('type')
+        if item_type == 'function_call':
+            function_call_seen = True
+            last_tool_index = index
+        elif item_type == 'function_call_output':
+            last_tool_index = index
+    if not function_call_seen or last_tool_index < 0:
+        return False
+    for item in items[last_tool_index + 1:]:
+        if not isinstance(item, dict) or item.get('type') != 'message':
+            continue
+        content = item.get('content')
+        if isinstance(content, str) and content.strip():
+            return False
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and str(part.get('text') or '').strip():
+                    return False
+    return True
+
+
 CHANNEL_RUNTIME_ERROR_MESSAGES = {
     'WORKFLOW-QUICK-ACTION-UNAVAILABLE': '這個快速工作流已停用、更新或不再允許此渠道使用，請從最新按鈕重新選擇。',
     'AI-MODEL-NOT-CONFIGURED': '此渠道尚未設定 AI 模型。',
@@ -580,6 +611,7 @@ CHANNEL_RUNTIME_ERROR_MESSAGES = {
     'COMPANY-TOKEN-BALANCE-INSUFFICIENT': '企業 AI 使用額度不足，請由管理員補充額度。',
     'BILLING-AUTHORIZATION-FAILED': '企業 AI 使用授權失敗，請聯繫管理員。',
     'AI-UPSTREAM-NO-RESPONSE': 'AI 模型服務未回傳可用內容，請稍後重試或由管理員檢查模型連線。',
+    'AI-UPSTREAM-INCOMPLETE-RESPONSE': 'Agent 已取得工具資料，但模型沒有完成最終結論；系統已阻止半成品被標示為完成，請重新執行。',
     'AI-RUNTIME-FAILED': 'AI 執行服務發生未分類錯誤，請聯繫管理員。',
 }
 
@@ -4995,6 +5027,22 @@ async def channel_chat(  # noqa: C901
     )
     if _incomplete_semantic_tool_response(assistant_output, content):
         content = ''
+
+    if _tool_sequence_ended_without_answer(assistant_output):
+        code = 'AI-UPSTREAM-INCOMPLETE-RESPONSE'
+        return {
+            'ok': False,
+            'chatId': chat_id,
+            'userMessageId': user_message_id,
+            'assistantMessageId': assistant_message_id,
+            'model': model_id,
+            'content': f'{CHANNEL_RUNTIME_ERROR_MESSAGES[code]}（錯誤代碼：{code}）',
+            'outputs': outputs,
+            'usage': usage,
+            'contextSummaryTokens': context_summary_tokens,
+            'reason': code,
+            'errorCode': code,
+        }
 
     if not content and not outputs:
         code = 'AI-UPSTREAM-NO-RESPONSE'
