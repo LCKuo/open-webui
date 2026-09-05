@@ -4261,7 +4261,7 @@ async def _crm_email_connector_readiness(company_user_id: str, reply_to: str) ->
             'replyTo': reply_to,
         }
     connector = enabled[0]
-    has_api_key = bool(connector.api_key_encrypted)
+    has_api_key = bool(connector.has_api_key)
     available = connector.status in {'ready', 'error'} and has_api_key
     reason = None
     if not has_api_key or connector.status == 'unconfigured':

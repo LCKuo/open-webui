@@ -13,6 +13,7 @@ from open_webui.routers.workflows import (
     _contact_official_websites,
     _contact_target_candidate,
     _crm_email_actor,
+    _crm_email_connector_readiness,
     _crm_token_allows_workflow,
     _customer_contact_query_plan,
     _customer_request_context,
@@ -273,6 +274,30 @@ def test_crm_email_actor_uses_the_authenticated_employee_instead_of_connector_de
     with pytest.raises(HTTPException) as missing_identity:
         _crm_email_actor(None, 'am', 'company@example.com')
     assert getattr(missing_identity.value, 'status_code', None) == 403
+
+
+@pytest.mark.asyncio
+async def test_crm_email_readiness_uses_the_public_connector_key_flag(monkeypatch):
+    connector = SimpleNamespace(
+        id='connector-1',
+        enabled=True,
+        status='unconfigured',
+        has_api_key=False,
+        from_name='Company',
+        from_address='noreply@example.com',
+        last_error=None,
+        daily_send_limit=20,
+    )
+
+    async def list_connectors(_company_user_id, *, include_quarantined):
+        assert include_quarantined is False
+        return [connector]
+
+    monkeypatch.setattr('open_webui.routers.workflows.InteractEmail.list_connectors', list_connectors)
+    readiness = await _crm_email_connector_readiness('company-1', 'employee@example.com')
+    assert readiness['available'] is False
+    assert readiness['replyTo'] == 'employee@example.com'
+    assert 'Resend API Key' in readiness['reason']
 
 
 @pytest.mark.asyncio
