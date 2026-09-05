@@ -211,18 +211,29 @@ def ensure_email_connector_allowed(
     allow_disabled: bool = False,
 ) -> None:
     if connector.company_user_id != context.get('company_user_id'):
-        raise HTTPException(status_code=403, detail='Email connector belongs to another company.')
+        raise HTTPException(status_code=403, detail='此企業無法使用其他企業的寄信服務。')
     if getattr(connector, 'control_plane_status', 'active') != 'active':
         raise HTTPException(
             status_code=409,
             detail='Email connector is quarantined pending company portal reconciliation.',
         )
     if not allow_disabled and (not connector.enabled or connector.status not in {'ready', 'error'}):
-        raise HTTPException(status_code=409, detail='Email connector is disabled or incomplete.')
-    if not allow_disabled and connector.allowed_workflow_ids and workflow_id not in connector.allowed_workflow_ids:
-        raise HTTPException(status_code=403, detail='This workflow is not allowed to use the email connector.')
-    if not allow_disabled and connector.allowed_channel_ids and channel_id not in connector.allowed_channel_ids:
-        raise HTTPException(status_code=403, detail='This channel is not allowed to use the email connector.')
+        raise HTTPException(status_code=409, detail='企業寄信服務已停用或尚未設定完成。')
+    direct_crm_delivery = context.get('trusted_product_delivery') == 'crm'
+    if (
+        not allow_disabled
+        and not direct_crm_delivery
+        and connector.allowed_workflow_ids
+        and workflow_id not in connector.allowed_workflow_ids
+    ):
+        raise HTTPException(status_code=403, detail='目前工作流未獲准使用企業寄信服務。')
+    if (
+        not allow_disabled
+        and not direct_crm_delivery
+        and connector.allowed_channel_ids
+        and channel_id not in connector.allowed_channel_ids
+    ):
+        raise HTTPException(status_code=403, detail='目前來源管道未獲准使用企業寄信服務。')
     if context.get('service_principal'):
         return
     role = str(context.get('company_member_role') or '').lower()
@@ -231,11 +242,11 @@ def ensure_email_connector_allowed(
     if allow_disabled and role in {'owner', 'admin'}:
         return
     if connector.access_mode == 'company_admins' and role not in {'owner', 'admin'}:
-        raise HTTPException(status_code=403, detail='Only company admins can use this email connector.')
+        raise HTTPException(status_code=403, detail='只有企業管理員可以使用這項寄信服務。')
     if connector.access_mode == 'selected_members' and member_id not in connector.allowed_member_ids:
-        raise HTTPException(status_code=403, detail='Your company member is not allowed to use this email connector.')
+        raise HTTPException(status_code=403, detail='目前成員未獲准使用企業寄信服務。')
     if connector.access_mode == 'selected_groups' and not groups.intersection(connector.allowed_group_ids or []):
-        raise HTTPException(status_code=403, detail='Your company group is not allowed to use this email connector.')
+        raise HTTPException(status_code=403, detail='目前成員群組未獲准使用企業寄信服務。')
 
 
 def _apply_recipient_policy(

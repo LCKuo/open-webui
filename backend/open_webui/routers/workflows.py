@@ -145,6 +145,51 @@ _DISCOVERY_TRACKING_QUERY_KEYS = {
     'mc_eid',
 }
 
+_DISCOVERY_LOW_VALUE_DOMAINS = {
+    'wikipedia.org',
+    'wikimedia.org',
+    'facebook.com',
+    'instagram.com',
+    'linkedin.com',
+    'pinterest.com',
+    'scribd.com',
+    'slideshare.net',
+    'twitter.com',
+    'x.com',
+    'youtube.com',
+}
+_DISCOVERY_DOCUMENT_SUFFIXES = ('.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.zip')
+
+
+def _discovery_source_is_low_value(url: str) -> bool:
+    host = (urlparse(str(url or '')).hostname or '').lower().removeprefix('www.')
+    return any(host == domain or host.endswith(f'.{domain}') for domain in _DISCOVERY_LOW_VALUE_DOMAINS)
+
+
+def _discovery_source_is_document(url: str, title: str = '') -> bool:
+    path = urlparse(str(url or '')).path.lower()
+    return path.endswith(_DISCOVERY_DOCUMENT_SUFFIXES) or str(title or '').strip().lower().endswith('[pdf]')
+
+
+def _discovery_source_quality(item: dict[str, Any]) -> int:
+    url = str(item.get('url') or '')
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower().removeprefix('www.')
+    query = str(item.get('query') or '').lower()
+    title = str(item.get('title') or '').lower()
+    score = 0
+    if '官方網站' in query or 'official' in query:
+        score -= 20
+    if len([part for part in parsed.path.split('/') if part]) <= 1:
+        score -= 10
+    if re.search(r'(股份有限公司|有限公司|企業|實業|工業|科技|company|corporation|corp\.?|co\.?\s*,?\s*ltd)', title):
+        score -= 12
+    if host.endswith('.gov.tw') or host.endswith('.gov'):
+        score += 20
+    if re.search(r'(名錄|黃頁|百科|wiki|directory|catalog)', f'{host} {title}'):
+        score += 16
+    return score
+
 
 def _normalize_discovery_source_url(value: str) -> str:
     parsed = urlparse(str(value or '').strip())
@@ -168,7 +213,7 @@ def _normalize_discovery_source_url(value: str) -> str:
 
 PAGE_ITEM_COUNT = 30
 MANAGED_PROSPECTING_WORKFLOW_KEY = 'interact.crm.prospecting.discovery'
-MANAGED_PROSPECTING_WORKFLOW_VERSION = 10
+MANAGED_PROSPECTING_WORKFLOW_VERSION = 11
 MANAGED_PROSPECTING_MODEL_USE_CASE = 'prospecting_discovery'
 _managed_workflow_locks: dict[str, asyncio.Lock] = {}
 _deferred_workflow_tasks: set[asyncio.Task[Any]] = set()
@@ -361,11 +406,16 @@ companyRoles 是目標公司在供應鏈中的角色，例如設備製造商、�
                 'queries_input_key': 'search_queries',
                 'max_queries': 6,
                 'result_count': 6,
+                'max_total_results': 15,
+                'max_total_snippet_chars': 6000,
                 'retry_attempts': 2,
-                'fetch_pages': 6,
-                'max_content_chars': 6000,
+                'fetch_pages': 5,
+                'max_content_chars': 4000,
+                'max_total_content_chars': 12000,
+                'quality_filter': True,
+                'skip_document_files': True,
                 'allowed_domains': [],
-                'blocked_domains': [],
+                'blocked_domains': sorted(_DISCOVERY_LOW_VALUE_DOMAINS),
                 'blocked_domains_input_key': 'excluded_domains',
                 'blocked_urls_input_key': 'seen_source_urls',
             },
@@ -453,6 +503,7 @@ def _prioritize_web_search_fetch_results(
     return sorted(
         results,
         key=lambda item: (
+            _discovery_source_quality(item),
             int(item.get('_result_rank') or 0),
             int(item.get('_query_order') or 0),
         ),
@@ -2301,6 +2352,12 @@ async def _execute_workflow(
                 raise WorkflowRuntimeError('Public web search access is denied.')
         if node_type == 'web_search':
             data = workflow_input.get('data') if isinstance(workflow_input.get('data'), dict) else {}
+            search_brief = data.get('search_brief') if isinstance(data.get('search_brief'), dict) else {}
+            source_policy = (
+                search_brief.get('sourcePolicy')
+                if isinstance(search_brief.get('sourcePolicy'), dict)
+                else {}
+            )
             input_key = str(config.get('queries_input_key') or 'search_queries').strip()
             raw_queries = data.get(input_key)
             if isinstance(raw_queries, list):
@@ -2314,6 +2371,15 @@ async def _execute_workflow(
                 queries = [rendered]
             max_queries = _bounded_runtime_int(config.get('max_queries'), 5, 1, 8)
             result_count = _bounded_runtime_int(config.get('result_count'), 5, 1, 10)
+            if source_policy:
+                max_queries = min(
+                    max_queries,
+                    _bounded_runtime_int(source_policy.get('maxQueries'), max_queries, 1, 8),
+                )
+                result_count = min(
+                    result_count,
+                    _bounded_runtime_int(source_policy.get('maxResultsPerQuery'), result_count, 1, 10),
+                )
             queries = list(dict.fromkeys(item for item in queries if item))[:max_queries]
             if not queries:
                 raise WorkflowRuntimeError('Web search requires at least one non-empty query.')
@@ -2340,6 +2406,14 @@ async def _execute_workflow(
                 for item in (dynamic_blocked_urls if isinstance(dynamic_blocked_urls, list) else [])
                 if (normalized := _normalize_discovery_source_url(str(item)))
             }
+            quality_filter = _as_bool(config.get('quality_filter'))
+            raw_skip_documents = source_policy.get(
+                'skipDocumentFiles',
+                config.get('skip_document_files'),
+            )
+            skip_document_files = (
+                True if raw_skip_documents is None else _as_bool(raw_skip_documents)
+            )
 
             def domain_allowed(url: str) -> bool:
                 parsed_url = urlparse(url)
@@ -2398,15 +2472,17 @@ async def _execute_workflow(
                         or normalized_url in seen_urls
                         or normalized_url in blocked_urls
                         or not domain_allowed(url)
+                        or (quality_filter and _discovery_source_is_low_value(url))
+                        or (skip_document_files and _discovery_source_is_document(url, item.get('title') or ''))
                     ):
                         continue
                     seen_urls.add(normalized_url)
                     results.append(
                         {
                             'query': query,
-                            'title': str(item.get('title') or '').strip(),
+                            'title': str(item.get('title') or '').strip()[:300],
                             'url': url,
-                            'snippet': str(item.get('snippet') or '').strip(),
+                            'snippet': str(item.get('snippet') or '').strip()[:1200],
                             '_query_order': query_order,
                             '_result_rank': result_rank,
                         }
@@ -2418,6 +2494,39 @@ async def _execute_workflow(
                     'Public web search did not return any usable results.' + (f' {details}' if details else '')
                 )
 
+            max_total_results = _bounded_runtime_int(
+                config.get('max_total_results'),
+                15,
+                1,
+                50,
+            )
+            max_total_snippet_chars = _bounded_runtime_int(
+                config.get('max_total_snippet_chars'),
+                6_000,
+                500,
+                30_000,
+            )
+            if source_policy:
+                max_total_results = min(
+                    max_total_results,
+                    _bounded_runtime_int(source_policy.get('maxTotalResults'), max_total_results, 1, 50),
+                )
+                max_total_snippet_chars = min(
+                    max_total_snippet_chars,
+                    _bounded_runtime_int(
+                        source_policy.get('maxTotalSnippetChars'),
+                        max_total_snippet_chars,
+                        500,
+                        30_000,
+                    ),
+                )
+            results = _prioritize_web_search_fetch_results(results, max_total_results)
+            remaining_snippet_chars = max_total_snippet_chars
+            for item in results:
+                snippet = str(item.get('snippet') or '')[:remaining_snippet_chars]
+                item['snippet'] = snippet
+                remaining_snippet_chars = max(0, remaining_snippet_chars - len(snippet))
+
             fetch_pages = _bounded_runtime_int(config.get('fetch_pages'), 0, 0, 8)
             max_content_chars = _bounded_runtime_int(
                 config.get('max_content_chars'),
@@ -2425,8 +2534,35 @@ async def _execute_workflow(
                 500,
                 20_000,
             )
+            max_total_content_chars = _bounded_runtime_int(
+                config.get('max_total_content_chars'),
+                18_000,
+                1_000,
+                60_000,
+            )
+            if source_policy:
+                fetch_pages = min(
+                    fetch_pages,
+                    _bounded_runtime_int(source_policy.get('maxFetchedPages'), fetch_pages, 0, 8),
+                )
+                max_content_chars = min(
+                    max_content_chars,
+                    _bounded_runtime_int(source_policy.get('maxPageChars'), max_content_chars, 500, 20_000),
+                )
+                max_total_content_chars = min(
+                    max_total_content_chars,
+                    _bounded_runtime_int(
+                        source_policy.get('maxTotalContentChars'),
+                        max_total_content_chars,
+                        1_000,
+                        60_000,
+                    ),
+                )
             fetch_candidates = _prioritize_web_search_fetch_results(results, fetch_pages)
+            remaining_content_chars = max_total_content_chars
             for item in fetch_candidates:
+                if remaining_content_chars <= 0:
+                    break
                 fetched = await builtin_fetch_url(
                     item['url'],
                     __request__=request,
@@ -2436,7 +2572,10 @@ async def _execute_workflow(
                     stripped = fetched.strip()
                     if stripped.startswith('{') and '"error"' in stripped:
                         continue
-                    item['content'] = stripped[:max_content_chars]
+                    content = stripped[: min(max_content_chars, remaining_content_chars)]
+                    if content:
+                        item['content'] = content
+                        remaining_content_chars -= len(content)
             for item in results:
                 item.pop('_query_order', None)
                 item.pop('_result_rank', None)
@@ -4330,6 +4469,7 @@ async def service_send_email_for_crm(
             'group_ids': list(context.group_ids),
             'user_id': f"crm:{crm_claims.get('crm_user_id')}" if crm_claims else service_user.id,
             'service_principal': True,
+            'trusted_product_delivery': 'crm',
         },
         EmailSendRequest(
             connector_id=connector.id,

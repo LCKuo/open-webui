@@ -17,6 +17,8 @@ from open_webui.routers.workflows import (
     _crm_token_allows_workflow,
     _customer_contact_query_plan,
     _customer_request_context,
+    _discovery_source_is_document,
+    _discovery_source_is_low_value,
     _email_campaign_policy,
     _email_compose_context,
     _email_draft_contact_context,
@@ -147,7 +149,13 @@ def test_managed_prospecting_workflow_is_deterministic_and_publishable():
     )['data']['config']
     assert search_config['blocked_domains_input_key'] == 'excluded_domains'
     assert search_config['blocked_urls_input_key'] == 'seen_source_urls'
-    assert graph['schema_version'] == 10
+    assert 'wikipedia.org' in search_config['blocked_domains']
+    assert search_config['skip_document_files'] is True
+    assert search_config['max_total_results'] == 15
+    assert search_config['max_total_snippet_chars'] == 6000
+    assert search_config['max_content_chars'] == 4000
+    assert search_config['max_total_content_chars'] == 12000
+    assert graph['schema_version'] == 11
     assert meta['managed']['read_only'] is True
     assert meta['acl']['scope'] == 'private'
     assert _validate_workflow_configuration(graph, 'private', meta, for_publish=True)['ok'] is True
@@ -473,6 +481,36 @@ def test_web_search_fetches_one_result_per_query_before_deeper_results():
     prioritized = _prioritize_web_search_fetch_results(results, 3)
 
     assert [item['url'] for item in prioritized] == ['query-a-1', 'query-b-1', 'query-a-2']
+
+
+def test_web_search_prioritizes_official_company_pages_at_the_same_rank():
+    results = [
+        {
+            'url': 'https://directory.example/list',
+            'title': '產業名錄',
+            'query': '台灣設備會員名錄',
+            '_query_order': 0,
+            '_result_rank': 0,
+        },
+        {
+            'url': 'https://manufacturer.example/',
+            'title': '範例設備股份有限公司',
+            'query': '台灣設備製造商 官方網站',
+            '_query_order': 1,
+            '_result_rank': 0,
+        },
+    ]
+
+    prioritized = _prioritize_web_search_fetch_results(results, 2)
+
+    assert prioritized[0]['url'] == 'https://manufacturer.example/'
+
+
+def test_discovery_quality_gate_rejects_reference_and_document_sources():
+    assert _discovery_source_is_low_value('https://zh.wikipedia.org/wiki/example') is True
+    assert _discovery_source_is_low_value('https://manufacturer.example/products') is False
+    assert _discovery_source_is_document('https://gov.example/report.pdf') is True
+    assert _discovery_source_is_document('https://manufacturer.example/about') is False
 
 
 def test_discovery_source_url_normalization_removes_tracking_variants():
