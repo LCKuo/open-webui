@@ -1063,6 +1063,24 @@ class ServiceEmailDeliveryListRequest(BaseModel):
     workflowIds: list[str] = Field(default_factory=list, max_length=100)
 
 
+class ServiceEmailDeliveryRequest(BaseModel):
+    companyEmail: str
+    companyUserId: Optional[str] = None
+    companyMemberId: Optional[str] = None
+    companyMemberRole: Optional[str] = None
+    productRole: Literal['am', 'bd']
+
+
+class ServiceEmailSendRequest(ServiceEmailDeliveryRequest):
+    to: list[str] = Field(..., min_length=1, max_length=20)
+    cc: list[str] = Field(default_factory=list, max_length=20)
+    subject: str = Field(..., min_length=1, max_length=998)
+    text: str = Field(..., min_length=1, max_length=2_000_000)
+    html: Optional[str] = Field(default=None, max_length=2_000_000)
+    idempotencyKey: str = Field(..., min_length=8, max_length=256)
+    payloadHash: str = Field(..., min_length=32, max_length=128)
+
+
 class ServiceWorkflowCampaignPolicyRequest(BaseModel):
     companyEmail: str
     companyUserId: Optional[str] = None
@@ -4205,6 +4223,125 @@ async def service_list_email_deliveries_for_crm(
         company_user_id,
         form_data.limit,
         workflow_ids or None,
+    )
+
+
+def _crm_email_actor(claims: dict[str, Any] | None, product_role: str, company_email: str) -> str:
+    if not claims:
+        raise HTTPException(status_code=403, detail='寄信必須由已登入的 CRM 員工操作。')
+    crm_role = str(claims.get('crm_user_role') or '').strip().lower()
+    team_codes = {str(item).strip().lower() for item in claims.get('product_team_codes') or []}
+    if crm_role not in {'owner', 'manager'} and (crm_role != 'sales' or product_role not in team_codes):
+        raise HTTPException(status_code=403, detail='目前 CRM 員工沒有這個產品角色的寄信權限。')
+    actor_email = str(claims.get('crm_user_email') or '').strip().lower()
+    if not actor_email:
+        raise HTTPException(status_code=403, detail='CRM 員工帳號缺少 Email，無法設定回覆地址。')
+    return actor_email
+
+
+async def _crm_email_connector_readiness(company_user_id: str, reply_to: str) -> dict[str, Any]:
+    connectors = await InteractEmail.list_connectors(company_user_id, include_quarantined=False)
+    enabled = [connector for connector in connectors if connector.enabled]
+    if not enabled:
+        return {
+            'available': False,
+            'reason': '企業寄信尚未啟用，請管理者先到 Website 的整合服務完成設定。',
+            'connectorId': None,
+            'fromName': None,
+            'fromAddress': None,
+            'replyTo': reply_to,
+        }
+    if len(enabled) > 1:
+        return {
+            'available': False,
+            'reason': '偵測到多個啟用中的 Email Connector，請管理者只保留一個正式寄件服務。',
+            'connectorId': None,
+            'fromName': None,
+            'fromAddress': None,
+            'replyTo': reply_to,
+        }
+    connector = enabled[0]
+    has_api_key = bool(connector.api_key_encrypted)
+    available = connector.status in {'ready', 'error'} and has_api_key
+    reason = None
+    if not has_api_key or connector.status == 'unconfigured':
+        reason = '企業寄信尚未設定 Resend API Key，完成設定前系統不會顯示可用的寄出動作。'
+    elif connector.status == 'disabled':
+        reason = '企業寄信目前已停用，請管理者先在 Website 的整合服務重新啟用。'
+    elif connector.status == 'error':
+        reason = connector.last_error or '企業寄信最近一次連線測試失敗，寄送時會再次驗證。'
+    return {
+        'available': available,
+        'reason': reason,
+        'connectorId': connector.id,
+        'fromName': connector.from_name,
+        'fromAddress': connector.from_address,
+        'replyTo': reply_to,
+        'status': connector.status,
+        'dailySendLimit': connector.daily_send_limit,
+    }
+
+
+@router.post('/service/email-deliveries/readiness')
+async def service_email_delivery_readiness_for_crm(
+    form_data: ServiceEmailDeliveryRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_async_session),
+):
+    crm_claims = _authorize_service_or_crm(authorization, x_interact_service_token, 'workflow:run')
+    service_user = await _resolve_service_user(form_data.companyEmail, db)
+    _assert_crm_request_context(crm_claims, form_data, service_user)
+    context = _workflow_context_for_service_user(service_user, form_data, crm_claims)
+    company_user_id = str(context.company_user_id or '').strip()
+    if not company_user_id:
+        raise HTTPException(status_code=400, detail='Company context is required.')
+    reply_to = _crm_email_actor(crm_claims, form_data.productRole, form_data.companyEmail)
+    return await _crm_email_connector_readiness(company_user_id, reply_to)
+
+
+@router.post('/service/email-deliveries/send', response_model=EmailDeliveryModel)
+async def service_send_email_for_crm(
+    form_data: ServiceEmailSendRequest,
+    authorization: str | None = Header(default=None),
+    x_interact_service_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_async_session),
+):
+    crm_claims = _authorize_service_or_crm(authorization, x_interact_service_token, 'workflow:run')
+    service_user = await _resolve_service_user(form_data.companyEmail, db)
+    _assert_crm_request_context(crm_claims, form_data, service_user)
+    context = _workflow_context_for_service_user(service_user, form_data, crm_claims)
+    company_user_id = str(context.company_user_id or '').strip()
+    if not company_user_id:
+        raise HTTPException(status_code=400, detail='Company context is required.')
+    reply_to = _crm_email_actor(crm_claims, form_data.productRole, form_data.companyEmail)
+    readiness = await _crm_email_connector_readiness(company_user_id, reply_to)
+    if not readiness['available'] or not readiness['connectorId']:
+        raise HTTPException(status_code=409, detail=readiness['reason'])
+    connector = await InteractEmail.get_connector(readiness['connectorId'])
+    if not connector:
+        raise HTTPException(status_code=404, detail='Email connector was not found.')
+    return await send_resend_email(
+        connector,
+        {
+            'company_user_id': company_user_id,
+            'company_member_id': str(crm_claims.get('crm_user_id') or '') if crm_claims else None,
+            'company_member_role': context.company_member_role,
+            'group_ids': list(context.group_ids),
+            'user_id': f"crm:{crm_claims.get('crm_user_id')}" if crm_claims else service_user.id,
+            'service_principal': True,
+        },
+        EmailSendRequest(
+            connector_id=connector.id,
+            to=form_data.to,
+            cc=form_data.cc,
+            subject=form_data.subject,
+            text=form_data.text,
+            html=form_data.html,
+            reply_to=reply_to,
+            idempotency_key=form_data.idempotencyKey,
+            payload_hash=form_data.payloadHash,
+        ),
     )
 
 

@@ -335,16 +335,18 @@ def test_resend_server_error_is_reported_as_service_unavailable():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('payload_reply_to', 'expected_reply_to'),
+    ('payload_reply_to', 'expected_reply_to', 'existing_status'),
     [
-        ('sales-owner@example.com', 'sales-owner@example.com'),
-        (None, 'service@example.com'),
+        ('sales-owner@example.com', 'sales-owner@example.com', None),
+        (None, 'service@example.com', None),
+        ('sales-owner@example.com', 'sales-owner@example.com', 'failed'),
     ],
 )
 async def test_campaign_delivery_reaches_provider_and_records_sent_status(
     monkeypatch,
     payload_reply_to,
     expected_reply_to,
+    existing_status,
 ):
     connector = SimpleNamespace(
         id='connector-1',
@@ -370,13 +372,13 @@ async def test_campaign_delivery_reaches_provider_and_records_sent_status(
         id='delivery-1',
         company_user_id='company-1',
         payload_hash='a' * 64,
-        status='sending',
+        status=existing_status or 'sending',
         provider_message_id=None,
     )
     recorded = {}
 
-    async def no_existing_delivery(_key):
-        return None
+    async def get_existing_delivery(_key):
+        return delivery if existing_status else None
 
     async def create_delivery(**values):
         recorded['created'] = values
@@ -416,7 +418,7 @@ async def test_campaign_delivery_reaches_provider_and_records_sent_status(
             return FakeResponse()
 
     monkeypatch.setattr(email_router.InteractEmail, 'decrypt_connector_api_key', lambda _connector: 're_test_key')
-    monkeypatch.setattr(email_router.InteractEmail, 'get_delivery_by_idempotency_key', no_existing_delivery)
+    monkeypatch.setattr(email_router.InteractEmail, 'get_delivery_by_idempotency_key', get_existing_delivery)
     monkeypatch.setattr(email_router.InteractEmail, 'create_delivery', create_delivery)
     monkeypatch.setattr(email_router.InteractEmail, 'update_delivery', update_delivery)
     monkeypatch.setattr(email_router, 'is_billing_enabled', lambda: False)
@@ -442,9 +444,12 @@ async def test_campaign_delivery_reaches_provider_and_records_sent_status(
     assert recorded['provider_url'].endswith('/emails')
     assert recorded['provider_request']['json']['to'] == ['buyer@example.com']
     assert recorded['provider_request']['json']['reply_to'] == expected_reply_to
-    assert recorded['created']['workflow_id'] == 'workflow-1'
-    assert recorded['created']['from_address'] == 'noreply@example.com'
-    assert recorded['created']['reply_to'] == expected_reply_to
+    if existing_status:
+        assert 'created' not in recorded
+    else:
+        assert recorded['created']['workflow_id'] == 'workflow-1'
+        assert recorded['created']['from_address'] == 'noreply@example.com'
+        assert recorded['created']['reply_to'] == expected_reply_to
     assert result.status == 'sent'
     assert result.provider_message_id == 'resend-message-1'
 

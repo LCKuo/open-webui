@@ -300,16 +300,24 @@ async def send_resend_email(
             raise HTTPException(status_code=409, detail='Idempotency key was already used for different email content.')
         if existing_delivery.company_user_id != connector.company_user_id:
             raise HTTPException(status_code=409, detail='Idempotency key conflicts with another company request.')
-        return existing_delivery
-    daily_limit = connector.daily_send_limit
-    if is_billing_enabled():
-        entitlements = await InteractBillingClient().semantic_entitlements(connector.company_user_id)
-        if not entitlements.get('operational'):
-            raise HTTPException(status_code=403, detail='Company email entitlement is not operational.')
-        plan_limit = int((entitlements.get('limits') or {}).get('dailyEmails') or 0)
-        daily_limit = min(daily_limit, plan_limit)
-    if daily_limit <= 0:
-        raise HTTPException(status_code=429, detail='Email connector daily send limit has been reached.')
+        if existing_delivery.status in {'sent', 'delivered', 'opened', 'clicked'}:
+            return existing_delivery
+        delivery = await InteractEmail.update_delivery(
+            existing_delivery.id,
+            status='sending',
+            error_code=None,
+            error_message=None,
+        )
+    else:
+        daily_limit = connector.daily_send_limit
+        if is_billing_enabled():
+            entitlements = await InteractBillingClient().semantic_entitlements(connector.company_user_id)
+            if not entitlements.get('operational'):
+                raise HTTPException(status_code=403, detail='Company email entitlement is not operational.')
+            plan_limit = int((entitlements.get('limits') or {}).get('dailyEmails') or 0)
+            daily_limit = min(daily_limit, plan_limit)
+        if daily_limit <= 0:
+            raise HTTPException(status_code=429, detail='Email connector daily send limit has been reached.')
 
     body = {
         'from': f'{connector.from_name} <{connector.from_address}>' if connector.from_name else connector.from_address,
@@ -321,33 +329,41 @@ async def send_resend_email(
         'reply_to': effective_reply_to,
     }
     body = {key: value for key, value in body.items() if value not in (None, [], '')}
-    try:
-        delivery, created = await InteractEmail.create_delivery(
-            daily_limit=daily_limit,
-            company_user_id=connector.company_user_id,
-            connector_id=connector.id,
-            workflow_id=payload.workflow_id,
-            workflow_run_id=payload.workflow_run_id,
-            requested_by=str(context.get('user_id') or context.get('company_member_id') or connector.company_user_id),
-            channel_id=payload.channel_id,
-            from_address=connector.from_address,
-            reply_to=effective_reply_to,
-            idempotency_key=payload.idempotency_key,
-            status='sending',
-            recipient_count=len(to) + len(cc),
-            recipient_domains=sorted({_domain(address) for address in [*to, *cc]}),
-            to_encrypted=_encrypt(json.dumps(to, ensure_ascii=False)),
-            cc_encrypted=_encrypt(json.dumps(cc, ensure_ascii=False)) if cc else None,
-            subject_encrypted=_encrypt(payload.subject),
-            content_encrypted=_encrypt(json.dumps({'text': payload.text, 'html': payload.html}, ensure_ascii=False)),
-            payload_hash=payload.payload_hash,
-        )
-    except EmailDailyLimitExceeded as exc:
-        raise HTTPException(status_code=429, detail='Email connector daily send limit has been reached.') from exc
-    if not created:
-        if delivery.payload_hash != payload.payload_hash or delivery.company_user_id != connector.company_user_id:
-            raise HTTPException(status_code=409, detail='Idempotency key was already used for a different request.')
-        return delivery
+    if not existing_delivery:
+        try:
+            delivery, created = await InteractEmail.create_delivery(
+                daily_limit=daily_limit,
+                company_user_id=connector.company_user_id,
+                connector_id=connector.id,
+                workflow_id=payload.workflow_id,
+                workflow_run_id=payload.workflow_run_id,
+                requested_by=str(context.get('user_id') or context.get('company_member_id') or connector.company_user_id),
+                channel_id=payload.channel_id,
+                from_address=connector.from_address,
+                reply_to=effective_reply_to,
+                idempotency_key=payload.idempotency_key,
+                status='sending',
+                recipient_count=len(to) + len(cc),
+                recipient_domains=sorted({_domain(address) for address in [*to, *cc]}),
+                to_encrypted=_encrypt(json.dumps(to, ensure_ascii=False)),
+                cc_encrypted=_encrypt(json.dumps(cc, ensure_ascii=False)) if cc else None,
+                subject_encrypted=_encrypt(payload.subject),
+                content_encrypted=_encrypt(json.dumps({'text': payload.text, 'html': payload.html}, ensure_ascii=False)),
+                payload_hash=payload.payload_hash,
+            )
+        except EmailDailyLimitExceeded as exc:
+            raise HTTPException(status_code=429, detail='Email connector daily send limit has been reached.') from exc
+        if not created:
+            if delivery.payload_hash != payload.payload_hash or delivery.company_user_id != connector.company_user_id:
+                raise HTTPException(status_code=409, detail='Idempotency key was already used for a different request.')
+            if delivery.status in {'sent', 'delivered', 'opened', 'clicked'}:
+                return delivery
+            delivery = await InteractEmail.update_delivery(
+                delivery.id,
+                status='sending',
+                error_code=None,
+                error_message=None,
+            )
     timeout = aiohttp.ClientTimeout(total=20)
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -379,10 +395,22 @@ async def send_resend_email(
                         error_message=message,
                     )
                     raise HTTPException(status_code=client_status, detail=client_message)
+                provider_message_id = str(data.get('id') or '').strip()
+                if not provider_message_id:
+                    await InteractEmail.update_delivery(
+                        delivery.id,
+                        status='failed',
+                        error_code='PROVIDER-MISSING-ID',
+                        error_message='Resend accepted the request without returning a message id.',
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail='寄信服務未回傳投遞 ID，系統未將這封信標記為已寄出。',
+                    )
                 return await InteractEmail.update_delivery(
                     delivery.id,
                     status='sent',
-                    provider_message_id=str(data.get('id') or '') or None,
+                    provider_message_id=provider_message_id,
                     sent_at=int(time.time_ns()),
                     error_code=None,
                     error_message=None,

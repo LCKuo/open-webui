@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from open_webui.retrieval.utils import _extract_public_links
 from open_webui.retrieval.web import utils as web_utils
 from open_webui.routers.workflows import (
@@ -11,6 +12,7 @@ from open_webui.routers.workflows import (
     _contact_navigation_links,
     _contact_official_websites,
     _contact_target_candidate,
+    _crm_email_actor,
     _crm_token_allows_workflow,
     _customer_contact_query_plan,
     _customer_request_context,
@@ -243,6 +245,34 @@ def test_managed_prospecting_workflow_is_implicitly_granted_only_to_its_company(
         {**restricted_claims, 'company_user_id': 'company-b'},
         workflow,
     ) is False
+
+
+def test_crm_email_actor_uses_the_authenticated_employee_instead_of_connector_default():
+    assert _crm_email_actor(
+        {
+            'crm_user_role': 'sales',
+            'crm_user_email': 'AM.Owner@Example.com',
+            'product_team_codes': ['am'],
+        },
+        'am',
+        'company@example.com',
+    ) == 'am.owner@example.com'
+
+    with pytest.raises(HTTPException) as denied:
+        _crm_email_actor(
+            {
+                'crm_user_role': 'sales',
+                'crm_user_email': 'bd@example.com',
+                'product_team_codes': ['bd'],
+            },
+            'am',
+            'company@example.com',
+        )
+    assert getattr(denied.value, 'status_code', None) == 403
+
+    with pytest.raises(HTTPException) as missing_identity:
+        _crm_email_actor(None, 'am', 'company@example.com')
+    assert getattr(missing_identity.value, 'status_code', None) == 403
 
 
 @pytest.mark.asyncio
