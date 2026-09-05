@@ -994,6 +994,7 @@ export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
 		description:
 			'接收 CRM 已核准活動的單一收件人與公版內容，附加停止聯絡連結、核對內容後逐封寄送。',
 		nodeTypes: [
+			'user_input',
 			'form_input',
 			'email_campaign_compose',
 			'campaign_approval_gate',
@@ -1201,7 +1202,33 @@ businessActivities 必須描述候選公司公開資料顯示的實際營業項�
 	}
 
 	if (templateId === 'crm-prospect-email-campaign') {
-		const [input, compose, approval, send, summary] = nodes;
+		const [guidance, input, compose, approval, send, summary] = nodes;
+		guidance.data.label = 'CRM 已核准寄送引導';
+		guidance.data.config = {
+			launch: {
+				version: 1,
+				mode: 'form_input',
+				buttonLabel: '執行已核准寄送',
+				instruction: '由 CRM 傳入已由主管確認的單一收件人與信件內容。',
+				followUpMode: 'chat_about_result',
+				confirmation: 'always',
+				inputSchema: {
+					type: 'object',
+					properties: {
+						message: {
+							type: 'string',
+							title: '已核准寄送任務',
+							description: '由 CRM 自動產生，不需要人工輸入。',
+							minLength: 1,
+							maxLength: 500
+						}
+					},
+					required: ['message'],
+					additionalProperties: false
+				},
+				defaultInput: {}
+			}
+		};
 		input.data.label = 'CRM 活動收件人';
 		input.data.config = {
 			...input.data.config,

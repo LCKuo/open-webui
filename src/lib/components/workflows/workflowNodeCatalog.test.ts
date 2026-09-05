@@ -44,6 +44,7 @@ describe('AI prospect discovery template', () => {
 		const types = graph.nodes.map((node) => node.data.type);
 
 		expect(types).toEqual([
+			'user_input',
 			'form_input',
 			'email_campaign_compose',
 			'campaign_approval_gate',
@@ -52,5 +53,11 @@ describe('AI prospect discovery template', () => {
 			'webhook_response'
 		]);
 		expect(graph.purpose).toBe('prospecting_email_campaign');
+		expect(graph.nodes[0]?.data.config?.launch).toEqual(
+			expect.objectContaining({
+				mode: 'form_input',
+				confirmation: 'always'
+			})
+		);
 	});
 });
