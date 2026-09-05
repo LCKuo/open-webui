@@ -55,6 +55,8 @@ export type EmailDelivery = {
 	connector_id: string;
 	workflow_id: string | null;
 	workflow_run_id: string | null;
+	from_address: string | null;
+	reply_to: string | null;
 	provider_message_id: string | null;
 	status: string;
 	recipient_count: number;

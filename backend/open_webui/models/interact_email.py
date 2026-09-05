@@ -104,6 +104,8 @@ class InteractEmailDelivery(Base):
     workflow_run_id = Column(Text, nullable=True, index=True)
     requested_by = Column(Text, nullable=False)
     channel_id = Column(Text, nullable=True)
+    from_address = Column(Text, nullable=True)
+    reply_to = Column(Text, nullable=True)
     provider_message_id = Column(Text, nullable=True, index=True)
     idempotency_key = Column(Text, nullable=False, unique=True)
     status = Column(Text, nullable=False, default='queued')
@@ -295,6 +297,8 @@ class EmailDeliveryModel(BaseModel):
     workflow_run_id: Optional[str] = None
     requested_by: str
     channel_id: Optional[str] = None
+    from_address: Optional[str] = None
+    reply_to: Optional[str] = None
     provider_message_id: Optional[str] = None
     idempotency_key: str
     status: str
@@ -345,9 +349,7 @@ class InteractEmailTable:
     @staticmethod
     def _ensure_control_plane_columns(sync_connection) -> None:
         table = InteractEmailConnector.__table__
-        columns = {
-            column['name'] for column in inspect(sync_connection).get_columns(table.name, schema=table.schema)
-        }
+        columns = {column['name'] for column in inspect(sync_connection).get_columns(table.name, schema=table.schema)}
         additions = {
             'managed_by': "TEXT NOT NULL DEFAULT 'company_portal'",
             'control_plane_revision': 'INTEGER NOT NULL DEFAULT 0',
@@ -368,20 +370,10 @@ class InteractEmailTable:
     ) -> list[EmailConnectorModel]:
         await self.ensure_tables()
         async with get_async_db_context() as db:
-            statement = select(InteractEmailConnector).where(
-                InteractEmailConnector.company_user_id == company_user_id
-            )
+            statement = select(InteractEmailConnector).where(InteractEmailConnector.company_user_id == company_user_id)
             if not include_quarantined:
                 statement = statement.where(InteractEmailConnector.control_plane_status == 'active')
-            rows = (
-                (
-                    await db.execute(
-                        statement.order_by(InteractEmailConnector.updated_at.desc())
-                    )
-                )
-                .scalars()
-                .all()
-            )
+            rows = (await db.execute(statement.order_by(InteractEmailConnector.updated_at.desc()))).scalars().all()
             return [_connector_model(row) for row in rows]
 
     async def get_connector(self, connector_id: str) -> Optional[InteractEmailConnector]:
@@ -569,19 +561,13 @@ class InteractEmailTable:
     ) -> list[EmailDeliveryModel]:
         await self.ensure_tables()
         async with get_async_db_context() as db:
-            statement = select(InteractEmailDelivery).where(
-                InteractEmailDelivery.company_user_id == company_user_id
-            )
+            statement = select(InteractEmailDelivery).where(InteractEmailDelivery.company_user_id == company_user_id)
             if workflow_ids:
-                statement = statement.where(
-                    InteractEmailDelivery.workflow_id.in_(workflow_ids)
-                )
+                statement = statement.where(InteractEmailDelivery.workflow_id.in_(workflow_ids))
             rows = (
                 (
                     await db.execute(
-                        statement
-                        .order_by(InteractEmailDelivery.created_at.desc())
-                        .limit(max(1, min(limit, 500)))
+                        statement.order_by(InteractEmailDelivery.created_at.desc()).limit(max(1, min(limit, 500)))
                     )
                 )
                 .scalars()

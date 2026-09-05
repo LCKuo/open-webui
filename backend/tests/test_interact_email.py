@@ -334,7 +334,18 @@ def test_resend_server_error_is_reported_as_service_unavailable():
 
 
 @pytest.mark.asyncio
-async def test_campaign_delivery_reaches_provider_and_records_sent_status(monkeypatch):
+@pytest.mark.parametrize(
+    ('payload_reply_to', 'expected_reply_to'),
+    [
+        ('sales-owner@example.com', 'sales-owner@example.com'),
+        (None, 'service@example.com'),
+    ],
+)
+async def test_campaign_delivery_reaches_provider_and_records_sent_status(
+    monkeypatch,
+    payload_reply_to,
+    expected_reply_to,
+):
     connector = SimpleNamespace(
         id='connector-1',
         company_user_id='company-1',
@@ -350,6 +361,7 @@ async def test_campaign_delivery_reaches_provider_and_records_sent_status(monkey
         cc_policy={'default_cc': [], 'allowed_domains': [], 'max_cc': 10},
         max_recipients_per_send=20,
         daily_send_limit=100,
+        company_email='service@example.com',
         from_name='Chengsyin Team',
         from_address='noreply@example.com',
         reply_to='owner@example.com',
@@ -419,6 +431,7 @@ async def test_campaign_delivery_reaches_provider_and_records_sent_status(monkey
             to=['buyer@example.com'],
             subject='Campaign validation',
             text='This is a controlled campaign delivery test.',
+            reply_to=payload_reply_to,
             workflow_id='workflow-1',
             workflow_run_id='run-1',
             idempotency_key='campaign-validation-1',
@@ -428,7 +441,10 @@ async def test_campaign_delivery_reaches_provider_and_records_sent_status(monkey
 
     assert recorded['provider_url'].endswith('/emails')
     assert recorded['provider_request']['json']['to'] == ['buyer@example.com']
+    assert recorded['provider_request']['json']['reply_to'] == expected_reply_to
     assert recorded['created']['workflow_id'] == 'workflow-1'
+    assert recorded['created']['from_address'] == 'noreply@example.com'
+    assert recorded['created']['reply_to'] == expected_reply_to
     assert result.status == 'sent'
     assert result.provider_message_id == 'resend-message-1'
 

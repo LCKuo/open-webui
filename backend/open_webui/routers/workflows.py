@@ -152,18 +152,19 @@ def _normalize_discovery_source_url(value: str) -> str:
         return ''
     host = parsed.hostname.lower()
     if parsed.port and not (
-        (parsed.scheme == 'http' and parsed.port == 80)
-        or (parsed.scheme == 'https' and parsed.port == 443)
+        (parsed.scheme == 'http' and parsed.port == 80) or (parsed.scheme == 'https' and parsed.port == 443)
     ):
         host = f'{host}:{parsed.port}'
     path = parsed.path.rstrip('/') or '/'
-    query = urlencode(sorted(
-        (key, item)
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        if not key.lower().startswith('utm_')
-        and key.lower() not in _DISCOVERY_TRACKING_QUERY_KEYS
-    ))
+    query = urlencode(
+        sorted(
+            (key, item)
+            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith('utm_') and key.lower() not in _DISCOVERY_TRACKING_QUERY_KEYS
+        )
+    )
     return f'{parsed.scheme}://{host}{path}' + (f'?{query}' if query else '')
+
 
 PAGE_ITEM_COUNT = 30
 MANAGED_PROSPECTING_WORKFLOW_KEY = 'interact.crm.prospecting.discovery'
@@ -465,9 +466,7 @@ PROSPECT_JOINED_EMAIL_BOUNDARY_PATTERN = re.compile(
     r'(?i)(\.(?:com|net|org|edu|gov|mil|biz|info|io|ai|co)(?:\.[a-z]{2})?)'
     r'(?=[a-z0-9][a-z0-9_.+-]{0,63}@)'
 )
-PROSPECT_PHONE_PREFIXED_EMAIL_LOCAL_PATTERN = re.compile(
-    r'(?i)^(?:\+?\d[\d() ]{0,8})?\d{2,4}-\d{4,8}(?=[a-z])'
-)
+PROSPECT_PHONE_PREFIXED_EMAIL_LOCAL_PATTERN = re.compile(r'(?i)^(?:\+?\d[\d() ]{0,8})?\d{2,4}-\d{4,8}(?=[a-z])')
 PROSPECT_ROLE_LOCALS = {
     'business',
     'contact',
@@ -670,8 +669,7 @@ def _official_contact_page_urls(website: str) -> list[str]:
         return []
 
     origins = [
-        f'{urlparse(variant).scheme}://{urlparse(variant).netloc}/'
-        for variant in _official_website_variants(website)
+        f'{urlparse(variant).scheme}://{urlparse(variant).netloc}/' for variant in _official_website_variants(website)
     ]
     path_segments = [segment for segment in parsed.path.split('/') if segment]
     locale_prefix = ''
@@ -726,22 +724,22 @@ def _contact_target_candidate(
     search_brief: dict[str, Any],
 ) -> dict[str, Any] | None:
     candidate_identity = _normalized_company_identity(candidate.get('name'))
-    candidate_domain = (
-        urlparse(str(candidate.get('website') or '')).hostname or ''
-    ).lower().removeprefix('www.')
+    candidate_domain = (urlparse(str(candidate.get('website') or '')).hostname or '').lower().removeprefix('www.')
     for raw_target in search_brief.get('targetCandidates') or []:
         if not isinstance(raw_target, dict):
             continue
         target_identity = _normalized_company_identity(raw_target.get('name'))
         if candidate_identity and candidate_identity == target_identity:
             return raw_target
-        target_domain = (
-            urlparse(str(raw_target.get('website') or '')).hostname or ''
-        ).lower().removeprefix('www.')
-        if candidate_domain and target_domain and (
-            candidate_domain == target_domain
-            or candidate_domain.endswith(f'.{target_domain}')
-            or target_domain.endswith(f'.{candidate_domain}')
+        target_domain = (urlparse(str(raw_target.get('website') or '')).hostname or '').lower().removeprefix('www.')
+        if (
+            candidate_domain
+            and target_domain
+            and (
+                candidate_domain == target_domain
+                or candidate_domain.endswith(f'.{target_domain}')
+                or target_domain.endswith(f'.{candidate_domain}')
+            )
         ):
             return raw_target
     return None
@@ -809,10 +807,7 @@ def _contact_navigation_links(
             parsed.scheme not in {'http', 'https'}
             or not source_domain
             or url in seen
-            or not any(
-                source_domain == domain or source_domain.endswith(f'.{domain}')
-                for domain in normalized_domains
-            )
+            or not any(source_domain == domain or source_domain.endswith(f'.{domain}') for domain in normalized_domains)
         ):
             continue
         text = re.sub(r'[\s\-_｜|/]+', '', str(link.get('text') or '').strip().lower())
@@ -2307,12 +2302,8 @@ async def _execute_workflow(
 
             raw_allowed_domains = config.get('allowed_domains')
             raw_blocked_domains = config.get('blocked_domains')
-            dynamic_blocked_domains = data.get(
-                str(config.get('blocked_domains_input_key') or 'blocked_domains')
-            )
-            dynamic_blocked_urls = data.get(
-                str(config.get('blocked_urls_input_key') or 'blocked_urls')
-            )
+            dynamic_blocked_domains = data.get(str(config.get('blocked_domains_input_key') or 'blocked_domains'))
+            dynamic_blocked_urls = data.get(str(config.get('blocked_urls_input_key') or 'blocked_urls'))
             allowed_domains = {
                 str(item).strip().lower()
                 for item in (raw_allowed_domains if isinstance(raw_allowed_domains, list) else [])
@@ -2499,11 +2490,7 @@ async def _execute_workflow(
                 if not isinstance(raw_candidate, dict):
                     return None, []
                 candidate = dict(raw_candidate)
-                target_candidate = (
-                    _contact_target_candidate(candidate, search_brief)
-                    if contact_only_mode
-                    else None
-                )
+                target_candidate = _contact_target_candidate(candidate, search_brief) if contact_only_mode else None
                 if target_candidate:
                     target_website = str(target_candidate.get('website') or '').strip()
                     if urlparse(target_website).scheme in {'http', 'https'}:
@@ -2585,9 +2572,7 @@ async def _execute_workflow(
                     for website_order, official_website in enumerate(official_websites):
                         source_domain = (urlparse(official_website).hostname or '').lower().removeprefix('www.')
                         navigation_links: list[dict[str, Any]] = []
-                        for variant_order, website_variant in enumerate(
-                            _official_website_variants(official_website)
-                        ):
+                        for variant_order, website_variant in enumerate(_official_website_variants(official_website)):
                             if website_variant not in seen_urls:
                                 seen_urls.add(website_variant)
                                 search_items.append(
@@ -2610,12 +2595,12 @@ async def _execute_workflow(
                             if not isinstance(page, dict):
                                 continue
                             page_domain = (
-                                urlparse(str(page.get('source_url') or '')).hostname or ''
-                            ).lower().removeprefix('www.')
+                                (urlparse(str(page.get('source_url') or '')).hostname or '')
+                                .lower()
+                                .removeprefix('www.')
+                            )
                             navigation_links = _contact_navigation_links(
-                                page.get('links')
-                                if isinstance(page.get('links'), list)
-                                else [],
+                                page.get('links') if isinstance(page.get('links'), list) else [],
                                 [source_domain, page_domain],
                             )
                             if navigation_links:
@@ -2629,8 +2614,7 @@ async def _execute_workflow(
                                 search_items.append(
                                     {
                                         'query': 'official_contact_navigation',
-                                        'title': str(link.get('text') or '').strip()
-                                        or f'{company_name} 官方聯絡頁',
+                                        'title': str(link.get('text') or '').strip() or f'{company_name} 官方聯絡頁',
                                         'url': contact_url,
                                         'snippet': '',
                                         '_official': True,
@@ -2640,9 +2624,7 @@ async def _execute_workflow(
                                     }
                                 )
                         else:
-                            for probe_order, contact_url in enumerate(
-                                _official_contact_page_urls(official_website)
-                            ):
+                            for probe_order, contact_url in enumerate(_official_contact_page_urls(official_website)):
                                 if contact_url in seen_urls:
                                     continue
                                 seen_urls.add(contact_url)
@@ -3008,11 +2990,16 @@ async def _execute_workflow(
             if source.get('status') and source.get('status') != 'found':
                 raise WorkflowRuntimeError(f'Customer contact lookup is not ready: {source.get("status")}.')
 
+            compose_values = {
+                **workflow_input.get('data', {}),
+                **source,
+                'message': workflow_input.get('message', ''),
+            }
+
             def render(template: str) -> str:
-                values = {**workflow_input.get('data', {}), **source, 'message': workflow_input.get('message', '')}
                 return re.sub(
                     r'\{\{\s*([^{}]+?)\s*\}\}',
-                    lambda match: str(values.get(match.group(1).strip(), match.group(0))),
+                    lambda match: str(compose_values.get(match.group(1).strip(), match.group(0))),
                     template,
                 )
 
@@ -3081,6 +3068,7 @@ async def _execute_workflow(
                 'subject': subject,
                 'text': text_body,
                 'html': None,
+                'reply_to': compose_values.get('reply_to'),
                 'customer': source,
             }
 
@@ -3271,9 +3259,7 @@ async def _execute_workflow(
         completed_usage = execution_meter.get('usage') or {}
         failed_attempt_usage = getattr(exc, 'execution_usage', None) or {}
         exc.execution_usage = merge_usage(completed_usage, failed_attempt_usage)
-        exc.model_calls = int(execution_meter.get('model_calls') or 0) + int(
-            getattr(exc, 'model_calls', 0) or 0
-        )
+        exc.model_calls = int(execution_meter.get('model_calls') or 0) + int(getattr(exc, 'model_calls', 0) or 0)
         raise
     result['workflow_id'] = workflow.id
     result['workflow_name'] = workflow.name
@@ -3394,7 +3380,8 @@ def _verified_channel_access_context(
         company_user_id=company_user_id,
         company_member_id=str(
             channel_context.get('accessSubjectId') or channel_context.get('companyMemberId') or ''
-        ).strip() or None,
+        ).strip()
+        or None,
         company_member_role=member_role,
         group_ids={str(item) for item in channel_context.get('groupIds') or [] if str(item)},
         channel_id=channel_id,

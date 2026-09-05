@@ -193,8 +193,7 @@ def _resend_error_response(status: int, code: Any, message: Any) -> tuple[int, s
         )
     normalized_code = str(code or '').strip().lower()
     if status in {401, 403} and (
-        'api key' in normalized
-        or normalized_code in {'invalid_api_key', 'restricted_api_key'}
+        'api key' in normalized or normalized_code in {'invalid_api_key', 'restricted_api_key'}
     ):
         return 422, 'Resend API Key 無效或權限不足。請確認 Key 仍有效，且具有寄信權限。'
     if status == 429:
@@ -287,9 +286,12 @@ async def send_resend_email(
     to = _clean_addresses(payload.to)
     cc = _clean_addresses(payload.cc)
     to, cc = _apply_recipient_policy(connector, to, cc)
-    reply_to_values = (
-        _clean_addresses([payload.reply_to or connector.reply_to]) if (payload.reply_to or connector.reply_to) else []
-    )
+    requested_reply_to = payload.reply_to
+    if not requested_reply_to and context.get('service_principal'):
+        requested_reply_to = connector.company_email
+    requested_reply_to = requested_reply_to or connector.reply_to
+    reply_to_values = _clean_addresses([requested_reply_to]) if requested_reply_to else []
+    effective_reply_to = reply_to_values[0] if reply_to_values else None
     if not payload.text and not payload.html:
         raise HTTPException(status_code=400, detail='Email requires text or HTML content.')
     existing_delivery = await InteractEmail.get_delivery_by_idempotency_key(payload.idempotency_key)
@@ -316,7 +318,7 @@ async def send_resend_email(
         'subject': payload.subject,
         'text': payload.text,
         'html': payload.html,
-        'reply_to': reply_to_values[0] if reply_to_values else None,
+        'reply_to': effective_reply_to,
     }
     body = {key: value for key, value in body.items() if value not in (None, [], '')}
     try:
@@ -328,6 +330,8 @@ async def send_resend_email(
             workflow_run_id=payload.workflow_run_id,
             requested_by=str(context.get('user_id') or context.get('company_member_id') or connector.company_user_id),
             channel_id=payload.channel_id,
+            from_address=connector.from_address,
+            reply_to=effective_reply_to,
             idempotency_key=payload.idempotency_key,
             status='sending',
             recipient_count=len(to) + len(cc),
