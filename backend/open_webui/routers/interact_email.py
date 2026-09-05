@@ -223,6 +223,7 @@ def ensure_email_connector_allowed(
     if (
         not allow_disabled
         and not direct_crm_delivery
+        and workflow_id is not None
         and connector.allowed_workflow_ids
         and workflow_id not in connector.allowed_workflow_ids
     ):
@@ -230,10 +231,19 @@ def ensure_email_connector_allowed(
     if (
         not allow_disabled
         and not direct_crm_delivery
+        and channel_id is not None
         and connector.allowed_channel_ids
         and channel_id not in connector.allowed_channel_ids
     ):
         raise HTTPException(status_code=403, detail='目前來源管道未獲准使用企業寄信服務。')
+    if (
+        not allow_disabled
+        and not direct_crm_delivery
+        and workflow_id is None
+        and channel_id is None
+        and (connector.allowed_workflow_ids or connector.allowed_channel_ids)
+    ):
+        raise HTTPException(status_code=403, detail='寄送來源缺少工作流或管道身分，無法使用企業寄信服務。')
     if context.get('service_principal'):
         return
     role = str(context.get('company_member_role') or '').lower()

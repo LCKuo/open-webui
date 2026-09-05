@@ -190,7 +190,7 @@ def test_crm_service_principal_bypasses_seat_acl_but_not_workflow_acl():
         enabled=True,
         status='ready',
         allowed_workflow_ids=['workflow-1'],
-        allowed_channel_ids=[],
+        allowed_channel_ids=['line-1'],
         access_mode='company_admins',
         allowed_member_ids=[],
         allowed_group_ids=[],
@@ -225,9 +225,12 @@ def test_trusted_crm_direct_delivery_bypasses_route_acl_only():
         'company_member_role': 'member',
         'group_ids': [],
         'service_principal': True,
-        'trusted_product_delivery': 'crm',
     }
 
+    with pytest.raises(HTTPException):
+        ensure_email_connector_allowed(connector, context, None, None)
+
+    context['trusted_product_delivery'] = 'crm'
     ensure_email_connector_allowed(connector, context, None, None)
 
     context['company_user_id'] = 'company-2'
