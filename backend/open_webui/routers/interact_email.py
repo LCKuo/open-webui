@@ -24,7 +24,7 @@ from open_webui.models.workflows import Workflows
 from open_webui.utils.auth import get_verified_user
 from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
 from open_webui.utils.workflows import workflow_acl
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 router = APIRouter()
 RESEND_API_BASE = 'https://api.resend.com'
@@ -47,6 +47,29 @@ class EmailConnectorTestForm(BaseModel):
     recipient: str = Field(..., min_length=3, max_length=320)
 
 
+class EmailAttachmentRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=180)
+    path: HttpUrl
+    content_type: Optional[str] = Field(default=None, max_length=200)
+    size_bytes: Optional[int] = Field(default=None, gt=0, le=8 * 1024 * 1024)
+    checksum_sha256: Optional[str] = Field(default=None, pattern=r'^[0-9a-f]{64}$')
+
+    @field_validator('filename')
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        clean = value.strip()
+        if not clean or any(character in clean for character in ('\r', '\n', '/', '\\')):
+            raise ValueError('Attachment filename is invalid.')
+        return clean
+
+    @field_validator('path')
+    @classmethod
+    def validate_path(cls, value: HttpUrl) -> HttpUrl:
+        if value.scheme != 'https':
+            raise ValueError('Attachment path must use HTTPS.')
+        return value
+
+
 class ServiceEmailConnectorUpsertForm(EmailConnectorUpsertForm):
     companyUserId: str = Field(..., min_length=1, max_length=200)
     companyEmail: str = Field(..., min_length=3, max_length=320)
@@ -62,11 +85,19 @@ class EmailSendRequest(BaseModel):
     text: Optional[str] = Field(default=None, max_length=2_000_000)
     html: Optional[str] = Field(default=None, max_length=2_000_000)
     reply_to: Optional[str] = Field(default=None, max_length=320)
+    attachments: list[EmailAttachmentRequest] = Field(default_factory=list, max_length=5)
     workflow_id: Optional[str] = None
     workflow_run_id: Optional[str] = None
     channel_id: Optional[str] = None
     idempotency_key: str = Field(..., min_length=8, max_length=256)
     payload_hash: str = Field(..., min_length=32, max_length=128)
+
+    @model_validator(mode='after')
+    def validate_attachment_total(self):
+        known_total = sum(attachment.size_bytes or 0 for attachment in self.attachments)
+        if known_total > 15 * 1024 * 1024:
+            raise ValueError('Attachment total exceeds 15 MB.')
+        return self
 
     @field_validator('subject')
     @classmethod
@@ -348,6 +379,10 @@ async def send_resend_email(
         'text': payload.text,
         'html': payload.html,
         'reply_to': effective_reply_to,
+        'attachments': [
+            {'filename': attachment.filename, 'path': str(attachment.path)}
+            for attachment in payload.attachments
+        ] or None,
     }
     body = {key: value for key, value in body.items() if value not in (None, [], '')}
     if not existing_delivery:
@@ -369,7 +404,19 @@ async def send_resend_email(
                 to_encrypted=_encrypt(json.dumps(to, ensure_ascii=False)),
                 cc_encrypted=_encrypt(json.dumps(cc, ensure_ascii=False)) if cc else None,
                 subject_encrypted=_encrypt(payload.subject),
-                content_encrypted=_encrypt(json.dumps({'text': payload.text, 'html': payload.html}, ensure_ascii=False)),
+                content_encrypted=_encrypt(json.dumps({
+                    'text': payload.text,
+                    'html': payload.html,
+                    'attachments': [
+                        {
+                            'filename': attachment.filename,
+                            'content_type': attachment.content_type,
+                            'size_bytes': attachment.size_bytes,
+                            'checksum_sha256': attachment.checksum_sha256,
+                        }
+                        for attachment in payload.attachments
+                    ],
+                }, ensure_ascii=False)),
                 payload_hash=payload.payload_hash,
             )
         except EmailDailyLimitExceeded as exc:

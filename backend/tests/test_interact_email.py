@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 from open_webui.routers.interact_email import (
+    EmailAttachmentRequest,
     EmailSendRequest,
     _apply_recipient_policy,
     _resend_error_response,
@@ -143,6 +144,13 @@ def test_connector_rejects_email_header_injection():
             from_name='Support\r\nBcc: attacker@example.com',
             from_address='support@example.com',
         )
+
+
+def test_email_attachment_requires_safe_filename_and_https_path():
+    with pytest.raises(ValidationError):
+        EmailAttachmentRequest(filename='../secret.pdf', path='https://crm.example.com/file')
+    with pytest.raises(ValidationError):
+        EmailAttachmentRequest(filename='card.jpg', path='http://crm.example.com/file')
 
 
 def test_connector_secrets_are_trimmed_and_selected_access_requires_targets():
@@ -464,6 +472,13 @@ async def test_campaign_delivery_reaches_provider_and_records_sent_status(
             subject='Campaign validation',
             text='This is a controlled campaign delivery test.',
             reply_to=payload_reply_to,
+            attachments=[{
+                'filename': 'company-card.jpg',
+                'path': 'https://crm.example.com/api/email-attachments/18?signature=test',
+                'content_type': 'image/jpeg',
+                'size_bytes': 168471,
+                'checksum_sha256': 'b' * 64,
+            }],
             workflow_id='workflow-1',
             workflow_run_id='run-1',
             idempotency_key='campaign-validation-1',
@@ -474,12 +489,17 @@ async def test_campaign_delivery_reaches_provider_and_records_sent_status(
     assert recorded['provider_url'].endswith('/emails')
     assert recorded['provider_request']['json']['to'] == ['buyer@example.com']
     assert recorded['provider_request']['json']['reply_to'] == expected_reply_to
+    assert recorded['provider_request']['json']['attachments'] == [{
+        'filename': 'company-card.jpg',
+        'path': 'https://crm.example.com/api/email-attachments/18?signature=test',
+    }]
     if existing_status:
         assert 'created' not in recorded
     else:
         assert recorded['created']['workflow_id'] == 'workflow-1'
         assert recorded['created']['from_address'] == 'noreply@example.com'
         assert recorded['created']['reply_to'] == expected_reply_to
+        assert 'company-card.jpg' in recorded['created']['content_encrypted']
     assert result.status == 'sent'
     assert result.provider_message_id == 'resend-message-1'
 

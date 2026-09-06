@@ -41,6 +41,7 @@ from open_webui.models.workflows import (
 )
 from open_webui.retrieval.utils import get_public_page_links
 from open_webui.routers.interact_email import (
+    EmailAttachmentRequest,
     EmailSendRequest,
     ensure_email_connector_allowed,
     send_resend_email,
@@ -1128,6 +1129,7 @@ class ServiceEmailSendRequest(ServiceEmailDeliveryRequest):
     subject: str = Field(..., min_length=1, max_length=998)
     text: str = Field(..., min_length=1, max_length=2_000_000)
     html: Optional[str] = Field(default=None, max_length=2_000_000)
+    attachments: list[EmailAttachmentRequest] = Field(default_factory=list, max_length=5)
     idempotencyKey: str = Field(..., min_length=8, max_length=256)
     payloadHash: str = Field(..., min_length=32, max_length=128)
 
@@ -3102,6 +3104,13 @@ async def _execute_workflow(
             html_body = str(values.get('html') or values.get('html_body') or '').strip() or None
             subject, text_body = _validate_email_draft_content(subject, text_body)
             unsubscribe_url = str(values.get('unsubscribe_url') or '').strip()
+            try:
+                attachments = [
+                    EmailAttachmentRequest.model_validate(item).model_dump(mode='json')
+                    for item in (values.get('attachments') or [])
+                ]
+            except Exception as exc:
+                raise WorkflowRuntimeError('Campaign email attachment metadata is invalid.') from exc
             require_unsubscribe = config.get('require_unsubscribe', True) is not False
             if require_unsubscribe:
                 parsed_unsubscribe = urlparse(unsubscribe_url)
@@ -3122,6 +3131,7 @@ async def _execute_workflow(
                 'text': text_body,
                 'html': html_body,
                 'reply_to': values.get('reply_to'),
+                'attachments': attachments,
                 'customer': {
                     'customer_id': values.get('candidate_id'),
                     'customer_name': values.get('company_name'),
@@ -3285,6 +3295,7 @@ async def _execute_workflow(
                     text=email_payload.get('text'),
                     html=email_payload.get('html'),
                     reply_to=email_payload.get('reply_to'),
+                    attachments=email_payload.get('attachments') or [],
                     workflow_id=workflow.id,
                     workflow_run_id=run_id,
                     channel_id=form_data.channel_id,
@@ -4478,6 +4489,7 @@ async def service_send_email_for_crm(
             subject=form_data.subject,
             text=form_data.text,
             html=form_data.html,
+            attachments=form_data.attachments,
             reply_to=reply_to,
             idempotency_key=form_data.idempotencyKey,
             payload_hash=form_data.payloadHash,
