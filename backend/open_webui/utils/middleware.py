@@ -84,6 +84,7 @@ from open_webui.utils.access_control.files import get_owner_accessible_folder_fi
 from open_webui.utils.access_control.folders import has_folder_access
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.chat_id import is_saved_chat_id
+from open_webui.utils.tool_call_stream import merge_tool_call_delta
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.context_compaction import compact_messages_for_request
 from open_webui.utils.files import (
@@ -124,7 +125,7 @@ from open_webui.utils.misc import (
 )
 from open_webui.utils.payload import apply_system_prompt_to_body, resolve_system_prompt
 from open_webui.utils.plugin import load_function_module_by_id
-from open_webui.utils.response import merge_usage, normalize_usage, record_auxiliary_usage
+from open_webui.utils.response import merge_usage, normalize_usage, record_auxiliary_usage, update_usage_snapshot
 from open_webui.utils.sanitize import sanitize_code
 from open_webui.utils.task import (
     get_task_model_id,
@@ -2368,6 +2369,11 @@ async def connect_mcp_server(
     return client, tool_specs
 
 
+def _models_for_request(request):
+    runtime_models = getattr(request.state, 'runtime_models', None)
+    return runtime_models if runtime_models is not None else request.app.state.MODELS
+
+
 async def process_chat_payload(request, form_data, user, metadata, model):
     # Ensure chat_id is always a string — external API clients may omit it.
     if not isinstance(metadata.get('chat_id'), str):
@@ -2386,7 +2392,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         if arena_model_ids and arena_filter_mode == 'exclude':
             arena_model_ids = [
                 available_model['id']
-                for available_model in request.app.state.MODELS.values()
+                for available_model in _models_for_request(request).values()
                 if available_model.get('owned_by') != 'arena' and available_model['id'] not in arena_model_ids
             ]
 
@@ -2395,12 +2401,12 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         else:
             arena_model_ids = [
                 available_model['id']
-                for available_model in request.app.state.MODELS.values()
+                for available_model in _models_for_request(request).values()
                 if available_model.get('owned_by') != 'arena'
             ]
             selected_model_id = random.choice(arena_model_ids)
 
-        selected_model = request.app.state.MODELS.get(selected_model_id)
+        selected_model = _models_for_request(request).get(selected_model_id)
         if selected_model:
             model = selected_model
             form_data['model'] = selected_model_id
@@ -2469,12 +2475,17 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     if is_saved_chat_id(chat_id) and user_message_id:
         if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-            compaction_models = {
-                **request.app.state.MODELS,
-                request.state.model['id']: request.state.model,
-            }
+            direct_model = request.state.model
+            compaction_models = (
+                {direct_model['id']: direct_model}
+                if direct_model.get('user_supplied')
+                else {
+                    **_models_for_request(request),
+                    direct_model['id']: direct_model,
+                }
+            )
         else:
-            compaction_models = request.app.state.MODELS
+            compaction_models = _models_for_request(request)
 
         system_message = get_system_message(form_data.get('messages', []))
         system_prompt = get_content_from_message(system_message) if system_message else ''
@@ -2539,7 +2550,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = _models_for_request(request)
 
     task_model_id = get_task_model_id(
         form_data['model'],
@@ -3224,13 +3235,13 @@ def update_assistant_message_from_stream(assistant_message, raw):
             if output:
                 assistant_message['output'] = output
             if meta and meta.get('usage'):
-                assistant_message['usage'] = merge_usage(assistant_message.get('usage'), meta['usage'])
+                assistant_message['usage'] = update_usage_snapshot(assistant_message.get('usage'), meta['usage'])
             continue
 
         raw_usage = data.get('usage', {}) or {}
         raw_usage.update(data.get('timings', {}))
         if raw_usage:
-            assistant_message['usage'] = merge_usage(assistant_message.get('usage'), raw_usage)
+            assistant_message['usage'] = update_usage_snapshot(assistant_message.get('usage'), raw_usage)
 
         for choice in data.get('choices', []):
             delta = choice.get('delta', {}) or {}
@@ -3620,7 +3631,7 @@ async def outlet_filter_handler(ctx):
         }
 
         # Pipeline outlet filters
-        models = request.app.state.MODELS
+        models = _models_for_request(request)
         try:
             outlet_data = await process_pipeline_outlet_filter(request, outlet_data, user, models)
         except Exception as e:
@@ -4300,6 +4311,8 @@ async def streaming_chat_response_handler(response, ctx):
                     nonlocal last_response_id
 
                     response_tool_calls = []
+                    usage_before_response = usage
+                    response_usage = None
 
                     delta_count = 0
                     delta_chunk_size = max(
@@ -4475,7 +4488,8 @@ async def streaming_chat_response_handler(response, ctx):
 
                                         # Normalize and capture usage for DB persistence
                                         if response_metadata.get('usage'):
-                                            usage = merge_usage(usage, response_metadata['usage'])
+                                            response_usage = update_usage_snapshot(response_usage, response_metadata['usage'])
+                                            usage = merge_usage(usage_before_response, response_usage)
                                             response_metadata['usage'] = usage
 
                                         processed_data.update(response_metadata)
@@ -4504,7 +4518,8 @@ async def streaming_chat_response_handler(response, ctx):
                                     raw_usage = data.get('usage', {}) or {}
                                     raw_usage.update(data.get('timings', {}))  # llama.cpp
                                     if raw_usage:
-                                        usage = merge_usage(usage, raw_usage)
+                                        response_usage = update_usage_snapshot(response_usage, raw_usage)
+                                        usage = merge_usage(usage_before_response, response_usage)
                                         await event_emitter(
                                             {
                                                 'type': 'chat:completion',
@@ -4577,50 +4592,7 @@ async def streaming_chat_response_handler(response, ctx):
                                     delta_tool_calls = delta.get('tool_calls', None)
                                     if delta_tool_calls:
                                         for delta_tool_call in delta_tool_calls:
-                                            tool_call_index = delta_tool_call.get('index')
-
-                                            if tool_call_index is not None:
-                                                # Check if the tool call already exists
-                                                current_response_tool_call = None
-                                                for response_tool_call in response_tool_calls:
-                                                    if response_tool_call.get('index') == tool_call_index:
-                                                        current_response_tool_call = response_tool_call
-                                                        break
-
-                                                if current_response_tool_call is None:
-                                                    # Add the new tool call
-                                                    delta_tool_call.setdefault('function', {})
-                                                    delta_tool_call['function'].setdefault('name', '')
-                                                    delta_arguments = delta_tool_call['function'].get('arguments')
-                                                    if not isinstance(delta_arguments, str):
-                                                        delta_tool_call['function']['arguments'] = (
-                                                            ''
-                                                            if delta_arguments is None
-                                                            else json.dumps(delta_arguments)
-                                                        )
-                                                    response_tool_calls.append(delta_tool_call)
-                                                else:
-                                                    # Update the existing tool call
-                                                    delta_name = delta_tool_call.get('function', {}).get('name')
-                                                    delta_arguments = delta_tool_call.get('function', {}).get(
-                                                        'arguments'
-                                                    )
-
-                                                    if delta_name:
-                                                        current_response_tool_call['function']['name'] = delta_name
-
-                                                    if delta_arguments is not None:
-                                                        if not isinstance(delta_arguments, str):
-                                                            delta_arguments = json.dumps(delta_arguments)
-                                                        current_response_tool_call.setdefault('function', {})
-                                                        if not isinstance(
-                                                            current_response_tool_call['function'].get('arguments'),
-                                                            str,
-                                                        ):
-                                                            current_response_tool_call['function']['arguments'] = ''
-                                                        current_response_tool_call['function']['arguments'] += (
-                                                            delta_arguments
-                                                        )
+                                            merge_tool_call_delta(response_tool_calls, delta_tool_call)
 
                                         # Emit pending tool calls in real-time
                                         if response_tool_calls:
@@ -4637,6 +4609,7 @@ async def streaming_chat_response_handler(response, ctx):
                                                         'name': func.get('name', ''),
                                                         'arguments': func.get('arguments', '{}'),
                                                         'status': 'in_progress',
+                                                        **({'extra_content': copy.deepcopy(tc['extra_content'])} if tc.get('extra_content') else {}),
                                                     }
                                                 )
 
@@ -5073,6 +5046,7 @@ async def streaming_chat_response_handler(response, ctx):
                                     'name': func.get('name', ''),
                                     'arguments': func.get('arguments', '{}'),
                                     'status': 'in_progress',
+                                    **({'extra_content': copy.deepcopy(tc['extra_content'])} if tc.get('extra_content') else {}),
                                 }
                             )
 
@@ -5101,6 +5075,8 @@ async def streaming_chat_response_handler(response, ctx):
                                 except Exception as e:
                                     log.debug(e)
                                     return None
+                        if not isinstance(params, dict):
+                            return None
                         tool_call.setdefault('function', {})['arguments'] = json.dumps(params)
                         return params
 
@@ -5444,6 +5420,8 @@ async def streaming_chat_response_handler(response, ctx):
                             output[:0] = prior_output
                             prior_output = []
                         else:
+                            if getattr(res, 'status_code', 200) >= 400:
+                                await emit_message_error(f'Upstream HTTP {res.status_code} during tool continuation.')
                             break
                     except Exception as e:
                         error_content = get_message_error_content(e)
@@ -5750,7 +5728,7 @@ async def streaming_chat_response_handler(response, ctx):
                     model_id = model.get('id') if isinstance(model, dict) else model
                     has_api_outlet_filters = bool(
                         (isinstance(model, dict) and 'pipeline' in model)
-                        or get_sorted_filters(model_id, request.app.state.MODELS)
+                        or get_sorted_filters(model_id, _models_for_request(request))
                     )
                 except Exception:
                     has_api_outlet_filters = True

@@ -12,6 +12,7 @@ from open_webui.routers.interact_channels import (
     CRM_BD_ACTION_INSTRUCTION,
     CRM_EMBEDDED_AM_REVIEW_INSTRUCTION,
     ChannelChatRequest,
+    SystemLineNotificationRequest,
     _bd_direct_command,
     _channel_output_text,
     _channel_runtime_failure,
@@ -21,6 +22,7 @@ from open_webui.routers.interact_channels import (
     _direct_crm_channel_command,
     _estimated_reservation_tokens,
     _generate_context_summary,
+    _is_system_line_notification_recipient,
     _line_delivery_messages,
     _line_filter_workflow_options,
     _line_result_messages,
@@ -62,6 +64,13 @@ def test_channel_timeout_error_does_not_encourage_duplicate_runs():
 def test_am_instruction_names_the_only_allowed_crm_write_apis():
     assert 'interact_crm_follow_up_create' in CRM_AM_ACTION_INSTRUCTION
     assert 'interact_crm_follow_up_update' in CRM_AM_ACTION_INSTRUCTION
+    assert 'interact_crm_am_work_items_list' in CRM_AM_ACTION_INSTRUCTION
+    assert 'interact_crm_shipment_care_complete' in CRM_AM_ACTION_INSTRUCTION
+    assert 'interact_crm_quotation_follow_up_record' in CRM_AM_ACTION_INSTRUCTION
+    assert 'interact_crm_am_handoff_accept' in CRM_AM_ACTION_INSTRUCTION
+    assert 'interact_crm_am_operation_get' in CRM_AM_ACTION_INSTRUCTION
+    assert 'interact_crm_am_work_preference_save' in CRM_AM_ACTION_INSTRUCTION
+    assert 'never infer a permanent preference from a one-off edit' in CRM_AM_ACTION_INSTRUCTION
     assert 'Never use interact_crm_bd_discovery_start' in CRM_AM_ACTION_INSTRUCTION
     assert 'Never ask for facts already stored in CRM' in CRM_AM_ACTION_INSTRUCTION
     assert 'never send a generic workbench link' in CRM_AM_ACTION_INSTRUCTION
@@ -75,12 +84,79 @@ def test_embedded_am_requires_original_crm_form_for_writes():
     assert _embedded_action_requires_original_form('bd.discovery.start') is False
 
 
+def test_am_system_notification_targets_only_the_requested_product_user():
+    payload = SystemLineNotificationRequest(
+        companyEmail='company@example.com',
+        companyUserId='company-1',
+        productKey='crm',
+        productInstanceId='instance-1',
+        productUserIds=['7'],
+        message='AM 今日工作',
+        idempotencyKey='digest-20260920',
+        allowedRoles=['member'],
+    )
+    matching = SimpleNamespace(
+        member_status='active', member_role='member', identity_source='product',
+        product_key='crm', product_instance_id='instance-1', product_user_id='7',
+        product_team_codes=['am'], external_user_id='line-user-7', line_user_ref='line-user-7',
+    )
+    other_employee = SimpleNamespace(**{**matching.__dict__, 'product_user_id': '8'})
+    assert _is_system_line_notification_recipient(matching, payload) is True
+    assert _is_system_line_notification_recipient(other_employee, payload) is False
+
+
+@pytest.mark.parametrize('role', ['am', 'bd'])
+def test_system_notification_http_contract_and_targeted_delivery(role, monkeypatch):
+    from unittest.mock import AsyncMock
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from open_webui.routers import interact_channels as channel_router
+
+    channel = SimpleNamespace(
+        channel_type='line', product_role=role, enabled=True,
+        product_bindings=[{'enabled': True, 'productKey': 'crm', 'instanceId': 'instance-1'}],
+    )
+    def binding(user, ref):
+        return SimpleNamespace(
+            id=ref, member_status='active', member_role='member', identity_source='product',
+            product_key='crm', product_instance_id='instance-1', product_user_id=user,
+            product_team_codes=[role], external_user_id=ref, line_user_ref=ref,
+        )
+    monkeypatch.setattr(channel_router, '_require_service_token', lambda *args: None)
+    monkeypatch.setattr(channel_router, '_require_company_channel', AsyncMock(return_value=channel))
+    monkeypatch.setattr(channel_router.InteractChannels, 'list_line_identity_bindings', AsyncMock(return_value=[
+        binding('7', 'already-accepted'), binding('7', 'not-yet-accepted'), binding('8', 'other-user'),
+    ]))
+    push = AsyncMock()
+    monkeypatch.setattr(channel_router, '_send_line_push', push)
+    app = FastAPI()
+    app.include_router(channel_router.router)
+    payload = dict(companyEmail='company@example.com', companyUserId='company-1',
+                   productKey='crm', productInstanceId='instance-1', productRole=role,
+                   productUserIds=['7'], excludeLineUserRefs=['already-accepted'],
+                   message='Test only', idempotencyKey='habit-http-contract', allowedRoles=['member'])
+    with TestClient(app) as client:
+        response = client.post('/channels/test/system-notifications/line', json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()['recipientCount'] == 1
+        assert response.json()['sentCount'] == 1
+        assert push.await_args.args[1] == 'not-yet-accepted'
+        for invalid in [{**payload, 'productUserIds': []}, {key: value for key, value in payload.items() if key != 'productUserIds'}]:
+            assert client.post('/channels/test/system-notifications/line', json=invalid).status_code == 422
+    assert push.await_count == 1
+
+
 def test_bd_instruction_allows_public_business_contacts_but_blocks_am_writes():
     assert 'public business contact pages' in CRM_BD_ACTION_INSTRUCTION
     assert 'verifiable corporate phone numbers and email addresses' in CRM_BD_ACTION_INSTRUCTION
     assert 'interact_crm_bd_discovery_start' in CRM_BD_ACTION_INSTRUCTION
     assert 'interact_crm_bd_profile_suggestion_create' in CRM_BD_ACTION_INSTRUCTION
     assert 'interact_crm_bd_candidates_list' in CRM_BD_ACTION_INSTRUCTION
+    assert 'interact_crm_bd_handoff_prepare' in CRM_BD_ACTION_INSTRUCTION
+    assert 'interact_crm_bd_work_summary' in CRM_BD_ACTION_INSTRUCTION
+    assert 'interact_crm_bd_operation_get' in CRM_BD_ACTION_INSTRUCTION
+    assert 'interact_crm_bd_work_preference_save' in CRM_BD_ACTION_INSTRUCTION
+    assert 'does not authorize a handoff' in CRM_BD_ACTION_INSTRUCTION
     assert 'never claim that the list is unavailable before calling it' in CRM_BD_ACTION_INSTRUCTION
     assert 'call interact_crm_bd_discovery_start immediately with no arguments' in CRM_BD_ACTION_INSTRUCTION
     assert 'Never list segments or ask for region, count, rounds, or exclusions' in CRM_BD_ACTION_INSTRUCTION
@@ -1787,6 +1863,97 @@ async def test_channel_chat_awaits_model_features(monkeypatch):
     assert 'tool_ids' not in captured
     assert captured_runtime['trusted'] is True
     assert response['content'] == 'done'
+
+
+@pytest.mark.asyncio
+async def test_analysis_only_rejects_non_crm_channels(monkeypatch):
+    monkeypatch.setattr('open_webui.routers.interact_channels._require_service_token', lambda *args: None)
+    payload = _payload()
+    payload.analysisOnly = True
+    with pytest.raises(HTTPException) as exc:
+        await channel_chat(SimpleNamespace(state=SimpleNamespace()), payload, None, None)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_crm_analysis_only_disables_tools_and_workflows(monkeypatch):
+    captured = {}
+    user = SimpleNamespace(id='shared-user', role='user')
+    claims = {
+        'crm_user_id': '42', 'crm_instance_id': 'crm-instance',
+        'crm_user_role': 'owner', 'crm_user_email': 'owner@example.com',
+        'company_email': 'company@example.com', 'company_user_id': 'company-1',
+        'product_team_codes': ['bd'],
+    }
+
+    async def get_user(_claims):
+        return user
+
+    async def runtime_models(*args):
+        return {'model': {'info': {'meta': {'builtinTools': {'crm_bd_actions': True}}}}}
+
+    async def inventory(*args):
+        return [{'id': 'model', 'productKeys': ['crm'], 'productRoles': ['bd']}]
+
+    async def no_model(*args):
+        return None
+
+    async def no_scope_error(*args, **kwargs):
+        return None
+
+    async def ensure_chat(*args, **kwargs):
+        return SimpleNamespace(chat={'history': {'currentId': None}})
+
+    async def context(*args):
+        return [{'role': 'user', 'content': 'analyze MD'}], 0
+
+    async def get_message(*args):
+        return {'content': 'done', 'usage': {'total_tokens': 12}}
+
+    async def handler(request, form_data, user):
+        captured.update(form_data)
+        return {}
+
+    async def drain(*args):
+        return None
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Analysis-only must not resolve actions, tools, or workflows')
+
+    monkeypatch.setattr('open_webui.routers.interact_channels._crm_claims', lambda *args: claims)
+    monkeypatch.setattr('open_webui.routers.interact_channels._crm_company_user', get_user)
+    monkeypatch.setattr('open_webui.routers.interact_channels.get_runtime_models_for_user', runtime_models)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Models.get_active_workspace_model_inventory_by_user_ids', inventory)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Models.get_model_by_id', no_model)
+    monkeypatch.setattr('open_webui.routers.interact_channels.validate_company_knowledge_scope', no_scope_error)
+    monkeypatch.setattr('open_webui.routers.interact_channels._ensure_channel_chat', ensure_chat)
+    monkeypatch.setattr('open_webui.routers.interact_channels._prepare_channel_context', context)
+    monkeypatch.setattr('open_webui.routers.interact_channels.Chats.get_message_by_id_and_message_id', get_message)
+    monkeypatch.setattr('open_webui.routers.interact_channels._drain_streaming_response', drain)
+    monkeypatch.setattr('open_webui.routers.interact_channels._direct_crm_embedded_discovery_status', forbidden)
+    monkeypatch.setattr('open_webui.routers.interact_channels._resolve_model_tool_ids', forbidden)
+    monkeypatch.setattr('open_webui.routers.interact_channels._resolve_model_features', forbidden)
+    monkeypatch.setattr('open_webui.routers.workflows.select_workflow_for_user_context', forbidden)
+
+    request = SimpleNamespace(state=SimpleNamespace(), app=SimpleNamespace(state=SimpleNamespace(
+        CHAT_COMPLETION_HANDLER=handler,
+    )))
+    payload = ChannelChatRequest(
+        companyEmail='company@example.com', companyUserId='company-1',
+        channelType='crm', channelIdentifier='embedded-bd', externalUserId='crm-user-42',
+        modelId='model', message='analyze MD', analysisOnly=True,
+        identitySource='product', productKey='crm', productInstanceId='crm-instance',
+        productUserId='42', productRole='bd',
+    )
+    response = await channel_chat(request, payload, None, None)
+
+    assert captured['tools'] == []
+    assert all(CRM_BD_ACTION_INSTRUCTION not in str(message.get('content')) for message in captured['messages'])
+    assert not any(key in captured for key in ('tool_ids', 'features', 'filter_ids', 'workflow'))
+    assert captured['model'] == 'model'
+    assert captured['stream_options'] == {'include_usage': True}
+    assert response['ok'] is True
+    assert response['usage'] == {'total_tokens': 12}
 
 
 @pytest.mark.asyncio

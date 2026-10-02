@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import collections.abc
+import ast
+import copy
 import hashlib
 import json
 import logging
@@ -356,10 +358,24 @@ def convert_output_to_messages(
             # Ensure arguments is always a JSON string
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments)
+            try:
+                parsed_arguments = json.loads(arguments)
+            except (ValueError, TypeError):
+                try:
+                    parsed_arguments = ast.literal_eval(arguments)
+                except (ValueError, SyntaxError, TypeError):
+                    parsed_arguments = None
+            # Historical tool calls must remain valid JSON for strict providers.
+            # Keep the original malformed value and its failure result; never execute it here.
+            if isinstance(parsed_arguments, dict):
+                arguments = json.dumps(parsed_arguments, ensure_ascii=False)
+            else:
+                arguments = json.dumps({'_unparsed_arguments': arguments}, ensure_ascii=False)
             pending_tool_calls.append(
                 {
                     'id': item.get('call_id', ''),
                     'type': 'function',
+                    **({'extra_content': copy.deepcopy(item['extra_content'])} if item.get('extra_content') else {}),
                     'function': {
                         'name': item.get('name', ''),
                         'arguments': arguments,

@@ -374,7 +374,7 @@
 							</span>
 							<small
 								>{selected?.has_webhook_secret
-									? '可驗證 Resend 事件來源'
+									? '僅代表可驗證簽章，不代表已收到事件或客戶回信'
 									: '仍可寄信，但不會追蹤投遞結果'}</small
 							>
 						</div>
@@ -446,7 +446,7 @@
 									<h3 class="font-bold text-gray-900 dark:text-white">設定投遞狀態追蹤</h3>
 									<p class="mt-1 max-w-3xl text-sm leading-6 text-gray-500">
 										Webhook
-										不負責寄信。設定後，系統才能把信件從「已送出」更新為已送達、退信、開啟或點擊。
+										不負責寄信或讀取員工信箱。收到有效投遞事件後，系統才會更新已送達、退信、開啟或點擊狀態。
 									</p>
 								</div>
 								<a
@@ -483,13 +483,15 @@
 								<li class="setup-step">
 									<span class="step-number" aria-hidden="true">2</span>
 									<div>
-										<strong>訂閱郵件事件</strong>
-										<p>在 Events 勾選下列八項；事件名稱必須包含 <code>email.</code> 前綴。</p>
+										<strong>訂閱 8 項寄送狀態事件（不含收信）</strong>
+										<p>這是 Webhook 事件，不是 API Key 的 8 項權限。在 Events 勾選下列項目；事件名稱必須包含 <code>email.</code> 前綴。</p>
 										<div class="mt-2 flex flex-wrap gap-2">
 											{#each recommendedWebhookEvents as event}
 												<span class="event-chip" title={event.label}>{event.value}</span>
 											{/each}
 										</div>
+										<p class="mt-2">客戶回覆到 Reply-To 信箱時，需另外連接該信箱的收信同步。Sending access Key 不會讀取信箱，也不會回補舊來信。</p>
+										<p class="mt-2"><code>email.received</code> 只通知 Resend 實際收到的信，還需另外擷取內容與附件；本 Connector 的此端點只處理寄送狀態，請勿當作收信設定。不要為了收信同步直接更換公司現有 MX。</p>
 									</div>
 								</li>
 								<li class="setup-step">

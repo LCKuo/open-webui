@@ -126,6 +126,32 @@ def _merge_numeric_usage_map(current: dict | None, incoming: dict | None) -> dic
     return result
 
 
+def update_usage_snapshot(current: dict | None, incoming: dict | None) -> dict:
+    """Update cumulative usage within one provider response, including partial snapshots."""
+    if not incoming:
+        return dict(current or {})
+    result = {**normalize_usage(current or {}), **incoming}
+    aliases = {
+        'input_tokens': ('input_tokens', 'prompt_tokens', 'promptTokenCount', 'prompt_eval_count', 'prompt_n'),
+        'output_tokens': ('output_tokens', 'completion_tokens', 'candidatesTokenCount', 'eval_count', 'predicted_n'),
+        'compute_tokens': ('compute_tokens', 'thoughts_token_count', 'thoughtsTokenCount', 'thoughts_tokens', 'reasoning_tokens'),
+        'total_tokens': ('total_tokens', 'totalTokenCount', 'total_token_count'),
+    }
+    for canonical, keys in aliases.items():
+        value = next((incoming[key] for key in keys if incoming.get(key) is not None), None)
+        if value is not None:
+            result[canonical] = int(value)
+        else:
+            result.setdefault(canonical, 0)
+    if not any(incoming.get(key) is not None for key in aliases['total_tokens']):
+        result['total_tokens'] = sum(result[key] for key in ('input_tokens', 'output_tokens', 'compute_tokens'))
+    for key in USAGE_DETAIL_KEYS:
+        if isinstance(incoming.get(key), dict):
+            result[key] = {**((current or {}).get(key) or {}), **incoming[key]}
+    result.setdefault('measurement', 'provider')
+    return result
+
+
 def merge_usage(current: dict | None, incoming: dict | None) -> dict:
     """
     Merge usage payloads from multiple model calls into one cumulative usage dict.

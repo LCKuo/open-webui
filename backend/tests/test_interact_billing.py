@@ -369,6 +369,52 @@ async def test_reservation_multiplier_does_not_inflate_missing_usage_fallback():
 
 
 @pytest.mark.asyncio
+async def test_failed_workflow_commit_charges_actual_single_attempt_not_reservation_multiplier():
+    client = CaptureBillingClient()
+    user = SimpleNamespace(id="webui-user", email="member@example.com")
+    messages = [{"role": "user", "content": "large workflow prompt"}]
+    form_data = {
+        "model": "model",
+        "messages": messages,
+        "max_completion_tokens": 100,
+        "_billing_multiplier": 2,
+    }
+    authorization = await client.authorize(
+        user,
+        form_data,
+        {"chat_id": "crm:instance", "message_id": "run-1"},
+    )
+
+    await client.commit(
+        user,
+        authorization,
+        form_data,
+        {"chat_id": "crm:instance", "message_id": "run-1"},
+        {
+            "input_tokens": 123,
+            "output_tokens": 0,
+            "total_tokens": 123,
+            "measurement": "estimated",
+        },
+        "provider returned an empty response",
+        status_value="failed",
+    )
+
+    authorize_payload = client.requests[-2][2]
+    commit_payload = client.requests[-1][2]
+    assert authorize_payload["estimated_input_tokens"] == (
+        estimate_prompt_tokens(messages) * 2
+    )
+    assert commit_payload["status"] == "failed"
+    assert commit_payload["usage"] == {
+        "input_tokens": 123,
+        "output_tokens": 0,
+        "compute_tokens": 0,
+        "billable_tokens": 123,
+    }
+
+
+@pytest.mark.asyncio
 async def test_api_key_authorize_marks_external_api_usage():
     client = CaptureBillingClient()
     user = SimpleNamespace(id="webui-user", email="member@example.com")

@@ -296,19 +296,19 @@ def _build_request(
     return request
 
 
-def _resolve_model_tool_ids(app, model_id: str) -> list[str]:
+def _resolve_model_tool_ids(app, model_id: str, models=None) -> list[str]:
     """Read model-attached tool_ids from model config.
 
     The frontend does this in Chat.svelte (model.info.meta.toolIds).
     The backend never auto-resolves them, so we must do it explicitly.
     """
-    models = getattr(app.state, 'MODELS', {})
+    models = models or getattr(app.state, 'MODELS', {})
     model = models.get(model_id, {})
     tool_ids = model.get('info', {}).get('meta', {}).get('toolIds', [])
     return list(tool_ids) if tool_ids else []
 
 
-async def _resolve_model_features(app, model_id: str) -> dict:
+async def _resolve_model_features(app, model_id: str, models=None) -> dict:
     """Read model default features from model config.
 
     The frontend does this in Chat.svelte (model.info.meta.defaultFeatureIds
@@ -316,7 +316,7 @@ async def _resolve_model_features(app, model_id: str) -> dict:
     code_interpreter, image_generation when the model has them as defaults
     AND the capability is enabled AND the admin has enabled the feature.
     """
-    models = getattr(app.state, 'MODELS', {})
+    models = models or getattr(app.state, 'MODELS', {})
     model = models.get(model_id, {})
     meta = model.get('info', {}).get('meta', {})
 
@@ -343,20 +343,20 @@ async def _resolve_model_features(app, model_id: str) -> dict:
     return features
 
 
-def _resolve_model_filter_ids(app, model_id: str) -> list[str]:
+def _resolve_model_filter_ids(app, model_id: str, models=None) -> list[str]:
     """Read model default filter_ids from model config."""
-    models = getattr(app.state, 'MODELS', {})
+    models = models or getattr(app.state, 'MODELS', {})
     model = models.get(model_id, {})
     filter_ids = model.get('info', {}).get('meta', {}).get('defaultFilterIds', [])
     return list(filter_ids) if filter_ids else []
 
 
-def _resolve_model_terminal_id(app, model_id: str) -> Optional[str]:
+def _resolve_model_terminal_id(app, model_id: str, models=None) -> Optional[str]:
     """Read model default terminal_id from model config.
 
     The frontend does this in Chat.svelte (model.info.meta.terminalId).
     """
-    models = getattr(app.state, 'MODELS', {})
+    models = models or getattr(app.state, 'MODELS', {})
     model = models.get(model_id, {})
     return model.get('info', {}).get('meta', {}).get('terminalId') or None
 
@@ -523,13 +523,27 @@ async def execute_automation(app, automation: AutomationModel) -> None:
             room=f'user:{automation.user_id}',
         )
 
+        try:
+            expires_delta = parse_duration(str(await Config.get('automations.auth_token_expires_in', '1h')))
+        except ValueError:
+            expires_delta = None
+        token = create_token(
+            data={'id': user.id, 'typ': 'automation'},
+            expires_delta=expires_delta or timedelta(hours=1),
+        )
+        request = _build_request(app, token=token)
+        from open_webui.utils.models import get_runtime_models_for_user
+
+        runtime_models = await get_runtime_models_for_user(request, user)
+        request.state.runtime_models = runtime_models
+
         # Resolve model defaults (frontend does this, backend doesn't)
-        tool_ids = _resolve_model_tool_ids(app, model_id)
-        features = await _resolve_model_features(app, model_id)
-        filter_ids = _resolve_model_filter_ids(app, model_id)
+        tool_ids = _resolve_model_tool_ids(app, model_id, runtime_models)
+        features = await _resolve_model_features(app, model_id, runtime_models)
+        filter_ids = _resolve_model_filter_ids(app, model_id, runtime_models)
 
         # Resolve terminal from model config
-        terminal_id = _resolve_model_terminal_id(app, model_id)
+        terminal_id = _resolve_model_terminal_id(app, model_id, runtime_models)
 
         # Build the same payload the frontend sends to /api/chat/completions
         form_data = {
@@ -559,15 +573,6 @@ async def execute_automation(app, automation: AutomationModel) -> None:
 
         # Call the full chat completion pipeline (same as POST /api/chat/completions).
         # The handler reference is stored on app.state to avoid circular imports.
-        try:
-            expires_delta = parse_duration(str(await Config.get('automations.auth_token_expires_in', '1h')))
-        except ValueError:
-            expires_delta = None
-        token = create_token(
-            data={'id': user.id, 'typ': 'automation'},
-            expires_delta=expires_delta or timedelta(hours=1),
-        )
-        request = _build_request(app, token=token)
         await app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
 
         # Notify user

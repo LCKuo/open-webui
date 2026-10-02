@@ -11,6 +11,7 @@
 	import Modal from '../common/Modal.svelte';
 	import Account from './Settings/Account.svelte';
 	import ApiAccess from './Settings/Account/ApiAccess.svelte';
+	import PersonalAPIKeys from './Settings/PersonalAPIKeys.svelte';
 	import About from './Settings/About.svelte';
 	import General from './Settings/General.svelte';
 	import Interface from './Settings/Interface.svelte';
@@ -22,11 +23,9 @@
 	import ArchivedChats from './Settings/ArchivedChats.svelte';
 	import Personalization from './Settings/Personalization.svelte';
 	import Search from '../icons/Search.svelte';
-	import Connections from './Settings/Connections.svelte';
 	import Integrations from './Settings/Integrations.svelte';
 	import DatabaseSettings from '../icons/DatabaseSettings.svelte';
 	import SettingsAlt from '../icons/SettingsAlt.svelte';
-	import Link from '../icons/Link.svelte';
 	import UserCircle from '../icons/UserCircle.svelte';
 	import SoundHigh from '../icons/SoundHigh.svelte';
 	import InfoCircle from '../icons/InfoCircle.svelte';
@@ -38,6 +37,7 @@
 	import ChevronLeft from '../icons/ChevronLeft.svelte';
 	import Keyboard from '../icons/Keyboard.svelte';
 	import CodeBracket from '../icons/CodeBracket.svelte';
+	import LockClosed from '../icons/LockClosed.svelte';
 	import UsageIcon from '../icons/UsageIcon.svelte';
 	import AdminTabIcon from '$lib/components/admin/Settings/AdminTabIcon.svelte';
 	import AdminGeneral from '$lib/components/admin/Settings/General.svelte';
@@ -107,7 +107,7 @@
 		interface: 'Basics',
 		notifications: 'Basics',
 		shortcuts: 'Basics',
-		connections: 'Services',
+		personal_api_keys: 'Services',
 		tools: 'Services',
 		personalization: 'Preferences',
 		audio: 'Preferences',
@@ -341,17 +341,9 @@
 			]
 		},
 		{
-			id: 'connections',
-			title: 'Connections',
-			keywords: [
-				'addconnection',
-				'add connection',
-				'manageconnections',
-				'manage connections',
-				'manage direct connections',
-				'managedirectconnections',
-				'settings'
-			]
+			id: 'personal_api_keys',
+			title: 'AI Keys',
+			keywords: ['ai key', 'ai keys', 'api key', 'byok', 'personal api key', '個人金鑰', '模型金鑰']
 		},
 		{
 			id: 'tools',
@@ -777,10 +769,6 @@
 
 	const getAvailableSettings = () => {
 		const personalSettings = allSettings.filter((tab) => {
-			if (tab.id === 'connections') {
-				return $config?.features?.enable_direct_connections;
-			}
-
 			if (tab.id === 'tools') {
 				return (
 					$user?.role === 'admin' ||
@@ -1015,21 +1003,19 @@
 							<Keyboard className="size-3.5" strokeWidth="2" />
 							<span>{$i18n.t('Keyboard')}</span>
 						</button>
-					{:else if tabId === 'connections'}
-						{#if $user?.role === 'admin' || ($user?.role === 'user' && $config?.features?.enable_direct_connections)}
-							<button
-								role="tab"
-								aria-controls="tab-connections"
-								aria-selected={selectedTab === 'connections'}
-								class={tabButtonClass(selectedTab === 'connections')}
-								on:click={() => {
-									selectedTab = 'connections';
-								}}
-							>
-								<Link className="size-3.5" strokeWidth="2" />
-								<span>{$i18n.t('Connections')}</span>
-							</button>
-						{/if}
+					{:else if tabId === 'personal_api_keys'}
+						<button
+							role="tab"
+							aria-controls="tab-personal-api-keys"
+							aria-selected={selectedTab === 'personal_api_keys'}
+							class={tabButtonClass(selectedTab === 'personal_api_keys')}
+							on:click={() => {
+								selectedTab = 'personal_api_keys';
+							}}
+						>
+							<LockClosed className="size-3.5" strokeWidth="2" />
+							<span>AI 金鑰</span>
+						</button>
 					{:else if tabId === 'tools'}
 						{#if $user?.role === 'admin' || ($user?.role === 'user' && $user?.permissions?.features?.direct_tool_servers)}
 							<button
@@ -1215,13 +1201,8 @@
 				<Notifications {saveSettings} />
 			{:else if selectedTab === 'shortcuts'}
 				<Shortcuts {saveSettings} />
-			{:else if selectedTab === 'connections'}
-				<Connections
-					saveSettings={async (updated: Record<string, any>) => {
-						await saveSettings(updated);
-						toast.success($i18n.t('Settings saved successfully!'));
-					}}
-				/>
+			{:else if selectedTab === 'personal_api_keys'}
+				<PersonalAPIKeys />
 			{:else if selectedTab === 'tools'}
 				<Integrations
 					saveSettings={async (updated: Record<string, any>) => {

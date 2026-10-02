@@ -318,3 +318,21 @@ cypress/videos
 cypress/screenshots
 .vscode/settings.json
 .cptr
+
+# Local deployment evidence, customer runtime data and private credentials
+/artifacts/
+/tmp/
+/backend/data/
+/backend/open_webui_data.zip
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Customer-specific integration handover files belong in the private Website repo
+/docs/formai-website-sso-integration-zh-TW.md
+/docs/formai-website-sso-production.json

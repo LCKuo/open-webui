@@ -39,6 +39,91 @@ type OpenAIConfig = {
 	OPENAI_API_CONFIGS: object;
 };
 
+export type PersonalAPIKeyConnection = {
+	id: string;
+	name: string;
+	provider: 'openai' | 'gemini' | 'custom';
+	base_url: string;
+	host: string;
+	auth_type: 'bearer' | 'none';
+	key_last4: string | null;
+	last_verified_at: number | null;
+	verification_status: 'ready' | 'failed' | null;
+};
+
+export type PersonalAPIKeyConnectionsResponse = {
+	mode: 'personal' | 'platform';
+	connections: PersonalAPIKeyConnection[];
+};
+
+export type PersonalAPIKeyForm = {
+	name: string;
+	provider: 'openai' | 'gemini' | 'custom';
+	base_url?: string;
+	auth_type: 'bearer' | 'none';
+	api_key?: string;
+};
+
+const personalAPIKeyRequest = async <T>(token: string, path: string, init: RequestInit = {}) => {
+	let error: string | null = null;
+	const headers = new Headers(init.headers);
+	headers.set('Accept', 'application/json');
+	headers.set('Content-Type', 'application/json');
+	headers.set('Authorization', `Bearer ${token}`);
+	const res = await fetch(`${OPENAI_API_BASE_URL}${path}`, {
+		...init,
+		headers
+	})
+		.then(async (response) => {
+			if (!response.ok) throw await response.json();
+			return response.json() as Promise<T>;
+		})
+		.catch((err) => {
+			error = err?.detail ?? err?.error?.message ?? 'Server connection failed';
+			return null;
+		});
+
+	if (error) throw error;
+	return res as T;
+};
+
+export const getPersonalAPIKeyConnections = async (token: string) =>
+	personalAPIKeyRequest<PersonalAPIKeyConnectionsResponse>(token, '/personal-api-keys');
+
+export const createPersonalAPIKey = async (token: string, form: PersonalAPIKeyForm) =>
+	personalAPIKeyRequest<PersonalAPIKeyConnection>(token, '/personal-api-keys', {
+		method: 'POST',
+		body: JSON.stringify(form)
+	});
+
+export const updatePersonalAPIKey = async (
+	token: string,
+	connectionId: string,
+	form: PersonalAPIKeyForm
+) =>
+	personalAPIKeyRequest<PersonalAPIKeyConnection>(
+		token,
+		`/personal-api-keys/${encodeURIComponent(connectionId)}`,
+		{
+			method: 'PUT',
+			body: JSON.stringify(form)
+		}
+	);
+
+export const deletePersonalAPIKey = async (token: string, connectionId: string) =>
+	personalAPIKeyRequest<{ ok: boolean; mode: 'personal' | 'platform' }>(
+		token,
+		`/personal-api-keys/${encodeURIComponent(connectionId)}`,
+		{ method: 'DELETE' }
+	);
+
+export const verifyPersonalAPIKey = async (token: string, connectionId: string) =>
+	personalAPIKeyRequest<{ ok: boolean; message: string }>(
+		token,
+		`/personal-api-keys/${encodeURIComponent(connectionId)}/verify`,
+		{ method: 'POST' }
+	);
+
 export const updateOpenAIConfig = async (token: string = '', config: OpenAIConfig) => {
 	let error = null;
 

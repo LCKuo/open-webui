@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from typing import Any
 from uuid import uuid4
 
 import aiohttp
@@ -138,6 +139,7 @@ from open_webui.models.config import Config
 from open_webui.models.functions import Functions
 from open_webui.models.messages import Messages
 from open_webui.models.models import Models
+from open_webui.models.provider_credentials import UserProviderCredentials
 from open_webui.models.users import Users
 from open_webui.routers import (
     analytics,
@@ -261,6 +263,7 @@ from open_webui.utils.models import (
     get_all_base_models,
     get_all_models,
     get_filtered_models,
+    get_runtime_models_for_user,
     refresh_runtime_model_cache_entry,
     serialize_external_api_model,
 )
@@ -887,6 +890,7 @@ if ENABLE_SCIM:
 @app.get('/api/models')
 @app.get('/api/v1/models')  # Experimental: Compatibility with OpenAI API
 async def get_models(request: Request, refresh: bool = False, user=Depends(get_verified_user)):
+    personal_mode = await UserProviderCredentials.has_for_user(user.id)
     all_models = await get_all_models(request, refresh=refresh, user=user)
 
     # Filter out filter pipelines
@@ -963,7 +967,7 @@ async def get_models(request: Request, refresh: bool = False, user=Depends(get_v
         log.debug(
             f'/api/models returned filtered models accessible to the user: {json.dumps([model.get("id") for model in models])}'
         )
-    return {'data': models}
+    return {'data': models, 'personal_mode': personal_mode}
 
 
 @app.get('/api/models/base')
@@ -1110,8 +1114,19 @@ async def embeddings(request: Request, form_data: dict, user=Depends(get_verifie
     Returns:
         dict: OpenAI-compatible embeddings response.
     """
-    # Make sure models are loaded in app state
-    if not request.app.state.MODELS:
+    # Personal provider models are request-scoped and never enter the shared cache.
+    personal_mode = await UserProviderCredentials.has_for_user(user.id)
+    if personal_mode:
+        personal_models = await get_all_models(request, user=user)
+        personal_model = next(
+            (item for item in personal_models if item.get('id') == form_data.get('model')),
+            None,
+        )
+        if not personal_model:
+            raise HTTPException(status_code=404, detail='Model not found')
+        request.state.direct = True
+        request.state.model = personal_model
+    elif not request.app.state.MODELS:
         await get_all_models(request, user=user)
     billing_client = InteractBillingClient() if is_billing_enabled() else None
     billing_authorization = None
@@ -1207,8 +1222,9 @@ async def chat_completion(
         }:
             form_data.pop(field, None)
 
-    if not request.app.state.MODELS:
-        await get_all_models(request, user=user)
+    personal_mode = await UserProviderCredentials.has_for_user(user.id)
+    runtime_models = await get_runtime_models_for_user(request, user)
+    request.state.runtime_models = runtime_models
 
     model_id = form_data.get('model', None)
     model_item = form_data.pop('model_item', {})
@@ -1219,16 +1235,17 @@ async def chat_completion(
     try:
         model_info = None
         if not model_item.get('direct', False):
-            if model_id not in request.app.state.MODELS:
+            if model_id not in runtime_models:
                 raise Exception('Model not found')
 
-            model = request.app.state.MODELS[model_id]
+            model = runtime_models[model_id]
             model_info = await Models.get_model_by_id(model_id)
             if model_info:
                 if not model_info.is_active:
                     refresh_runtime_model_cache_entry(request, model_info)
                     raise Exception('Model not found')
-                model = refresh_runtime_model_cache_entry(request, model_info) or model
+                if not personal_mode:
+                    model = refresh_runtime_model_cache_entry(request, model_info) or model
 
             # Check if user has access to the model
             if not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):
@@ -1236,6 +1253,9 @@ async def chat_completion(
                     await check_model_access(user, model, model_info=model_info)
                 except Exception as e:
                     raise e
+
+            if model.get('user_supplied'):
+                await _set_direct_model(request, model, user)
 
             if getattr(request.state, 'auth_type', None) == 'api_key':
                 # Headless API clients do not have Chat.svelte to apply the
@@ -1249,10 +1269,10 @@ async def chat_completion(
                     _resolve_model_tool_ids,
                 )
 
-                form_data['tool_ids'] = _resolve_model_tool_ids(request.app, model_id)
-                form_data['filter_ids'] = _resolve_model_filter_ids(request.app, model_id)
-                form_data['features'] = await _resolve_model_features(request.app, model_id)
-                terminal_id = _resolve_model_terminal_id(request.app, model_id)
+                form_data['tool_ids'] = _resolve_model_tool_ids(request.app, model_id, runtime_models)
+                form_data['filter_ids'] = _resolve_model_filter_ids(request.app, model_id, runtime_models)
+                form_data['features'] = await _resolve_model_features(request.app, model_id, runtime_models)
+                terminal_id = _resolve_model_terminal_id(request.app, model_id, runtime_models)
                 if terminal_id:
                     form_data['terminal_id'] = terminal_id
         else:
@@ -1275,15 +1295,15 @@ async def chat_completion(
         # Check base model existence for custom models
         if model_info and model_info.base_model_id:
             base_model_id = model_info.base_model_id
-            if base_model_id not in request.app.state.MODELS:
+            if base_model_id not in runtime_models:
                 if ENABLE_CUSTOM_MODEL_FALLBACK:
                     default_models = ((await Config.get('ui.default_models')) or '').split(',')
 
                     fallback_model_id = default_models[0].strip() if default_models[0] else None
 
-                    if fallback_model_id and fallback_model_id in request.app.state.MODELS:
+                    if fallback_model_id and fallback_model_id in runtime_models:
                         # Update model and form_data so routing uses the fallback model's type
-                        model = request.app.state.MODELS[fallback_model_id]
+                        model = runtime_models[fallback_model_id]
                         form_data['model'] = fallback_model_id
                     else:
                         raise Exception('Model not found')
@@ -2126,7 +2146,7 @@ async def chat_completion(
             }
 
             # Resolve the model object for this specific model
-            resolved_model = request.app.state.MODELS.get(target_model_id, model)
+            resolved_model = runtime_models.get(target_model_id, model)
 
             # Only the first model runs chat-level background tasks;
             # subsequent models only run follow-ups.
@@ -2311,17 +2331,18 @@ async def generate_messages(
         model_id = model_info.base_model_id
 
     passthrough_params = []
-    models = request.app.state.OPENAI_MODELS
-    if not models or model_id not in models:
-        await openai.get_all_models(request, user=user)
-        models = request.app.state.OPENAI_MODELS
+    models = await openai.get_user_openai_models(request, user)
     model = models.get(model_id)
     if model:
-        url, _, api_config = await openai.get_openai_connection(model['urlIdx'])
+        url, _, api_config = await openai.get_openai_connection(model['urlIdx'], user=user)
         if is_anthropic_messages_passthrough(url, api_config) and not (
             model_info and model_info.base_model_id
         ):
-            runtime_model = request.app.state.MODELS.get(requested_model)
+            runtime_model = (
+                model
+                if model.get('personal_owner_id') == user.id
+                else request.app.state.MODELS.get(requested_model)
+            )
             if not runtime_model:
                 raise HTTPException(status_code=404, detail='Model not found')
             if not BYPASS_MODEL_ACCESS_CONTROL and (

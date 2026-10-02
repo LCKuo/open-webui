@@ -3,7 +3,6 @@ import copy
 import logging
 import sys
 
-from aiocache import cached
 from fastapi import Request
 from open_webui.config import (
     BYPASS_ADMIN_ACCESS_CONTROL,
@@ -16,6 +15,7 @@ from open_webui.models.config import Config
 from open_webui.models.functions import Functions
 from open_webui.models.groups import Groups
 from open_webui.models.models import Models
+from open_webui.models.provider_credentials import UserProviderCredentials
 from open_webui.utils.chat_variables import get_chat_variables_schema
 from open_webui.models.users import UserModel
 from open_webui.routers import ollama, openai
@@ -105,7 +105,10 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
         'evaluation.arena.models',
         'models.default_metadata',
     )
-    if (
+    personal_mode = bool(user and await UserProviderCredentials.has_for_user(user.id))
+    if personal_mode:
+        base_models = await fetch_openai_models(request, user=user)
+    elif (
         request.app.state.MODELS
         and request.app.state.BASE_MODELS
         and (config.get('models.base_models_cache') and not refresh)
@@ -126,7 +129,7 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
         return []
 
     # Add arena models
-    if config.get('evaluation.arena.enable'):
+    if config.get('evaluation.arena.enable') and not personal_mode:
         arena_models = []
         arena_config = config.get('evaluation.arena.models') or []
         if len(arena_config) > 0:
@@ -177,7 +180,19 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
         global_filter_ids = set()
         enabled_filter_ids = set()
 
-    custom_models = await Models.get_all_models()
+    if personal_mode:
+        personal_base_ids = {model['id'] for model in models}
+        accessible_models = await Models.get_models_by_user_id(user.id, permission='read')
+        custom_models = [
+            model
+            for model in accessible_models
+            if (
+                model.base_model_id in personal_base_ids
+                or (model.base_model_id is None and model.id in personal_base_ids)
+            )
+        ]
+    else:
+        custom_models = await Models.get_all_models()
 
     # Single O(1) lookup: Ollama base names first, then exact IDs (exact wins).
     base_model_lookup = {}
@@ -247,6 +262,16 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
                 **({'provider': base_model.get('provider')} if base_model and base_model.get('provider') else {}),
                 **({'loaded': base_model.get('loaded')} if base_model and base_model.get('loaded') is not None else {}),
             }
+
+            if base_model:
+                for key in (
+                    'personal_owner_id',
+                    'personal_connection_id',
+                    'provider',
+                    'urlIdx',
+                ):
+                    if base_model.get(key) is not None:
+                        model[key] = base_model[key]
 
             info = custom_model.model_dump()
             schema = get_chat_variables_schema(custom_model.params.model_dump().get('system'))
@@ -449,17 +474,33 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
 
     log.debug(f'get_all_models() returned {len(models)} models')
 
-    models_dict = {model['id']: model for model in models}
-    if isinstance(request.app.state.MODELS, RedisDict):
-        try:
-            request.app.state.MODELS.set(models_dict)
-        except Exception as e:
-            log.warning(f'Failed to update Redis model cache, using in-process cache: {e}')
+    if not personal_mode:
+        models_dict = {model['id']: model for model in models}
+        if isinstance(request.app.state.MODELS, RedisDict):
+            try:
+                request.app.state.MODELS.set(models_dict)
+            except Exception as e:
+                log.warning(f'Failed to update Redis model cache, using in-process cache: {e}')
+                request.app.state.MODELS = models_dict
+        else:
             request.app.state.MODELS = models_dict
-    else:
-        request.app.state.MODELS = models_dict
 
     return models
+
+
+async def get_runtime_models_for_user(
+    request: Request,
+    user: UserModel,
+    refresh: bool = False,
+) -> dict[str, dict]:
+    """Resolve a request-local model pool when the user supplies provider credentials."""
+    if user and await UserProviderCredentials.has_for_user(user.id):
+        models = await get_all_models(request, refresh=refresh, user=user)
+        return {model['id']: model for model in models}
+
+    if not request.app.state.MODELS or refresh:
+        await get_all_models(request, refresh=refresh, user=user)
+    return request.app.state.MODELS
 
 
 def refresh_runtime_model_cache_entry(request: Request, model_info) -> dict | None:
@@ -494,6 +535,8 @@ def refresh_runtime_model_cache_entry(request: Request, model_info) -> dict | No
 
 
 async def check_model_access(user, model, model_info=None, db=None):
+    if model.get('personal_owner_id') == user.id:
+        return
     if model.get('arena'):
         meta = model.get('info', {}).get('meta', {})
         access_grants = meta.get('access_grants', [])
@@ -542,6 +585,11 @@ async def get_filtered_models(models, user, db=None):
     if (
         user.role == 'user' or (user.role == 'admin' and not BYPASS_ADMIN_ACCESS_CONTROL)
     ) and not BYPASS_MODEL_ACCESS_CONTROL:
+        personal_models = [model for model in models if model.get('personal_owner_id') == user.id]
+        models = [model for model in models if model.get('personal_owner_id') != user.id]
+        if not models:
+            return personal_models
+
         model_infos = {}
         for model in models:
             if model.get('arena'):
@@ -567,7 +615,20 @@ async def get_filtered_models(models, user, db=None):
             db=db,
         )
 
-        filtered_models = []
+        filtered_models = list(personal_models)
+        from open_webui.utils.crm_model_catalog import CATALOG_MARKER, inventory
+        catalog_ids = None
+        def persisted_meta(item):
+            meta = getattr(item, 'meta', None)
+            if hasattr(meta, 'model_dump'):
+                return meta.model_dump()
+            return meta if isinstance(meta, dict) else {}
+
+        if any(persisted_meta(m).get(CATALOG_MARKER) for m in persisted_models.values()):
+            try:
+                catalog_ids = set((await inventory())['ids'])
+            except Exception:
+                catalog_ids = set()
         for model in models:
             if model.get('arena'):
                 meta = model.get('info', {}).get('meta', {})
@@ -582,6 +643,9 @@ async def get_filtered_models(models, user, db=None):
                 continue
 
             model_info = persisted_models.get(model['id'])
+            if (model_info and not model_info.base_model_id and persisted_meta(model_info).get(CATALOG_MARKER)
+                    and model_info.id not in (catalog_ids or set())):
+                continue
             if model_info:
                 if (
                     (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)

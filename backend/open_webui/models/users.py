@@ -734,6 +734,7 @@ class UsersTable:
     async def delete_user_by_id(self, id: str, db: AsyncSession | None = None) -> bool:
         from open_webui.models.chats import Chats
         from open_webui.models.groups import Groups
+        from open_webui.models.provider_credentials import UserProviderCredential
 
         # Remove User from Groups
         await Groups.remove_user_from_all_groups(id)
@@ -743,6 +744,7 @@ class UsersTable:
             deleted_chats = await Chats.delete_chats_by_user_id(id, db=session)
             if not deleted_chats:
                 return False  # chats deletion failed
+            await session.execute(delete(UserProviderCredential).where(UserProviderCredential.user_id == id))
             await session.execute(delete(User).where(User.id == id))
             await session.commit()
             return True

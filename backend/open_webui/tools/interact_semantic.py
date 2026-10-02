@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from fastapi import Request
+from pydantic import ValidationError
 
 from open_webui.semantic_query.contracts import QueryPlan
 from open_webui.semantic_query.errors import SemanticQueryError
@@ -29,6 +30,8 @@ def _error_result(error: SemanticQueryError) -> str:
         payload['repairHint'] = (
             'Use only QueryPlan schema properties; groupBy is not supported. '
             'Select up to 8 dimension IDs from the catalog. Grouping is inferred from dimensions. '
+            'Every orderBy.fieldId must also be selected in dimensions, measures, or metrics. '
+            'When more than 8 fields are needed, query a smaller relevant selection first; do not repeat the same invalid plan. '
             'Boolean filters require JSON true/false, not strings or numbers. '
             'Numeric filters require JSON numbers. datasetId must be the catalog datasetId, not a name or slug. '
             'Correct the plan and retry this semantic tool; do not use raw database queries as a fallback.'
@@ -98,6 +101,8 @@ async def interact_semantic_query(
       "orderBy":[{"fieldId":"revenue","direction":"desc"}],"limit":5}
     Use only properties in queryPlanSchema returned by the catalog. Do not send groupBy,
     table, sql, or columns. dimensions already define grouping and allow at most 8 IDs.
+    Every orderBy.fieldId must also be selected in dimensions, measures, or metrics.
+    Start with the most relevant dataset and at most 5 rows, not every dataset in the catalog.
     For a boolean dimension such as active, filters.conditions[].value must be JSON true
     or false, never "true", "false", 1, or 0. Numeric fields use JSON numbers.
     For a simple list use datasetId, dimensions, filters, and limit; measures are optional.
@@ -107,6 +112,15 @@ async def interact_semantic_query(
     """
     try:
         context = await runtime_context(__user__, __metadata__, trusted_product_runtime=_trusted_product_runtime(__request__))
+        try:
+            QueryPlan.model_validate(plan)
+        except ValidationError as error:
+            payload = json.loads(_error_result(SemanticQueryError('QUERY-PLAN-INVALID', 'Invalid plan')))
+            payload['validationIssues'] = [
+                {'field': '.'.join(str(part) for part in issue['loc']), 'message': issue['msg']}
+                for issue in error.errors(include_input=False, include_url=False)[:5]
+            ]
+            return _result(payload)
         return _result(await execute_query(plan, context))
     except SemanticQueryError as error:
         return _error_result(error)

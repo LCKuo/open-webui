@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -10,7 +11,7 @@ from open_webui.routers.auths import (
     _create_user_api_key,
     build_api_tour,
 )
-from open_webui.utils.auth import is_api_key_scope_allowed
+from open_webui.utils.auth import get_current_user_by_api_key, is_api_key_scope_allowed
 from pydantic import ValidationError
 
 
@@ -71,6 +72,38 @@ def test_api_key_scopes_fail_closed_for_internal_endpoints():
     assert not is_api_key_scope_allowed(scopes, 'GET', '/api/v1/users')
     assert not is_api_key_scope_allowed(scopes, 'POST', '/api/v1/models')
     assert not is_api_key_scope_allowed(scopes, 'POST', '/api/v1/workflows')
+
+
+@pytest.mark.asyncio
+async def test_webui_api_key_auth_preserves_key_id_for_billing(monkeypatch):
+    user = SimpleNamespace(id='user-1', role='admin', email='owner@example.com')
+    key_record = SimpleNamespace(
+        id='key-webui-client',
+        data={'scopes': ['models:read', 'chat:write']},
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        scope={'path': '/api/v1/chat/completions'},
+        method='POST',
+    )
+
+    async def config_get_many(*keys):
+        return {
+            'auth.enable_api_keys': True,
+            'auth.api_key.endpoint_restrictions': False,
+            'auth.api_key.allowed_endpoints': '',
+        }
+
+    monkeypatch.setattr(Users, 'get_user_by_api_key', AsyncMock(return_value=user))
+    monkeypatch.setattr(Users, 'get_api_key_by_token', AsyncMock(return_value=key_record))
+    monkeypatch.setattr(Users, 'update_last_active_by_id', AsyncMock(return_value=True))
+    monkeypatch.setattr('open_webui.utils.auth.Config.get_many', config_get_many)
+
+    resolved = await get_current_user_by_api_key(request, 'sk-generated-by-webui')
+
+    assert resolved is user
+    assert request.state.api_key_id == 'key-webui-client'
+    assert request.state.api_key_scopes == ['chat:write', 'models:read']
 
 
 @pytest.mark.asyncio

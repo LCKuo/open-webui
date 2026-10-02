@@ -217,12 +217,15 @@
 	$: {
 		const modelSearchParam =
 			$page.url.searchParams.get('models') || $page.url.searchParams.get('model');
+		const availableModelIds = getAvailableModelIds();
+		const hasSelectedModel = selectedModels?.some((modelId) => modelId);
+		const hasUnavailableModel = selectedModels?.some(
+			(modelId) => modelId && !availableModelIds.includes(modelId)
+		);
 
 		if (
-			chatIdProp === '' &&
 			$models.length > 0 &&
-			!selectedModels?.some((modelId) => modelId) &&
-			!modelSearchParam
+			((chatIdProp === '' && !hasSelectedModel && !modelSearchParam) || hasUnavailableModel)
 		) {
 			const fallbackModels = normalizeSelectedModels(selectedModels);
 			if (!equal(fallbackModels, selectedModels)) {

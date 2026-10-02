@@ -175,18 +175,19 @@ async def generate_chat_completion(
             }
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        # Merge the direct connection model into server models so that
-        # task functions (title, tags, etc.) can resolve a server-side
-        # task model while still having the direct model available.
-        # dict(...items()) is one HGETALL on a Redis-backed pool; ``{**pool}``
-        # would issue HKEYS plus one HGET per model.
-        models = {
-            **dict(request.app.state.MODELS.items()),
-            request.state.model['id']: request.state.model,
-        }
+        direct_model = request.state.model
+        if direct_model.get('user_supplied'):
+            models = {direct_model['id']: direct_model}
+        else:
+            # Legacy browser-direct connections may still use a configured
+            # server task model for title, tags, and similar helpers.
+            models = {
+                **dict(request.app.state.MODELS.items()),
+                direct_model['id']: direct_model,
+            }
         log.debug(f'direct connection to model: {request.state.model["id"]}')
     else:
-        models = request.app.state.MODELS
+        models = getattr(request.state, 'runtime_models', None) or request.app.state.MODELS
 
     model_id = form_data['model']
     # Single lookup — membership check plus getitem would be two Redis
@@ -204,6 +205,9 @@ async def generate_chat_completion(
                 await check_model_access(user, model)
             except Exception as e:
                 raise e
+
+        from open_webui.utils.crm_model_catalog import assert_agent_ready
+        await assert_agent_ready(user, model_id)
 
         # Arena model — sub-model was already resolved by process_chat_payload.
         # Inject selected_model_id into the response for the frontend.
@@ -223,7 +227,7 @@ async def generate_chat_completion(
             if model_ids and filter_mode == 'exclude':
                 model_ids = [
                     available_model['id']
-                    for available_model in list(request.app.state.MODELS.values())
+                    for available_model in list(models.values())
                     if available_model.get('owned_by') != 'arena' and available_model['id'] not in model_ids
                 ]
 
@@ -232,7 +236,7 @@ async def generate_chat_completion(
             else:
                 model_ids = [
                     available_model['id']
-                    for available_model in list(request.app.state.MODELS.values())
+                    for available_model in list(models.values())
                     if available_model.get('owned_by') != 'arena'
                 ]
                 selected_model_id = random.choice(model_ids)
@@ -241,7 +245,7 @@ async def generate_chat_completion(
 
             # bypass_filter recursion below skips the line-200 check; gate the resolved model here.
             if not bypass_filter and user.role == 'user':
-                selected_model = request.app.state.MODELS.get(selected_model_id)
+                selected_model = models.get(selected_model_id)
                 if selected_model:
                     await check_model_access(user, selected_model)
 

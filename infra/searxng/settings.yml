@@ -4,6 +4,8 @@ use_default_settings:
       - bing
       - google
       - google cse
+      - brave
+      - duckduckgo web
 
 general:
   debug: false
@@ -36,8 +38,12 @@ outgoing:
 
 engines:
   - name: bing
-    disabled: false
+    disabled: true
   - name: google
-    disabled: false
+    disabled: true
   - name: google cse
+    disabled: true
+  - name: brave
+    disabled: false
+  - name: duckduckgo web
     disabled: false

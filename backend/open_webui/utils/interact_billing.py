@@ -119,6 +119,13 @@ def _nested_int(data: dict[str, Any], container: str, key: str) -> int:
     return _non_negative_int(nested.get(key)) if isinstance(nested, dict) else 0
 
 
+def _first_present_int(data: dict[str, Any], keys: tuple[str, ...], fallback: int) -> int:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return _non_negative_int(data[key])
+    return _non_negative_int(fallback)
+
+
 def usage_token_counts(
     usage: Optional[dict[str, Any]],
     fallback_input_tokens: int,
@@ -145,11 +152,10 @@ def usage_token_counts(
         or usage.get("toolUsePromptTokenCount")
     )
 
-    output_tokens = _non_negative_int(
-        usage.get("output_tokens")
-        or usage.get("completion_tokens")
-        or usage.get("candidatesTokenCount")
-        or fallback_output_tokens
+    output_tokens = _first_present_int(
+        usage,
+        ("output_tokens", "completion_tokens", "candidatesTokenCount"),
+        fallback_output_tokens,
     )
     compute_tokens = _non_negative_int(
         usage.get("compute_tokens")

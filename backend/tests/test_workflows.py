@@ -1,10 +1,13 @@
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 from open_webui.retrieval.utils import _extract_public_links
 from open_webui.retrieval.web import utils as web_utils
 from open_webui.routers.workflows import (
+    ServiceFollowUpEmailDraftRequest,
     WorkflowResumeRequest,
     _as_bool,
     _campaign_email_idempotency_material,
@@ -23,6 +26,8 @@ from open_webui.routers.workflows import (
     _email_compose_context,
     _email_draft_contact_context,
     _email_knowledge_context,
+    _execute_workflow,
+    _follow_up_email_prompt,
     _managed_model_id_for_use_case,
     _managed_prospecting_meta,
     _managed_prospecting_workflow_graph,
@@ -33,8 +38,11 @@ from open_webui.routers.workflows import (
     _parse_email_draft,
     _prioritize_web_search_fetch_results,
     _public_contacts_from_text,
+    _response_data,
     _resume_workflow_run_internal,
     _runnable_model_ids,
+    _same_email_draft,
+    _settle_failed_workflow_billing,
     _usable_fetched_page_content,
     _validate_email_campaign_policy,
     _validate_email_draft_content,
@@ -42,8 +50,13 @@ from open_webui.routers.workflows import (
     _workflow_multimodal_content,
     _workflow_model_attempts,
 )
+from open_webui.models.workflows import WorkflowRunForm
 from open_webui.semantic_query.contracts import QueryPlan
-from open_webui.utils.workflow_runtime import PROSPECTING_DISCOVERY_CONTRACT, WorkflowRuntimeError
+from open_webui.utils.workflow_runtime import (
+    PROSPECTING_DISCOVERY_CONTRACT,
+    WorkflowRuntimeError,
+    execute_workflow_graph,
+)
 from open_webui.utils.workflows import (
     WorkflowAccessContext,
     decide_workflow_candidates,
@@ -155,7 +168,7 @@ def test_managed_prospecting_workflow_is_deterministic_and_publishable():
     assert search_config['max_total_snippet_chars'] == 6000
     assert search_config['max_content_chars'] == 4000
     assert search_config['max_total_content_chars'] == 12000
-    assert graph['schema_version'] == 11
+    assert graph['schema_version'] == 13
     assert meta['managed']['read_only'] is True
     assert meta['acl']['scope'] == 'private'
     assert _validate_workflow_configuration(graph, 'private', meta, for_publish=True)['ok'] is True
@@ -186,6 +199,402 @@ def test_managed_prospecting_model_prefers_declared_use_case():
         )
         is None
     )
+
+
+def test_workflow_response_data_unwraps_single_item_provider_list():
+    payload = {'choices': [{'message': {'content': 'ok'}}]}
+
+    assert _response_data([payload]) == payload
+
+
+def test_workflow_response_data_decodes_json_body_variants():
+    payload = {'choices': [{'message': {'content': 'ok'}}]}
+
+    assert _response_data(SimpleNamespace(body=json.dumps(payload).encode())) == payload
+    assert _response_data(SimpleNamespace(body=json.dumps([payload]))) == payload
+
+
+def test_workflow_response_data_accepts_model_dump_and_memoryview_body():
+    payload = {
+        'choices': [{'message': {'content': 'ok'}}],
+        'usage': {'input_tokens': 12, 'output_tokens': 3, 'total_tokens': 15},
+    }
+
+    assert _response_data(SimpleNamespace(model_dump=lambda: payload)) == payload
+    assert _response_data(
+        SimpleNamespace(body=memoryview(json.dumps(payload).encode()))
+    ) == payload
+
+
+def test_workflow_response_data_rejects_ambiguous_or_invalid_envelopes():
+    payload = {'choices': [{'message': {'content': 'ok'}}]}
+
+    assert _response_data([payload, payload]) == {}
+    assert _response_data(SimpleNamespace(body='not-json')) == {}
+
+
+@pytest.mark.asyncio
+async def test_search_brief_is_rendered_once_after_web_search():
+    captured = {}
+
+    async def node_runner(node_type, config, incoming, workflow_input):
+        assert node_type == 'web_search'
+        return {
+            'queries': ['industrial equipment'],
+            'results': [{'url': 'https://example.com', 'title': 'Example'}],
+            'result_count': 1,
+        }
+
+    async def model_runner(prompt, system_prompt, model_id, parts):
+        captured['prompt'] = prompt
+        captured['system_prompt'] = system_prompt
+        return {
+            'text': 'accepted',
+            'model_id': model_id,
+            'usage': {'input_tokens': 20, 'output_tokens': 2, 'total_tokens': 22},
+        }
+
+    graph = {
+        'nodes': [
+            {'id': 'input', 'data': {'type': 'form_input'}},
+            {'id': 'search', 'data': {'type': 'web_search'}},
+            {
+                'id': 'policy',
+                'data': {
+                    'type': 'system_prompt',
+                    'config': {'text': 'brief={{search_brief}}'},
+                },
+            },
+            {
+                'id': 'model',
+                'data': {
+                    'type': 'agent',
+                    'config': {'model_id': 'model-a', 'max_attempts': 2},
+                },
+            },
+            {'id': 'output', 'data': {'type': 'webhook_response'}},
+        ],
+        'edges': [
+            {'source': 'input', 'target': 'search'},
+            {'source': 'search', 'target': 'policy'},
+            {'source': 'policy', 'target': 'model'},
+            {'source': 'model', 'target': 'output'},
+        ],
+    }
+    brief = {
+        'sentinel': 'UNIQUE_BRIEF_SENTINEL',
+        'commercialEntryPoints': [{'name': 'PEEK wear parts'}],
+    }
+
+    result = await execute_workflow_graph(
+        graph,
+        {
+            'message': 'find prospects',
+            'data': {'search_brief': brief, 'search_queries': ['equipment maker']},
+        },
+        model_runner=model_runner,
+        node_runner=node_runner,
+    )
+
+    assert captured['system_prompt'].count('UNIQUE_BRIEF_SENTINEL') == 1
+    assert 'UNIQUE_BRIEF_SENTINEL' not in captured['prompt']
+    assert result['model_calls'] == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_model_accepts_single_item_envelope_and_counts_one_call(monkeypatch):
+    workflow = _workflow(
+        graph={
+            'nodes': [
+                {'id': 'input', 'data': {'type': 'form_input'}},
+                {
+                    'id': 'model',
+                    'data': {
+                        'type': 'agent',
+                        'config': {'model_id': 'model-a', 'max_attempts': 2},
+                    },
+                },
+                {'id': 'output', 'data': {'type': 'webhook_response'}},
+            ],
+            'edges': [
+                {'source': 'input', 'target': 'model'},
+                {'source': 'model', 'target': 'output'},
+            ],
+        },
+        meta={'managed': {'key': 'interact.crm.prospecting.discovery'}},
+    )
+    provider_calls = []
+    payload = {
+        'model': 'model-a',
+        'choices': [{'message': {'content': 'accepted'}}],
+        'usage': {'input_tokens': 17, 'output_tokens': 4, 'total_tokens': 21},
+    }
+
+    async def generate(_request, body, user, **_kwargs):
+        provider_calls.append(body)
+        return [payload]
+
+    async def allow(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        'open_webui.routers.workflows.get_runtime_models_for_user',
+        AsyncMock(return_value={'model-a': {'id': 'model-a'}}),
+    )
+    monkeypatch.setattr('open_webui.routers.workflows.check_model_access', allow)
+    monkeypatch.setattr('open_webui.routers.workflows.generate_chat_completion', generate)
+    monkeypatch.setattr('open_webui.utils.crm_model_catalog.assert_agent_ready', allow)
+
+    result = await _execute_workflow(
+        SimpleNamespace(state=SimpleNamespace()),
+        SimpleNamespace(id='user-a'),
+        workflow,
+        WorkflowRunForm(
+            input={'message': 'find prospects'},
+            trigger_type='manual_test',
+            model_id='model-a',
+            confirmed=True,
+        ),
+        access_context_override=_context(),
+    )
+
+    assert len(provider_calls) == 1
+    assert result['model_calls'] == 1
+    assert result['usage']['input_tokens'] == 17
+    assert result['usage']['output_tokens'] == 4
+    assert result['usage']['total_tokens'] == 21
+    assert 'accepted' in json.dumps(result['outputs'][0])
+
+
+@pytest.mark.asyncio
+async def test_managed_model_empty_envelope_stops_after_one_billable_attempt(monkeypatch):
+    workflow = _workflow(
+        graph={
+            'nodes': [
+                {'id': 'input', 'data': {'type': 'form_input'}},
+                {
+                    'id': 'model',
+                    'data': {
+                        'type': 'agent',
+                        'config': {
+                            'model_id': 'model-a',
+                            'output_contract': PROSPECTING_DISCOVERY_CONTRACT,
+                            'max_attempts': 2,
+                        },
+                    },
+                },
+            ],
+            'edges': [{'source': 'input', 'target': 'model'}],
+        },
+        meta={'managed': {'key': 'interact.crm.prospecting.discovery'}},
+    )
+    provider_calls = []
+
+    async def generate(_request, body, user, **_kwargs):
+        provider_calls.append(body)
+        return []
+
+    async def allow(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        'open_webui.routers.workflows.get_runtime_models_for_user',
+        AsyncMock(return_value={'model-a': {'id': 'model-a'}}),
+    )
+    monkeypatch.setattr('open_webui.routers.workflows.check_model_access', allow)
+    monkeypatch.setattr('open_webui.routers.workflows.generate_chat_completion', generate)
+    monkeypatch.setattr('open_webui.utils.crm_model_catalog.assert_agent_ready', allow)
+
+    with pytest.raises(WorkflowRuntimeError, match='停止重複呼叫') as failed:
+        await _execute_workflow(
+            SimpleNamespace(state=SimpleNamespace()),
+            SimpleNamespace(id='user-a'),
+            workflow,
+            WorkflowRunForm(
+                input={'message': 'find prospects'},
+                trigger_type='manual_test',
+                model_id='model-a',
+                confirmed=True,
+            ),
+            access_context_override=_context(),
+        )
+
+    assert len(provider_calls) == 1
+    assert failed.value.model_calls == 1
+    assert failed.value.execution_usage['input_tokens'] > 0
+    assert failed.value.execution_usage['output_tokens'] == 0
+
+
+@pytest.mark.asyncio
+async def test_managed_model_preflight_failure_never_calls_provider(monkeypatch):
+    workflow = _workflow(
+        graph={
+            'nodes': [
+                {'id': 'input', 'data': {'type': 'form_input'}},
+                {
+                    'id': 'model',
+                    'data': {
+                        'type': 'agent',
+                        'config': {'model_id': 'model-a', 'max_attempts': 2},
+                    },
+                },
+            ],
+            'edges': [{'source': 'input', 'target': 'model'}],
+        },
+        meta={'managed': {'key': 'interact.crm.prospecting.discovery'}},
+    )
+    provider = AsyncMock()
+
+    async def reject_preflight(*_args, **_kwargs):
+        raise WorkflowRuntimeError('provider quota is unavailable')
+
+    monkeypatch.setattr(
+        'open_webui.routers.workflows.get_runtime_models_for_user',
+        AsyncMock(return_value={'model-a': {'id': 'model-a'}}),
+    )
+    monkeypatch.setattr('open_webui.routers.workflows.generate_chat_completion', provider)
+    monkeypatch.setattr(
+        'open_webui.utils.crm_model_catalog.assert_agent_ready',
+        reject_preflight,
+    )
+
+    with pytest.raises(WorkflowRuntimeError, match='quota') as failed:
+        await _execute_workflow(
+            SimpleNamespace(state=SimpleNamespace()),
+            SimpleNamespace(id='user-a'),
+            workflow,
+            WorkflowRunForm(
+                input={'message': 'find prospects'},
+                trigger_type='manual_test',
+                model_id='model-a',
+                confirmed=True,
+            ),
+            access_context_override=_context(),
+        )
+
+    provider.assert_not_awaited()
+    assert getattr(failed.value, 'model_calls', 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_managed_model_provider_exception_counts_one_input_only_attempt(monkeypatch):
+    workflow = _workflow(
+        graph={
+            'nodes': [
+                {'id': 'input', 'data': {'type': 'form_input'}},
+                {
+                    'id': 'model',
+                    'data': {
+                        'type': 'agent',
+                        'config': {'model_id': 'model-a', 'max_attempts': 2},
+                    },
+                },
+            ],
+            'edges': [{'source': 'input', 'target': 'model'}],
+        },
+        meta={'managed': {'key': 'interact.crm.prospecting.discovery'}},
+    )
+    provider_calls = []
+
+    async def generate(_request, body, user, **_kwargs):
+        provider_calls.append(body)
+        raise RuntimeError('provider connection failed')
+
+    async def allow(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        'open_webui.routers.workflows.get_runtime_models_for_user',
+        AsyncMock(return_value={'model-a': {'id': 'model-a'}}),
+    )
+    monkeypatch.setattr('open_webui.routers.workflows.check_model_access', allow)
+    monkeypatch.setattr('open_webui.routers.workflows.generate_chat_completion', generate)
+    monkeypatch.setattr('open_webui.utils.crm_model_catalog.assert_agent_ready', allow)
+
+    with pytest.raises(RuntimeError, match='connection failed') as failed:
+        await _execute_workflow(
+            SimpleNamespace(state=SimpleNamespace()),
+            SimpleNamespace(id='user-a'),
+            workflow,
+            WorkflowRunForm(
+                input={'message': 'find prospects'},
+                trigger_type='manual_test',
+                model_id='model-a',
+                confirmed=True,
+            ),
+            access_context_override=_context(),
+        )
+
+    assert len(provider_calls) == 1
+    assert failed.value.model_calls == 1
+    assert failed.value.execution_usage['input_tokens'] > 0
+    assert failed.value.execution_usage['output_tokens'] == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_workflow_billing_commits_one_used_attempt_and_never_cancels():
+    authorization = SimpleNamespace(reservation_id='reservation-a')
+    commits = []
+    cancellations = []
+    error = WorkflowRuntimeError('provider returned an empty response')
+    error.model_calls = 1
+    error.execution_usage = {
+        'input_tokens': 123,
+        'output_tokens': 0,
+        'total_tokens': 123,
+        'measurement': 'estimated',
+    }
+
+    class BillingClient:
+        async def commit(self, *args, **kwargs):
+            commits.append((args, kwargs))
+
+        async def cancel(self, *args):
+            cancellations.append(args)
+
+    await _settle_failed_workflow_billing(
+        BillingClient(),
+        authorization,
+        SimpleNamespace(id='user-a'),
+        {'model': 'model-a'},
+        {'workflow': {'id': 'workflow-a'}},
+        error,
+        'before-model-use',
+    )
+
+    assert cancellations == []
+    assert len(commits) == 1
+    assert commits[0][0][4] == error.execution_usage
+    assert commits[0][1] == {'status_value': 'failed'}
+
+
+@pytest.mark.asyncio
+async def test_failed_workflow_billing_cancels_when_provider_was_not_called():
+    authorization = SimpleNamespace(reservation_id='reservation-a')
+    commits = []
+    cancellations = []
+    error = WorkflowRuntimeError('preflight rejected the model')
+    error.model_calls = 0
+
+    class BillingClient:
+        async def commit(self, *args, **kwargs):
+            commits.append((args, kwargs))
+
+        async def cancel(self, *args):
+            cancellations.append(args)
+
+    await _settle_failed_workflow_billing(
+        BillingClient(),
+        authorization,
+        SimpleNamespace(id='user-a'),
+        {'model': 'model-a'},
+        {'workflow': {'id': 'workflow-a'}},
+        error,
+        'before-model-use',
+    )
+
+    assert commits == []
+    assert cancellations == [(authorization, 'before-model-use')]
 
 
 def test_managed_prospecting_model_prefers_company_owned_use_case_agent():
@@ -837,6 +1246,49 @@ def test_email_draft_validation_blocks_user_instruction_as_message_body():
 
     with pytest.raises(WorkflowRuntimeError, match='阻止將操作指令當成郵件寄出'):
         _validate_email_draft_content('產品介紹', request, request)
+
+
+def test_follow_up_email_prompt_uses_only_one_immediately_previous_email():
+    prompt = _follow_up_email_prompt(
+        ServiceFollowUpEmailDraftRequest(
+            companyEmail='owner@example.com',
+            companyUserId='company-a',
+            productRole='bd',
+            companyName='測試股份有限公司',
+            contactName='王小姐',
+            contactTitle='採購',
+            currentSubject='想確認目前需求',
+            currentText='王小姐您好，本次想確認目前需求。',
+            previousSubject='上次產品資料',
+            previousText='王小姐您好，附上上次產品資料。',
+            previousSentAt='2026-09-01T09:00:00+08:00',
+        )
+    )
+
+    assert 'immediately_previous_sent_email' in prompt
+    assert prompt.count('上次產品資料') == 2
+    assert '不得假設客戶已讀、已回覆、已承諾或有新需求' in prompt
+
+
+def test_follow_up_email_rejects_an_exact_copy_of_previous_message():
+    assert _same_email_draft(
+        ' 上次產品資料 ',
+        '王小姐您好，\n附上上次產品資料。',
+        '上次產品資料',
+        '王小姐您好，附上上次產品資料。',
+    )
+    assert _same_email_draft(
+        '換一個主旨',
+        '王小姐您好，附上上次產品資料。',
+        '上次產品資料',
+        '王小姐您好，附上上次產品資料。',
+    )
+    assert not _same_email_draft(
+        '確認近期需求',
+        '王小姐您好，想確認近期是否有評估需求。',
+        '上次產品資料',
+        '王小姐您好，附上上次產品資料。',
+    )
 
 
 @pytest.mark.asyncio

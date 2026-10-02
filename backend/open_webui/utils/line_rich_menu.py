@@ -660,9 +660,10 @@ def _role_menu_items(
                 'label': '擬定跟進信',
                 'icon': 'chat',
                 'accent': '#0891B2',
-                'action': _message_action(
-                    '擬定跟進信',
-                    '請根據最近跟進與交易紀錄，找出需要下一封信的客戶並產生專業簡潔草稿；不要直接寄送。',
+                'action': (
+                    _uri_action('擬定跟進信', f'{liff_uri}?task=am-draft')
+                    if liff_uri
+                    else _message_action('擬定跟進信', '請協助擬定跟進信草稿，不要寄送。')
                 ),
             },
             {

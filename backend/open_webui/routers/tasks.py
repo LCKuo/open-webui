@@ -22,7 +22,7 @@ from open_webui.routers.pipelines import process_pipeline_inlet_filter
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.interact_billing import InteractBillingClient, is_billing_enabled
-from open_webui.utils.models import check_model_access, get_all_models
+from open_webui.utils.models import check_model_access, get_all_models, get_runtime_models_for_user
 from open_webui.utils.response import record_auxiliary_usage
 from open_webui.utils.task import (
     autocomplete_generation_template,
@@ -64,13 +64,24 @@ TASK_CONFIG_KEYS = {
 
 
 async def _generate_task_completion(request: Request, payload: dict, user):
-    if getattr(request.state, 'interact_billing_parent_active', False) or not is_billing_enabled():
+    if (
+        getattr(request.state, 'interact_billing_parent_active', False)
+        or not is_billing_enabled()
+    ):
         response = await generate_chat_completion(request, form_data=payload, user=user)
         return record_auxiliary_usage(request, response, payload)
 
-    if not request.app.state.MODELS:
-        await get_all_models(request, user=user)
-    model = request.app.state.MODELS.get(str(payload.get('model') or ''))
+    direct_model = (
+        request.state.model
+        if getattr(request.state, 'direct', False) and hasattr(request.state, 'model')
+        else None
+    )
+    model_id = str(payload.get('model') or '')
+    model = direct_model if direct_model and direct_model.get('id') == model_id else None
+    if model is None:
+        if not request.app.state.MODELS:
+            await get_all_models(request, user=user)
+        model = request.app.state.MODELS.get(model_id)
     if model is None:
         raise HTTPException(status_code=404, detail='Model not found')
     if user.role == 'user':
@@ -121,6 +132,21 @@ async def _generate_task_completion(request: Request, payload: dict, user):
         raise
     finally:
         request.state.interact_billing_parent_active = False
+
+
+async def _task_models_for_request(request: Request, user, model_id: str | None):
+    if not (getattr(request.state, 'direct', False) and hasattr(request.state, 'model')):
+        runtime_models = await get_runtime_models_for_user(request, user)
+        request.state.runtime_models = runtime_models
+        return runtime_models
+
+    direct_model = request.state.model
+    if direct_model.get('user_supplied'):
+        return {direct_model['id']: direct_model}
+    return {
+        **request.app.state.MODELS,
+        direct_model['id']: direct_model,
+    }
 
 
 async def get_config_values(key_map: dict[str, str]) -> dict:
@@ -179,13 +205,7 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
             content={'detail': 'Title generation is disabled'},
         )
 
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            **request.app.state.MODELS,
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
+    models = await _task_models_for_request(request, user, form_data.get('model'))
 
     model_id = form_data['model']
     if not model_id:
@@ -263,13 +283,7 @@ async def generate_follow_ups(request: Request, form_data: dict, user=Depends(ge
             content={'detail': 'Follow-up generation is disabled'},
         )
 
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            **request.app.state.MODELS,
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
+    models = await _task_models_for_request(request, user, form_data.get('model'))
 
     model_id = form_data['model']
     if model_id not in models:
@@ -333,13 +347,7 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
             content={'detail': 'Tags generation is disabled'},
         )
 
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            **request.app.state.MODELS,
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
+    models = await _task_models_for_request(request, user, form_data.get('model'))
 
     model_id = form_data['model']
     if model_id not in models:
@@ -397,13 +405,7 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
 
 @router.post('/image_prompt/completions')
 async def generate_image_prompt(request: Request, form_data: dict, user=Depends(get_verified_user)):
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            **request.app.state.MODELS,
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
+    models = await _task_models_for_request(request, user, form_data.get('model'))
 
     model_id = form_data['model']
     if model_id not in models:
@@ -479,13 +481,7 @@ async def generate_queries(request: Request, form_data: dict, user=Depends(get_v
         log.info(f'Reusing cached queries: {request.state.cached_queries}')
         return request.state.cached_queries
 
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            **request.app.state.MODELS,
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
+    models = await _task_models_for_request(request, user, form_data.get('model'))
 
     model_id = form_data['model']
     if model_id not in models:
@@ -560,13 +556,7 @@ async def generate_autocompletion(request: Request, form_data: dict, user=Depend
                 detail=ERROR_MESSAGES.INPUT_TOO_LONG(autocomplete_input_max_length),
             )
 
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            **request.app.state.MODELS,
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
+    models = await _task_models_for_request(request, user, form_data.get('model'))
 
     model_id = form_data['model']
     if model_id not in models:
@@ -624,13 +614,7 @@ async def generate_autocompletion(request: Request, form_data: dict, user=Depend
 
 @router.post('/emoji/completions')
 async def generate_emoji(request: Request, form_data: dict, user=Depends(get_verified_user)):
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            **request.app.state.MODELS,
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
+    models = await _task_models_for_request(request, user, form_data.get('model'))
 
     model_id = form_data['model']
     if model_id not in models:
@@ -690,13 +674,7 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
 
 @router.post('/moa/completions')
 async def generate_moa_response(request: Request, form_data: dict, user=Depends(get_verified_user)):
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            **request.app.state.MODELS,
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
+    models = await _task_models_for_request(request, user, form_data.get('model'))
 
     model_id = form_data['model']
 

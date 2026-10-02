@@ -37,14 +37,20 @@ from open_webui.models.interact_data_connectors import InteractDataConnectors
 from open_webui.models.interact_semantic import InteractSemantic
 from open_webui.models.interact_sso import InteractSsoTickets
 from open_webui.models.models import Models
+from open_webui.models.provider_credentials import UserProviderCredentials
 from open_webui.models.users import Users
 from open_webui.storage.provider import Storage
 from open_webui.tools.interact_crm_actions import (
     interact_crm_bd_candidates_list,
     interact_crm_bd_discovery_start,
+    interact_crm_bd_discovery_status,
 )
 from open_webui.tools.interact_database import scan_data_connector_schema
 from open_webui.utils.assistant_content import output_text, response_text
+from open_webui.utils.crm_discovery_feedback import (
+    is_discovery_status_question, discovery_run_id, format_discovery_status,
+)
+from open_webui.utils.upstream_retry import provider_quota_exhausted
 from open_webui.utils.auth import get_password_hash, get_verified_user
 from open_webui.utils.automations import (
     _resolve_model_features,
@@ -78,7 +84,11 @@ from open_webui.utils.line_rich_menu import (
     parse_line_postback_data,
 )
 from open_webui.utils.misc import get_message_list, validate_email_format
-from open_webui.utils.models import get_all_models, refresh_runtime_model_cache_entry
+from open_webui.utils.models import (
+    get_all_models,
+    get_runtime_models_for_user,
+    refresh_runtime_model_cache_entry,
+)
 from open_webui.utils.workflow_launch import validate_launch_input
 from open_webui.utils.workflows import WorkflowAccessContext
 from pydantic import BaseModel, Field, model_validator
@@ -490,8 +500,24 @@ SEMANTIC_CHANNEL_COMPLETION_INSTRUCTION = (
 )
 
 CRM_AM_ACTION_INSTRUCTION = (
+    'When the employee asks what to handle today, call interact_crm_am_work_items_list first. '
+    'It returns the employee-owned scheduled follow-ups, quotation work, shipment-seven-day care, '
+    'and customer signals with stable task keys. Keep separate tasks separate even for the same company. '
+    'Follow-up scheduling is a human decision: a customer saying no current demand never implies never-follow-up. '
+    'Before changing the schedule, read crm_app.ai_customer_follow_up_plans (updated_at::text as revision), '
+    'confirm a concrete future date or explicit never with the employee, then pass follow_up_plan_mode, '
+    'next_follow_up_at and follow_up_plan_revision. Use unchanged when only recording facts. '
+    'Scheduled dates use Taiwan time +08:00 and must be in the future. Never invent a purchase cycle. '
     'You are the AM Agent. Database and semantic tools are strictly read-only. Your only CRM write '
-    'APIs are interact_crm_follow_up_create and interact_crm_follow_up_update. When the user explicitly '
+    'APIs are interact_crm_follow_up_create, interact_crm_follow_up_update, '
+    'interact_crm_shipment_care_complete, interact_crm_quotation_follow_up_record, '
+    'interact_crm_am_handoff_accept, interact_crm_am_work_summary, '
+    'interact_crm_am_operation_get, and interact_crm_am_notification_snooze. '
+    'The employee may explicitly save a writing preference with '
+    'interact_crm_am_work_preference_save; never infer a permanent preference from a one-off edit. '
+    'Complete shipment care only after the employee confirms the '
+    'exact shipment and factual outcome; the API creates the follow-up and completes that one task atomically. '
+    'When the user explicitly '
     'asks to record a confirmed customer interaction, use interact_crm_follow_up_create. To edit an '
     'existing follow-up, first read crm_app.ai_follow_ups and its record_version, confirm every replacement '
     'fact, then use interact_crm_follow_up_update. Resolve company, contact, opportunity, current time, '
@@ -500,7 +526,14 @@ CRM_AM_ACTION_INSTRUCTION = (
     'generic workbench link as a substitute for completing an action. Do not narrate progress, announce '
     'a future lookup, or end after a tool call; return the complete business answer in the same turn. Ask at most one short blocking '
     'question only when multiple records match or a safety-critical fact cannot be inferred. Never claim a '
-    'write succeeded unless the API returns ok=true. Never use interact_crm_bd_candidates_list. '
+    'write succeeded unless the API returns ok=true. A quotation follow-up must use '
+    'interact_crm_quotation_follow_up_record rather than a general company follow-up. Accept a BD handoff '
+    'only after showing its confirmed demand and next step; the CRM rechecks ownership, bans, candidate '
+    'status and current permissions. For a lost response or timeout, call interact_crm_am_operation_get '
+    'with the same operation ID before retrying. Notification snooze changes only the employee reminder '
+    'window and never changes a customer due date. A matched inbound email may be summarized and used to '
+    'prepare a CRM draft, but no tool in this instruction authorizes sending it. Never use '
+    'interact_crm_bd_candidates_list. '
     'Never use interact_crm_bd_discovery_start or '
     'interact_crm_bd_profile_suggestion_create, and never write CRM tables directly.'
 )
@@ -522,13 +555,23 @@ CRM_EMBEDDED_AM_REVIEW_INSTRUCTION = (
 )
 
 CRM_BD_ACTION_INSTRUCTION = (
+    'For discovery task status, latest run, zero candidates, saturation, reasons or next steps, '
+    'call interact_crm_bd_discovery_status first (omit run_id for latest). '
+    'Use its actual counts, adjustments and recommendations; never infer the market is exhausted '
+    'or claim there is no access before calling it. A status question does not authorize a new search. '
+    'Distinguish performed adjustments from suggestions requiring human confirmation. '
+    'Never modify exclusions, expand geographic scope or approve/send emails to obtain more results. '
     'You are the BD Agent. Database and semantic tools are strictly read-only. You may search public '
     'company websites, directories, exhibitions, registries, and public business contact pages, including '
     'verifiable corporate phone numbers and email addresses; never guess private personal contact data. '
     'Use interact_crm_bd_candidates_list whenever the user asks for pending or reviewed prospect '
     'candidates; never claim that the list is unavailable before calling it. Your only CRM write APIs '
-    'are interact_crm_bd_discovery_start and '
-    'interact_crm_bd_profile_suggestion_create. When the user asks to start or execute prospect discovery, '
+    'are interact_crm_bd_discovery_start, interact_crm_bd_profile_suggestion_create, '
+    'interact_crm_bd_handoff_prepare, interact_crm_bd_work_summary, '
+    'interact_crm_bd_operation_get, and interact_crm_bd_notification_snooze. '
+    'The employee may explicitly save a writing preference with '
+    'interact_crm_bd_work_preference_save; never infer a permanent preference from a one-off edit. '
+    'When the user asks to start or execute prospect discovery, '
     'call interact_crm_bd_discovery_start immediately with no arguments unless the user explicitly provided '
     'an override. CRM automatically selects the next eligible active segment from run history, uses safe '
     'scope defaults, and applies target exclusions, CRM/candidate deduplication, do-not-contact rules, and '
@@ -540,7 +583,12 @@ CRM_BD_ACTION_INSTRUCTION = (
     'candidate list before asking the user. Never return a checklist of questions and never send a generic '
     'workbench link as a substitute for completing an action. Do not narrate progress, announce a future '
     'lookup, or end after a tool call; return the complete business answer in the same turn. Ask at most one short blocking question only '
-    'when no authorized system record can resolve the target. Never use interact_crm_follow_up_create or '
+    'when no authorized system record can resolve the target. Candidate approval is not evidence of actual '
+    'customer demand and does not authorize a handoff. Use interact_crm_bd_handoff_prepare only after the '
+    'employee confirms a concrete demand, a recommended next step, and optionally the receiving AM. For a '
+    'lost response or timeout, call interact_crm_bd_operation_get with the same operation ID before retrying. '
+    'Notification snooze changes only employee reminders and never changes prospect or customer state. '
+    'Never use interact_crm_follow_up_create or '
     'interact_crm_follow_up_update, and never write CRM tables directly.'
 )
 
@@ -599,6 +647,10 @@ def _tool_sequence_ended_without_answer(items: Any) -> bool:
 
 
 CHANNEL_RUNTIME_ERROR_MESSAGES = {
+    'AI-UPSTREAM-QUOTA-EXHAUSTED': 'AI 供應商的 API 配額已用完，這次未執行。這不是 CRM 儲值餘額；請由管理員確認供應商方案或等待配額重置，不必重複送出。',
+    'AI-UPSTREAM-UNAVAILABLE': 'AI 供應商暫時忙碌或無法連線，短暫重試後仍未完成。請稍後再試；已完成的 CRM 操作請先查看工作紀錄，避免重複新增。',
+    'AI-UPSTREAM-RATE-LIMITED': 'AI 供應商目前流量受限，這次未完成。請稍後再試；也可先開啟 AM／BD 工作台處理資料，不必重複連點。',
+    'AI-UPSTREAM-INVALID-TOOL-ARGUMENTS': 'AI 產生的工具參數不完整，這次未完成。請重新提出需求；已完成的 CRM 操作請先在工作台確認，避免重複新增。',
     'WORKFLOW-QUICK-ACTION-UNAVAILABLE': '這個快速工作流已停用、更新或不再允許此渠道使用，請從最新按鈕重新選擇。',
     'AI-MODEL-NOT-CONFIGURED': '此渠道尚未設定 AI 模型。',
     'AI-MODEL-NOT-FOUND': '此渠道設定的 AI 模型不存在或已停用。',
@@ -620,6 +672,14 @@ def _channel_runtime_failure(detail: str) -> tuple[str, str]:
     lowered = detail.lower()
     if 'workflow-quick-action-unavailable' in lowered:
         code = 'WORKFLOW-QUICK-ACTION-UNAVAILABLE'
+    elif provider_quota_exhausted(lowered):
+        code = 'AI-UPSTREAM-QUOTA-EXHAUSTED'
+    elif any(marker in lowered for marker in ('too many requests', 'rate_limited', 'rate_limit_exceeded', 'resource_exhausted', 'http 429', "'status': 429", '"status": 429', "'code': 429", '"code": 429')):
+        code = 'AI-UPSTREAM-RATE-LIMITED'
+    elif any(marker in lowered for marker in ('http 502', 'http 503', 'http 504', 'high demand', 'service unavailable')):
+        code = 'AI-UPSTREAM-UNAVAILABLE'
+    elif 'arguments' in lowered and any(marker in lowered for marker in ('valid json', 'malformed', 'incomplete json')):
+        code = 'AI-UPSTREAM-INVALID-TOOL-ARGUMENTS'
     elif 'end of life' in lowered or 'model has been retired' in lowered or 'model_decommissioned' in lowered:
         code = 'AI-MODEL-RETIRED'
     elif 'timeout' in lowered or 'timed out' in lowered:
@@ -806,6 +866,7 @@ class ChannelChatRequest(BaseModel):
     fallbackModelId: str | None = None
     metadata: dict[str, Any] | None = None
     maxTokens: int | None = Field(default=None, ge=1, le=32768)
+    analysisOnly: bool = False
     workflowId: str | None = Field(default=None, min_length=1, max_length=128)
     workflowVersionId: str | None = Field(default=None, min_length=1, max_length=128)
     workflowTrigger: str | None = Field(default=None, min_length=1, max_length=80)
@@ -1035,15 +1096,37 @@ class ChannelHubLiffSelectRequest(ChannelHubLiffSessionRequest):
 class SystemLineNotificationRequest(BaseModel):
     companyEmail: str = Field(..., min_length=3, max_length=320)
     companyUserId: str = Field(..., min_length=1, max_length=200)
-    productRole: Literal['am'] = 'am'
+    productRole: Literal['am', 'bd'] = 'am'
     productKey: str = Field(..., min_length=1, max_length=60)
     productInstanceId: str = Field(..., min_length=1, max_length=160)
     message: str = Field(..., min_length=1, max_length=5000)
     idempotencyKey: str = Field(..., min_length=8, max_length=200)
+    productUserIds: list[str] = Field(..., min_length=1, max_length=200)
+    excludeLineUserRefs: list[str] = Field(default_factory=list, max_length=200)
     allowedRoles: list[Literal['owner', 'admin', 'member']] = Field(
         default_factory=lambda: ['owner', 'admin'],
         min_length=1,
         max_length=3,
+    )
+
+
+def _is_system_line_notification_recipient(
+    binding: InteractLineIdentityBindingModel,
+    payload: SystemLineNotificationRequest,
+) -> bool:
+    return bool(
+        binding.member_status == 'active'
+        and binding.member_role in payload.allowedRoles
+        and binding.identity_source == 'product'
+        and binding.product_key == payload.productKey
+        and binding.product_instance_id == payload.productInstanceId
+        and binding.product_user_id in payload.productUserIds
+        and binding.line_user_ref not in payload.excludeLineUserRefs
+        and (
+            binding.member_role in {'owner', 'admin'}
+            or payload.productRole in binding.product_team_codes
+        )
+        and binding.external_user_id
     )
 
 
@@ -1124,8 +1207,8 @@ def _stable_channel_chat_id(
     return f'interact-channel-{uuid5(NAMESPACE_URL, stable_key)}'
 
 
-def _model_has_enabled_builtin_tools(app, model_id: str) -> bool:
-    model = getattr(app.state, 'MODELS', {}).get(model_id, {})
+def _model_has_enabled_builtin_tools(app, model_id: str, models=None) -> bool:
+    model = (models or getattr(app.state, 'MODELS', {})).get(model_id, {})
     meta = model.get('info', {}).get('meta', {}) if isinstance(model, dict) else {}
     capabilities = meta.get('capabilities', {}) or {}
     if capabilities.get('builtin_tools', True) is False:
@@ -1764,7 +1847,17 @@ def _usage_tokens(usage: dict[str, Any] | None) -> int:
         return 0
     if usage.get('billable_tokens') is not None:
         return max(0, int(usage['billable_tokens'] or 0))
-    return usage_token_counts(usage, 0)[3]
+    counts = usage_token_counts(usage, 0)
+    return counts[3] if sum(counts[:3]) else 0
+
+
+def _channel_result_tokens(result: dict[str, Any], reserved_tokens: int) -> int:
+    usage = result.get('usage') or {}
+    if any(usage.get(key) is not None for key in ('billable_tokens', 'total_tokens', 'input_tokens', 'prompt_tokens')):
+        return _usage_tokens(usage)
+    if result.get('errorCode') in ('AI-UPSTREAM-RATE-LIMITED', 'AI-UPSTREAM-QUOTA-EXHAUSTED', 'AI-UPSTREAM-UNAVAILABLE'):
+        return 0
+    return reserved_tokens
 
 
 async def _platform_channel(
@@ -2139,6 +2232,8 @@ async def _complete_claimed_response(
 
 
 def _bd_direct_command(message: str) -> str | None:
+    if is_discovery_status_question(message):
+        return 'discovery_status'
     normalized = re.sub(r'\s+', '', str(message or '')).lower()
     discovery_phrases = (
         '執行潛客探索',
@@ -2163,13 +2258,13 @@ def _bd_direct_command(message: str) -> str | None:
 
 
 def _crm_channel_tool_context(
-    channel: InteractChannelModel,
+    channel: InteractChannelModel | None,
     company_identity: dict[str, Any],
     selected_model_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     metadata = {
-        'source': 'channel',
-        'channelId': channel.id,
+        'source': 'channel' if channel else 'crm_embedded',
+        'channelId': channel.id if channel else None,
         'modelId': selected_model_id,
         'companyUserId': company_identity.get('companyUserId'),
         'companyMemberId': company_identity.get('companyMemberId'),
@@ -2182,6 +2277,24 @@ def _crm_channel_tool_context(
         'productTeamCodes': company_identity.get('productTeamCodes') or [],
     }
     return {'companyUserId': company_identity.get('companyUserId')}, metadata
+
+
+async def _direct_crm_embedded_discovery_status(request, role, message, identity, model_id, enabled):
+    if role != 'bd' or not enabled or not is_discovery_status_question(message):
+        return None
+    if not identity or not identity.get('companyUserId') or not identity.get('productUserId'):
+        return None
+    user, metadata = _crm_channel_tool_context(None, identity, model_id)
+    raw = await interact_crm_bd_discovery_status(
+        run_id=discovery_run_id(message),
+        __request__=request, __user__=user, __metadata__=metadata,
+    )
+    result = _crm_action_result(raw)
+    return {
+        'ok': bool(result.get('ok')),
+        'content': format_discovery_status(result) if result.get('ok') else 'CRM 任務紀錄暫時無法讀取，請稍後重試；這次沒有另開搜尋。',
+        'outputs': [], 'usage': {}, 'directCrmAction': True,
+    }
 
 
 def _crm_action_result(raw: str) -> dict[str, Any]:
@@ -2242,6 +2355,17 @@ async def _direct_crm_channel_command(
             'reason': 'CRM-IDENTITY-NOT-READY',
         }
     user, metadata = _crm_channel_tool_context(channel, identity, model_id)
+    if command == 'discovery_status':
+        raw = await interact_crm_bd_discovery_status(
+            run_id=discovery_run_id(message),
+            __request__=request, __user__=user, __metadata__=metadata,
+        )
+        result = _crm_action_result(raw)
+        return {
+            'ok': bool(result.get('ok')),
+            'content': format_discovery_status(result) if result.get('ok') else str(result.get('error') or 'CRM 任務紀錄暫時無法讀取，沒有另開搜尋。'),
+            'outputs': [], 'usage': {}, 'directCrmAction': True,
+        }
     if command == 'discovery':
         raw = await interact_crm_bd_discovery_start(
             __request__=request,
@@ -2346,12 +2470,11 @@ async def _complete_claimed_result(
     # approval/input card. Treat that structured output as a valid response.
     if not content and not outputs:
         content = _fallback_text(channel)
-    usage = result.get('usage') if isinstance(result.get('usage'), dict) else {}
     context_summary_tokens = max(0, int(result.get('contextSummaryTokens') or 0))
     await InteractChannels.set_response(
         claim.event_id,
         content,
-        (_usage_tokens(usage) or reserved_tokens) + context_summary_tokens,
+        _channel_result_tokens(result, reserved_tokens) + context_summary_tokens,
         result.get('reason'),
     )
     return {**result, 'content': content, 'outputs': outputs}
@@ -4641,6 +4764,10 @@ async def channel_chat(  # noqa: C901
     request.state.interact_channel_runtime = True
     if not payload.message.strip() and not payload.parts:
         raise HTTPException(status_code=400, detail='A message or media part is required.')
+    if payload.analysisOnly and (
+        not crm_claims or payload.productRole != 'bd' or payload.workflowId
+    ):
+        raise HTTPException(status_code=403, detail='Analysis-only mode requires a CRM BD session without a workflow.')
 
     user = (
         await _crm_company_user(crm_claims)
@@ -4748,12 +4875,12 @@ async def channel_chat(  # noqa: C901
             model_id=payload.modelId,
         )
 
-    if not request.app.state.MODELS:
-        await get_all_models(request, user=user)
+    runtime_models = await get_runtime_models_for_user(request, user)
+    request.state.runtime_models = runtime_models
 
     model_id = payload.modelId
-    if model_id not in request.app.state.MODELS:
-        if payload.fallbackModelId and payload.fallbackModelId in request.app.state.MODELS:
+    if model_id not in runtime_models:
+        if payload.fallbackModelId and payload.fallbackModelId in runtime_models:
             model_id = payload.fallbackModelId
         else:
             raise HTTPException(
@@ -4764,7 +4891,7 @@ async def channel_chat(  # noqa: C901
     model_info = await Models.get_model_by_id(model_id)
     if model_info and not model_info.is_active:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Configured Open WebUI model was disabled.')
-    if model_info:
+    if model_info and not await UserProviderCredentials.has_for_user(user.id):
         runtime_model = refresh_runtime_model_cache_entry(request, model_info)
         if runtime_model is None:
             await get_all_models(request, refresh=True, user=user)
@@ -4782,7 +4909,7 @@ async def channel_chat(  # noqa: C901
                 detail='This Agent is not enabled for the requested CRM role.',
             )
 
-    runtime_model = request.app.state.MODELS.get(model_id, {})
+    runtime_model = runtime_models.get(model_id, {})
     model_knowledge = (
         runtime_model.get('info', {}).get('meta', {}).get('knowledge', [])
         if isinstance(runtime_model, dict)
@@ -4844,6 +4971,28 @@ async def channel_chat(  # noqa: C901
         user_message_id = str(uuid4())
         assistant_message_id = str(uuid4())
 
+    if crm_claims and not payload.analysisOnly:
+        direct = await _direct_crm_embedded_discovery_status(
+            request, payload.productRole, payload.message, verified_identity, model_id,
+            runtime_model.get('info', {}).get('meta', {}).get('builtinTools', {}).get('crm_bd_actions') is True,
+        )
+        if direct is not None:
+            await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, user_message_id, {
+                'id': user_message_id, 'parentId': parent_id, 'role': 'user',
+                'content': payload.message, 'childrenIds': [assistant_message_id],
+                'timestamp': int(time.time()), 'models': [model_id],
+            })
+            await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, assistant_message_id, {
+                'id': assistant_message_id, 'parentId': user_message_id, 'role': 'assistant',
+                'content': direct['content'], 'childrenIds': [], 'done': True,
+                'timestamp': int(time.time()), 'model': model_id, 'usage': {},
+            })
+            return {
+                **direct, 'chatId': chat_id, 'model': model_id,
+                'userMessageId': user_message_id, 'assistantMessageId': assistant_message_id,
+                'contextSummaryTokens': 0,
+            }
+
     messages, context_summary_tokens = await _prepare_channel_context(
         request,
         user,
@@ -4852,7 +5001,8 @@ async def channel_chat(  # noqa: C901
         payload,
     )
     if (
-        isinstance(runtime_model, dict)
+        not payload.analysisOnly
+        and isinstance(runtime_model, dict)
         and runtime_model.get('info', {}).get('meta', {}).get('builtinTools', {}).get('interact_database') is True
     ):
         messages.insert(0, {'role': 'system', 'content': SEMANTIC_CHANNEL_COMPLETION_INSTRUCTION})
@@ -4861,17 +5011,17 @@ async def channel_chat(  # noqa: C901
         if isinstance(runtime_model, dict)
         else {}
     )
-    if crm_claims and payload.productRole == 'am':
+    if not payload.analysisOnly and crm_claims and payload.productRole == 'am':
         messages.insert(0, {
             'role': 'system',
             'content': CRM_EMBEDDED_AM_REVIEW_INSTRUCTION,
         })
-    elif runtime_builtin_tools.get('crm_am_actions') is True:
+    elif not payload.analysisOnly and runtime_builtin_tools.get('crm_am_actions') is True:
         messages.insert(0, {
             'role': 'system',
             'content': CRM_AM_ACTION_INSTRUCTION,
         })
-    if runtime_builtin_tools.get('crm_bd_actions') is True:
+    if not payload.analysisOnly and runtime_builtin_tools.get('crm_bd_actions') is True:
         messages.insert(0, {'role': 'system', 'content': CRM_BD_ACTION_INSTRUCTION})
 
     form_data = {
@@ -4923,26 +5073,32 @@ async def channel_chat(  # noqa: C901
     }
     if payload.maxTokens:
         form_data['max_completion_tokens'] = payload.maxTokens
-    if _model_has_enabled_builtin_tools(request.app, model_id):
+    if payload.analysisOnly:
+        # Explicit empty tools bypasses model builtin and connector injection.
+        form_data['tools'] = []
+    elif _model_has_enabled_builtin_tools(request.app, model_id, runtime_models):
         form_data['params'] = {'function_calling': 'native'}
 
-    tool_ids = _resolve_model_tool_ids(request.app, model_id)
-    if payload.channelType == 'line' and not verified_identity:
-        tool_ids = []
-    features = await _resolve_model_features(request.app, model_id)
-    filter_ids = _resolve_model_filter_ids(request.app, model_id)
-    if tool_ids:
-        form_data['tool_ids'] = tool_ids
-    if features:
-        form_data['features'] = features
-    if filter_ids:
-        form_data['filter_ids'] = filter_ids
+    if not payload.analysisOnly:
+        tool_ids = _resolve_model_tool_ids(request.app, model_id, runtime_models)
+        if payload.channelType == 'line' and not verified_identity:
+            tool_ids = []
+        features = await _resolve_model_features(request.app, model_id, runtime_models)
+        filter_ids = _resolve_model_filter_ids(request.app, model_id, runtime_models)
+        if tool_ids:
+            form_data['tool_ids'] = tool_ids
+        if features:
+            form_data['features'] = features
+        if filter_ids:
+            form_data['filter_ids'] = filter_ids
 
     # External channels use the same deterministic selector and ACL context as
     # WebUI chat. Ambiguous requests remain normal chat instead of guessing.
     from open_webui.routers import workflows as workflow_routes
 
-    if payload.workflowId:
+    if payload.analysisOnly:
+        pass
+    elif payload.workflowId:
         if not payload.workflowVersionId or not channel_id or not access_context:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -5769,19 +5925,11 @@ async def send_system_line_notification(
     )
     recipients = [
         binding for binding in bindings
-        if binding.member_status == 'active'
-        and binding.member_role in payload.allowedRoles
-        and binding.identity_source == 'product'
-        and binding.product_key == payload.productKey
-        and binding.product_instance_id == payload.productInstanceId
-        and (
-            binding.member_role in {'owner', 'admin'}
-            or payload.productRole in binding.product_team_codes
-        )
-        and binding.external_user_id
+        if _is_system_line_notification_recipient(binding, payload)
     ]
     sent = 0
     failures: list[dict[str, str]] = []
+    deliveries: list[dict[str, str | None]] = []
     for binding in recipients:
         retry_key = str(uuid5(NAMESPACE_URL, f'{payload.idempotencyKey}:{binding.id}'))
         try:
@@ -5792,14 +5940,27 @@ async def send_system_line_notification(
                 retry_key=retry_key,
             )
             sent += 1
+            deliveries.append({
+                'lineUserRef': binding.line_user_ref,
+                'status': 'accepted',
+                'providerRequestId': retry_key,
+                'error': None,
+            })
         except Exception as error:
             failures.append({'lineUserRef': binding.line_user_ref, 'error': str(error)[:300]})
+            deliveries.append({
+                'lineUserRef': binding.line_user_ref,
+                'status': 'failed',
+                'providerRequestId': retry_key,
+                'error': str(error)[:300],
+            })
     return {
         'ok': not failures,
         'recipientCount': len(recipients),
         'sentCount': sent,
         'failedCount': len(failures),
         'failures': failures,
+        'deliveries': deliveries,
     }
 
 

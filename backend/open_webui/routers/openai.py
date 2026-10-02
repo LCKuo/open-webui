@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import re
-from typing import Optional
 from urllib.parse import quote, urlparse
 
 import aiofiles
@@ -13,6 +12,7 @@ import aiohttp
 from aiocache import cached
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -33,16 +33,17 @@ from open_webui.env import (
     FORWARD_SESSION_INFO_HEADER_CHAT_ID,
     MODELS_CACHE_TTL,
 )
-from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.config import Config
 from open_webui.models.groups import Groups
 from open_webui.models.models import Models
+from open_webui.models.provider_credentials import UserProviderCredentials
 from open_webui.models.users import UserModel
-from open_webui.utils.access_control import check_model_access, has_connection_access, has_permission
+from open_webui.utils.access_control import check_model_access, has_permission
 from open_webui.utils.anthropic import get_anthropic_models, is_anthropic_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import get_custom_headers, include_user_info_headers
+from open_webui.utils.openai_tool_compat import apply_chat_completion_tool_compat
 from open_webui.utils.interact_billing import require_metered_inference_entrypoint
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.model_ids import strip_provider_model_prefix
@@ -60,8 +61,9 @@ from open_webui.utils.session_pool import (
     get_session,
     stream_wrapper,
 )
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy.ext.asyncio import AsyncSession
+from open_webui.retrieval.web.utils import get_ssrf_safe_session, validate_url
+from open_webui.utils.upstream_retry import request_with_rate_limit_retry
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 log = logging.getLogger(__name__)
 
@@ -95,30 +97,35 @@ async def send_get_request(
     user: UserModel = None,
     config=None,
 ):
+    session = None
     try:
-        async with aiohttp.ClientSession(timeout=_MODEL_LIST_TIMEOUT, trust_env=True) as session:
-            if request and config:
-                headers, cookies = await get_headers_and_cookies(request, url, key, config, user=user)
-            else:
-                headers = {
-                    **({'Authorization': f'Bearer {key}'} if key else {}),
-                }
-                cookies = None
+        session, owns_session = await get_upstream_session(config)
+        if request and config:
+            headers, cookies = await get_headers_and_cookies(request, url, key, config, user=user)
+        else:
+            headers = {
+                **({'Authorization': f'Bearer {key}'} if key else {}),
+            }
+            cookies = None
 
-                if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-                    headers = include_user_info_headers(headers, user)
+            if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+                headers = include_user_info_headers(headers, user)
 
-            async with session.get(
-                url,
-                headers=headers,
-                cookies=cookies,
-                ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            ) as response:
-                return await response.json(loads=JSONCodec.loads)
+        async with session.get(
+            url,
+            headers=headers,
+            cookies=cookies,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            timeout=_MODEL_LIST_TIMEOUT,
+        ) as response:
+            return await response.json(loads=JSONCodec.loads)
     except Exception as e:
         # Handle connection error here
         log.error(f'Connection error: {e}')
         return None
+    finally:
+        if session is not None and locals().get('owns_session'):
+            await session.close()
 
 
 async def get_models_request(
@@ -298,12 +305,295 @@ async def normalize_openai_api_keys(api_base_urls: list[str], api_keys: list[str
     return api_keys
 
 
-async def get_openai_connection(idx: int) -> tuple[str, str, dict]:
-    _, api_base_urls, api_keys, api_configs = await get_openai_runtime_config()
-    url = api_base_urls[idx]
-    key = api_keys[idx]
-    api_config = api_configs.get(str(idx), api_configs.get(url, {}))
-    return url, key, api_config
+def get_openai_api_config(api_configs: dict, idx: int, url: str) -> dict:
+    return api_configs.get(str(idx), api_configs.get(url, {}))
+
+
+async def get_openai_runtime_connections(
+    user: UserModel | None = None,
+    *,
+    use_personal: bool = True,
+) -> tuple[bool, list[dict]]:
+    """Resolve the exclusive per-user provider set or the shared platform set."""
+    if user and use_personal:
+        personal_connections = await UserProviderCredentials.get_runtime_connections(user.id)
+        if personal_connections:
+            return True, personal_connections
+
+    enabled, api_base_urls, api_keys, api_configs = await get_openai_runtime_config()
+    if len(api_keys) != len(api_base_urls):
+        api_keys = await normalize_openai_api_keys(api_base_urls, api_keys)
+
+    return False, [
+        {
+            'url': url,
+            'key': api_keys[idx],
+            'config': get_openai_api_config(api_configs, idx, url),
+        }
+        for idx, url in enumerate(api_base_urls)
+        if enabled
+    ]
+
+
+async def get_openai_connection(
+    idx: int,
+    user: UserModel | None = None,
+    *,
+    use_personal: bool = True,
+) -> tuple[str, str, dict]:
+    _, connections = await get_openai_runtime_connections(user, use_personal=use_personal)
+    try:
+        connection = connections[idx]
+    except IndexError as exc:
+        raise HTTPException(status_code=404, detail=ERROR_MESSAGES.MODEL_NOT_FOUND()) from exc
+    return connection['url'], connection['key'], connection['config']
+
+
+async def get_upstream_session(api_config: dict | None) -> tuple[aiohttp.ClientSession, bool]:
+    if isinstance(api_config, dict) and api_config.get('user_supplied'):
+        return get_ssrf_safe_session(), True
+    return await get_session(), False
+
+
+PERSONAL_PROVIDER_URLS = {
+    'openai': 'https://api.openai.com/v1',
+    'gemini': 'https://generativelanguage.googleapis.com/v1beta/openai',
+}
+
+
+class PersonalAPIKeyForm(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    provider: str
+    base_url: str | None = Field(default=None, max_length=2048)
+    auth_type: str = 'bearer'
+    api_key: str | None = Field(default=None, max_length=4000)
+
+    @field_validator('name')
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator('provider')
+    @classmethod
+    def clean_provider(cls, value: str) -> str:
+        clean = value.strip().lower()
+        if clean not in {'openai', 'gemini', 'custom'}:
+            raise ValueError('Unsupported provider')
+        return clean
+
+    @field_validator('auth_type')
+    @classmethod
+    def clean_auth_type(cls, value: str) -> str:
+        clean = value.strip().lower()
+        if clean not in {'bearer', 'none'}:
+            raise ValueError('Unsupported authentication type')
+        return clean
+
+    @field_validator('api_key')
+    @classmethod
+    def clean_api_key(cls, value: str | None) -> str | None:
+        return value.strip() if value else None
+
+
+class PersonalAPIKeyConnection(BaseModel):
+    id: str
+    name: str
+    provider: str
+    base_url: str
+    host: str
+    auth_type: str
+    key_last4: str | None = None
+    last_verified_at: int | None = None
+    verification_status: str | None = None
+
+
+def personal_connection_public(item) -> PersonalAPIKeyConnection:
+    return PersonalAPIKeyConnection(
+        id=item.connection_id,
+        name=item.name,
+        provider=item.provider,
+        base_url=item.base_url,
+        host=urlparse(item.base_url).hostname or item.base_url,
+        auth_type=item.auth_type,
+        key_last4=item.key_last4 or None,
+        last_verified_at=item.last_verified_at,
+        verification_status=item.verification_status,
+    )
+
+
+async def prepare_personal_connection(form_data: PersonalAPIKeyForm) -> tuple[str, str, str]:
+    provider = form_data.provider
+    if provider in PERSONAL_PROVIDER_URLS:
+        base_url = PERSONAL_PROVIDER_URLS[provider]
+        auth_type = 'bearer'
+    else:
+        base_url = (form_data.base_url or '').strip()
+        auth_type = form_data.auth_type
+        if not base_url:
+            raise HTTPException(status_code=422, detail='自訂服務必須填寫 API 網址。')
+
+    parsed = urlparse(base_url)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise HTTPException(status_code=422, detail='API 網址不可包含帳密、查詢參數或片段。')
+    try:
+        await run_in_threadpool(validate_url, base_url)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail='API 網址無法連線，或不符合系統安全規則。') from exc
+
+    if auth_type == 'bearer' and len(form_data.api_key or '') < 8:
+        raise HTTPException(status_code=422, detail='API 金鑰至少需要 8 個字元。')
+    return provider, base_url, auth_type
+
+
+async def validate_personal_connection(
+    request: Request,
+    user: UserModel,
+    *,
+    provider: str,
+    base_url: str,
+    auth_type: str,
+    api_key: str | None,
+) -> None:
+    config = {
+        'enable': True,
+        'auth_type': auth_type,
+        'user_supplied': True,
+        'personal_provider': provider,
+    }
+    result = await get_models_request(
+        request,
+        base_url,
+        api_key or '',
+        user=user,
+        config=config,
+    )
+    models = result if isinstance(result, list) else (result or {}).get('data')
+    if not isinstance(models, list) or not models:
+        raise HTTPException(
+            status_code=502,
+            detail='無法讀取模型清單，未變更目前設定。請確認 API 網址、金鑰與服務狀態。',
+        )
+
+
+async def clear_personal_api_key_model_cache(request: Request) -> None:
+    await get_all_models.cache.clear()
+
+
+@router.get('/personal-api-keys')
+async def list_personal_api_keys(user=Depends(get_verified_user)):
+    items = await UserProviderCredentials.list_by_user_id(user.id)
+    return {
+        'mode': 'personal' if items else 'platform',
+        'connections': [personal_connection_public(item) for item in items],
+    }
+
+
+@router.post('/personal-api-keys', response_model=PersonalAPIKeyConnection)
+async def create_personal_api_key(
+    request: Request,
+    form_data: PersonalAPIKeyForm,
+    user=Depends(get_verified_user),
+):
+    provider, base_url, auth_type = await prepare_personal_connection(form_data)
+    await validate_personal_connection(
+        request,
+        user,
+        provider=provider,
+        base_url=base_url,
+        auth_type=auth_type,
+        api_key=form_data.api_key,
+    )
+    item = await UserProviderCredentials.upsert(
+        user.id,
+        name=form_data.name,
+        provider=provider,
+        base_url=base_url,
+        auth_type=auth_type,
+        api_key=form_data.api_key,
+    )
+    await UserProviderCredentials.set_verification_status(user.id, item.connection_id, 'ready')
+    item = await UserProviderCredentials.get_by_connection_id(user.id, item.connection_id)
+    await clear_personal_api_key_model_cache(request)
+    return personal_connection_public(item)
+
+
+@router.put('/personal-api-keys/{connection_id}', response_model=PersonalAPIKeyConnection)
+async def update_personal_api_key(
+    request: Request,
+    connection_id: str,
+    form_data: PersonalAPIKeyForm,
+    user=Depends(get_verified_user),
+):
+    existing = await UserProviderCredentials.get_by_connection_id(user.id, connection_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail='找不到這個自有 AI 連線。')
+    provider, base_url, auth_type = await prepare_personal_connection(form_data)
+    await validate_personal_connection(
+        request,
+        user,
+        provider=provider,
+        base_url=base_url,
+        auth_type=auth_type,
+        api_key=form_data.api_key,
+    )
+    item = await UserProviderCredentials.upsert(
+        user.id,
+        name=form_data.name,
+        provider=provider,
+        base_url=base_url,
+        auth_type=auth_type,
+        api_key=form_data.api_key,
+    )
+    if item.connection_id != connection_id:
+        await UserProviderCredentials.delete(user.id, connection_id)
+    await UserProviderCredentials.set_verification_status(user.id, item.connection_id, 'ready')
+    item = await UserProviderCredentials.get_by_connection_id(user.id, item.connection_id)
+    await clear_personal_api_key_model_cache(request)
+    return personal_connection_public(item)
+
+
+@router.delete('/personal-api-keys/{connection_id}')
+async def delete_personal_api_key(
+    request: Request,
+    connection_id: str,
+    user=Depends(get_verified_user),
+):
+    if not await UserProviderCredentials.delete(user.id, connection_id):
+        raise HTTPException(status_code=404, detail='找不到這個自有 AI 連線。')
+    await clear_personal_api_key_model_cache(request)
+    remaining = await UserProviderCredentials.list_by_user_id(user.id)
+    return {'ok': True, 'mode': 'personal' if remaining else 'platform'}
+
+
+@router.post('/personal-api-keys/{connection_id}/verify')
+async def verify_personal_api_key(
+    request: Request,
+    connection_id: str,
+    user=Depends(get_verified_user),
+):
+    item = await UserProviderCredentials.get_by_connection_id(user.id, connection_id)
+    if not item:
+        raise HTTPException(status_code=404, detail='找不到這個自有 AI 連線。')
+    runtime = await UserProviderCredentials.get_runtime_connections(user.id)
+    connection = next(entry for entry in runtime if entry['config']['personal_connection_id'] == connection_id)
+
+    verification_status = 'failed'
+    try:
+        result = await get_models_request(
+            request,
+            connection['url'],
+            connection['key'],
+            user=user,
+            config=connection['config'],
+        )
+        models = result.get('data') if isinstance(result, dict) else result
+        if not isinstance(models, list) or not models:
+            raise HTTPException(status_code=502, detail='連線未通過測試，請確認網址、金鑰與服務狀態。')
+        verification_status = 'ready'
+        return {'ok': True, 'message': '自有 AI 連線可正常讀取模型。'}
+    finally:
+        await UserProviderCredentials.set_verification_status(user.id, connection_id, verification_status)
+        await clear_personal_api_key_model_cache(request)
 
 
 async def get_anthropic_token_count_target(request: Request, form_data: dict, user: UserModel):
@@ -315,39 +605,41 @@ async def get_anthropic_token_count_target(request: Request, form_data: dict, us
     payload = {**form_data}
     model_id = requested_model
     model_info = await Models.get_model_by_id(model_id)
-    await check_model_access(user, model_info, BYPASS_MODEL_ACCESS_CONTROL)
 
     if model_info and model_info.base_model_id:
         model_id = model_info.base_model_id
         payload['model'] = model_id
 
-    models = request.app.state.OPENAI_MODELS
-    if not models or model_id not in models:
-        await get_all_models(request, user=user)
-        models = request.app.state.OPENAI_MODELS
+    models = await get_user_openai_models(request, user)
 
     model = models.get(model_id)
     if not model or 'urlIdx' not in model:
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.MODEL_NOT_FOUND())
+    if model_info:
+        await check_model_access(user, model_info, BYPASS_MODEL_ACCESS_CONTROL)
+    elif model.get('personal_owner_id') != user.id:
+        await check_model_access(user, None, BYPASS_MODEL_ACCESS_CONTROL)
 
-    url, key, api_config = await get_openai_connection(model['urlIdx'])
+    url, key, api_config = await get_openai_connection(model['urlIdx'], user=user)
     prefix_id = api_config.get('prefix_id')
     payload['model'] = strip_provider_model_prefix(payload['model'], prefix_id)
 
     headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
-    return requested_model, payload, url, key, headers, cookies
+    return requested_model, payload, url, key, api_config, headers, cookies
 
 
 async def count_anthropic_tokens(request: Request, form_data: dict, user: UserModel) -> int:
     """Forward an Anthropic token-count request through an OpenAI-compatible connection."""
-    requested_model, payload, url, key, headers, cookies = await get_anthropic_token_count_target(
+    requested_model, payload, url, key, api_config, headers, cookies = await get_anthropic_token_count_target(
         request, form_data, user
     )
     request_url = f'{url.rstrip("/")}/messages/count_tokens'
     response = None
+    session = None
+    owns_session = False
 
     try:
-        session = await get_session()
+        session, owns_session = await get_upstream_session(api_config)
         response = await session.request(
             method='POST',
             url=request_url,
@@ -387,7 +679,7 @@ async def count_anthropic_tokens(request: Request, form_data: dict, user: UserMo
         log.exception('Failed to count Anthropic tokens for model %s', requested_model)
         raise HTTPException(status_code=502, detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR)
     finally:
-        await cleanup_response(response)
+        await cleanup_response(response, session if owns_session else None)
 
 
 @router.get('/config')
@@ -479,7 +771,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         if file_path.is_file():
             return FileResponse(file_path)
 
-        url, key, api_config = await get_openai_connection(idx)
+        url, key, api_config = await get_openai_connection(idx, user=user, use_personal=False)
 
         headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
 
@@ -527,33 +819,30 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         raise HTTPException(status_code=401, detail=ERROR_MESSAGES.OPENAI_NOT_FOUND)
 
 
-async def get_all_models_responses(request: Request, user: UserModel) -> list:
-    enable_openai_api, api_base_urls, api_keys, api_configs = await get_openai_runtime_config()
-    if not enable_openai_api:
+async def get_all_models_responses(
+    request: Request,
+    user: UserModel,
+    runtime_connections: list[dict] | None = None,
+) -> list:
+    if runtime_connections is None:
+        _, runtime_connections = await get_openai_runtime_connections(user)
+    if not runtime_connections:
         return []
 
-    num_urls = len(api_base_urls)
-    num_keys = len(api_keys)
-
-    if num_keys != num_urls:
-        api_keys = await normalize_openai_api_keys(api_base_urls, api_keys)
-
     request_tasks = []
-    for idx, url in enumerate(api_base_urls):
-        if (str(idx) not in api_configs) and (url not in api_configs):  # Legacy support
-            request_tasks.append(get_models_request(request, url, api_keys[idx], user=user))
+    for idx, connection in enumerate(runtime_connections):
+        url = connection['url']
+        key = connection['key']
+        api_config = connection['config']
+        if not api_config:  # Legacy support
+            request_tasks.append(get_models_request(request, url, key, user=user))
         else:
-            api_config = api_configs.get(
-                str(idx),
-                api_configs.get(url, {}),  # Legacy support
-            )
-
             enable = api_config.get('enable', True)
             model_ids = api_config.get('model_ids', [])
 
             if enable:
                 if len(model_ids) == 0:
-                    request_tasks.append(get_models_request(request, url, api_keys[idx], user=user, config=api_config))
+                    request_tasks.append(get_models_request(request, url, key, user=user, config=api_config))
                 else:
                     model_list = {
                         'object': 'list',
@@ -577,11 +866,7 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
 
     for idx, response in enumerate(responses):
         if response:
-            url = api_base_urls[idx]
-            api_config = api_configs.get(
-                str(idx),
-                api_configs.get(url, {}),  # Legacy support
-            )
+            api_config = runtime_connections[idx]['config']
 
             connection_type = api_config.get('connection_type', 'external')
             prefix_id = api_config.get('prefix_id', None)
@@ -600,6 +885,14 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
 
                 if prefix_id:
                     model['id'] = f'{prefix_id}.{model.get("id", model.get("name", ""))}'
+
+                if api_config.get('personal_owner_id'):
+                    model['personal_owner_id'] = api_config['personal_owner_id']
+                    model['personal_connection_id'] = api_config['personal_connection_id']
+                    connection_name = api_config.get('personal_connection_name')
+                    if connection_name:
+                        original_name = model.get('name') or model.get('id')
+                        model['name'] = f'{original_name} · {connection_name}'
 
                 if tags:
                     model['tags'] = tags
@@ -648,12 +941,17 @@ async def get_filtered_models(models, user, db=None):
 async def get_all_models(request: Request, user: UserModel) -> dict[str, list]:
     log.info('get_all_models()')
 
-    enable_openai_api, api_base_urls, _, api_configs = await get_openai_runtime_config()
-    if not enable_openai_api:
-        request.app.state.OPENAI_MODELS = {}
-        return {'data': []}
+    personal_mode, runtime_connections = await get_openai_runtime_connections(user)
+    if not runtime_connections:
+        if not personal_mode:
+            request.app.state.OPENAI_MODELS = {}
+        return {'data': [], 'personal_mode': personal_mode}
 
-    responses = await get_all_models_responses(request, user=user)
+    responses = await get_all_models_responses(
+        request,
+        user=user,
+        runtime_connections=runtime_connections,
+    )
 
     def extract_data(response):
         if response and 'data' in response:
@@ -671,9 +969,9 @@ async def get_all_models(request: Request, user: UserModel) -> dict[str, list]:
 
         for idx, model_list in enumerate(model_lists):
             if model_list is not None and 'error' not in model_list:
-                base_url = api_base_urls[idx]
+                base_url = runtime_connections[idx]['url']
                 hostname = urlparse(base_url).hostname if base_url else None
-                api_config = api_configs.get(str(idx), api_configs.get(base_url, {}))
+                api_config = runtime_connections[idx]['config']
 
                 for model in model_list:
                     model_id = model.get('id') or model.get('name')
@@ -709,16 +1007,24 @@ async def get_all_models(request: Request, user: UserModel) -> dict[str, list]:
     models = get_merged_models(map(extract_data, responses))
     log.debug(f'models: {models}')
 
-    request.app.state.OPENAI_MODELS = models
-    return {'data': list(models.values())}
+    if not personal_mode:
+        request.app.state.OPENAI_MODELS = models
+    return {'data': list(models.values()), 'personal_mode': personal_mode}
+
+
+async def get_user_openai_models(request: Request, user: UserModel) -> dict[str, dict]:
+    """Return provider routing from this user's cached model inventory."""
+    response = await get_all_models(request, user=user)
+    return {
+        model['id']: model
+        for model in response.get('data', [])
+        if isinstance(model, dict) and model.get('id')
+    }
 
 
 @router.get('/models')
 @router.get('/models/{url_idx}')
 async def get_models(request: Request, url_idx: int | None = None, user=Depends(get_verified_user)):
-    if not await Config.get('openai.enable'):
-        raise HTTPException(status_code=503, detail='OpenAI API is disabled')
-
     models = {
         'data': [],
     }
@@ -726,7 +1032,9 @@ async def get_models(request: Request, url_idx: int | None = None, user=Depends(
     if url_idx is None:
         models = await get_all_models(request, user=user)
     else:
-        url, key, api_config = await get_openai_connection(url_idx)
+        if not await Config.get('openai.enable'):
+            raise HTTPException(status_code=503, detail='OpenAI API is disabled')
+        url, key, api_config = await get_openai_connection(url_idx, user=user, use_personal=False)
 
         r = None
         async with aiohttp.ClientSession(
@@ -1187,7 +1495,7 @@ async def generate_chat_completion(
     user=Depends(get_verified_user),
 ):
     require_metered_inference_entrypoint(request)
-    if not await Config.get('openai.enable'):
+    if not await Config.get('openai.enable') and not await UserProviderCredentials.has_for_user(user.id):
         raise HTTPException(status_code=503, detail='OpenAI API is disabled')
 
     # NOTE: We intentionally do NOT use Depends(get_async_session) here.
@@ -1231,14 +1539,8 @@ async def generate_chat_completion(
                 payload = await apply_system_prompt_to_body(system, payload, metadata, user)
 
         await check_model_access(user, model_info, bypass_filter)
-    else:
-        await check_model_access(user, None, bypass_filter)
 
-    # Check if model is already in app state cache to avoid expensive get_all_models() call
-    models = request.app.state.OPENAI_MODELS
-    if not models or model_id not in models:
-        await get_all_models(request, user=user)
-        models = request.app.state.OPENAI_MODELS
+    models = await get_user_openai_models(request, user)
     model = models.get(model_id)
 
     if model:
@@ -1248,8 +1550,10 @@ async def generate_chat_completion(
             status_code=404,
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
+    if not model_info and model.get('personal_owner_id') != user.id:
+        await check_model_access(user, None, bypass_filter)
 
-    url, key, api_config = await get_openai_connection(idx)
+    url, key, api_config = await get_openai_connection(idx, user=user)
 
     prefix_id = api_config.get('prefix_id', None)
     payload['model'] = strip_provider_model_prefix(payload['model'], prefix_id)
@@ -1285,6 +1589,9 @@ async def generate_chat_completion(
     headers, cookies = await get_headers_and_cookies(request, url, key, api_config, metadata, user=user)
 
     is_responses = api_config.get('api_type') == 'responses'
+
+    if not is_responses:
+        payload = apply_chat_completion_tool_compat(payload)
 
     if api_config.get('azure') or api_config.get('provider') == 'azure':
         # Only set api-key header if not using Azure Entra ID authentication
@@ -1337,11 +1644,13 @@ async def generate_chat_completion(
     r = None
     streaming = False
     response = None
+    session = None
+    owns_session = False
 
     try:
-        session = await get_session()
+        session, owns_session = await get_upstream_session(api_config)
 
-        r = await session.request(
+        r = await request_with_rate_limit_retry(session,
             method='POST',
             url=request_url,
             data=payload,
@@ -1394,7 +1703,11 @@ async def generate_chat_completion(
 
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, content_handler=stream_chunks_handler),
+                stream_wrapper(
+                    r,
+                    session=session if owns_session else None,
+                    content_handler=stream_chunks_handler,
+                ),
                 status_code=r.status,
                 headers=_clean_proxy_headers(r.headers),
             )
@@ -1435,7 +1748,7 @@ async def generate_chat_completion(
         )
     finally:
         if not streaming:
-            await cleanup_response(r)
+            await cleanup_response(r, session if owns_session else None)
 
 
 async def embeddings(request: Request, form_data: dict, user):
@@ -1451,22 +1764,25 @@ async def embeddings(request: Request, form_data: dict, user):
         dict: OpenAI-compatible embeddings response.
     """
     idx = 0
-    # Prepare payload/body
-    body = json.dumps(form_data)
     # Find correct backend url/key based on model
     model_id = form_data.get('model')
-    # Check if model is already in app state cache to avoid expensive get_all_models() call
-    models = request.app.state.OPENAI_MODELS
-    if not models or model_id not in models:
-        await get_all_models(request, user=user)
-        models = request.app.state.OPENAI_MODELS
-    if model_id in models:
-        idx = models[model_id]['urlIdx']
+    models = await get_user_openai_models(request, user)
+    if model_id not in models:
+        raise HTTPException(status_code=404, detail=ERROR_MESSAGES.MODEL_NOT_FOUND())
+    idx = models[model_id]['urlIdx']
 
-    url, key, api_config = await get_openai_connection(idx)
+    url, key, api_config = await get_openai_connection(idx, user=user)
+    prefix_id = api_config.get('prefix_id')
+    form_data = {
+        **form_data,
+        'model': strip_provider_model_prefix(form_data['model'], prefix_id),
+    }
+    body = json.dumps(form_data)
 
     r = None
     streaming = False
+    session = None
+    owns_session = False
 
     headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
 
@@ -1489,10 +1805,10 @@ async def embeddings(request: Request, form_data: dict, user):
             headers['api-version'] = api_version
     else:
         embeddings_url = f'{url}/embeddings'
-    requested_model = form_data.get('model')
+    requested_model = model_id
 
     try:
-        session = await get_session()
+        session, owns_session = await get_upstream_session(api_config)
         r = await session.request(
             method='POST',
             url=embeddings_url,
@@ -1506,7 +1822,7 @@ async def embeddings(request: Request, form_data: dict, user):
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, passthrough=True),
+                stream_wrapper(r, session=session if owns_session else None, passthrough=True),
                 status_code=r.status,
                 headers=_clean_proxy_headers(r.headers),
             )
@@ -1541,7 +1857,7 @@ async def embeddings(request: Request, form_data: dict, user):
         )
     finally:
         if not streaming:
-            await cleanup_response(r)
+            await cleanup_response(r, session if owns_session else None)
 
 
 class ResponsesForm(BaseModel):
@@ -1581,23 +1897,25 @@ async def responses(
     idx = 0
     model_id = form_data.model
 
-    # Enforce per-model access control
-    await check_model_access(user, await Models.get_model_by_id(model_id), BYPASS_MODEL_ACCESS_CONTROL)
+    models = await get_user_openai_models(request, user)
+    model = models.get(model_id)
+    if not model:
+        raise HTTPException(status_code=404, detail=ERROR_MESSAGES.MODEL_NOT_FOUND())
+    model_info = await Models.get_model_by_id(model_id)
+    if model_info:
+        await check_model_access(user, model_info, BYPASS_MODEL_ACCESS_CONTROL)
+    elif model.get('personal_owner_id') != user.id:
+        await check_model_access(user, None, BYPASS_MODEL_ACCESS_CONTROL)
+    idx = model['urlIdx']
 
+    url, key, api_config = await get_openai_connection(idx, user=user)
+    payload['model'] = strip_provider_model_prefix(payload['model'], api_config.get('prefix_id'))
     body = json.dumps(payload)
-
-    if model_id:
-        models = request.app.state.OPENAI_MODELS
-        if not models or model_id not in models:
-            await get_all_models(request, user=user)
-            models = request.app.state.OPENAI_MODELS
-        if model_id in models:
-            idx = models[model_id]['urlIdx']
-
-    url, key, api_config = await get_openai_connection(idx)
 
     r = None
     streaming = False
+    session = None
+    owns_session = False
 
     try:
         headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
@@ -1619,7 +1937,7 @@ async def responses(
         else:
             request_url = f'{url}/responses'
 
-        session = await get_session()
+        session, owns_session = await get_upstream_session(api_config)
         r = await session.request(
             method='POST',
             url=request_url,
@@ -1634,7 +1952,7 @@ async def responses(
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, passthrough=True),
+                stream_wrapper(r, session=session if owns_session else None, passthrough=True),
                 status_code=r.status,
                 headers=_clean_proxy_headers(r.headers),
             )
@@ -1672,7 +1990,7 @@ async def responses(
         )
     finally:
         if not streaming:
-            await cleanup_response(r)
+            await cleanup_response(r, session if owns_session else None)
 
 
 @router.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE'])
@@ -1702,18 +2020,21 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
     idx = 0
     model_id = payload.get('model') if isinstance(payload, dict) else None
     if model_id:
-        models = request.app.state.OPENAI_MODELS
-        if not models or model_id not in models:
-            await get_all_models(request, user=user)
-            models = request.app.state.OPENAI_MODELS
-        if model_id in models:
-            idx = models[model_id]['urlIdx']
+        models = await get_user_openai_models(request, user)
+        if model_id not in models:
+            raise HTTPException(status_code=404, detail=ERROR_MESSAGES.MODEL_NOT_FOUND())
+        idx = models[model_id]['urlIdx']
 
-    url, key, api_config = await get_openai_connection(idx)
+    url, key, api_config = await get_openai_connection(idx, user=user)
     base_url = url
+    if isinstance(payload, dict) and model_id:
+        payload['model'] = strip_provider_model_prefix(model_id, api_config.get('prefix_id'))
+        body = json.dumps(payload).encode()
 
     r = None
     streaming = False
+    session = None
+    owns_session = False
 
     try:
         headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
@@ -1741,7 +2062,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
         else:
             request_url = f'{url}/{path}'
 
-        session = await get_session()
+        session, owns_session = await get_upstream_session(api_config)
         r = await session.request(
             method=request.method,
             url=request_url,
@@ -1756,7 +2077,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, passthrough=True),
+                stream_wrapper(r, session=session if owns_session else None, passthrough=True),
                 status_code=r.status,
                 headers=_clean_proxy_headers(r.headers),
             )
@@ -1794,4 +2115,4 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
         )
     finally:
         if not streaming:
-            await cleanup_response(r)
+            await cleanup_response(r, session if owns_session else None)
